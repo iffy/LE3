@@ -25,9 +25,9 @@ mod view_cube;
 use actions::{Action, AppState, CreatingLine, CreatingRect, Pane, RectAxis, SketchSession, Tool};
 use construction::{
     angle_from_axis_plane_hit, axis_angle_handle, axis_gizmo_hit, axis_normal,
-    axis_offset_handle, draw_axis_plane_gizmo, draw_offset_gizmo, draw_pick_highlight,
+    axis_offset_handle, draw_axis_plane_gizmo, draw_offset_gizmo, draw_quad_face_highlight,
     offset_from_normal_drag, offset_gizmo_hit, offset_handle, pick_reference, plane_corners,
-    resolve_pick_target, PickTargetKind, AxisGizmoDrag, AxisGizmoHit, PlaneDim, PlaneReference,
+    resolve_pick_target, AxisGizmoDrag, AxisGizmoHit, PlaneDim, PlaneReference,
     AXIS_GIZMO_HANDLE_HIT_RADIUS_PX, PLANE_DISPLAY_HALF,
 };
 use face::{
@@ -847,19 +847,14 @@ fn draw_face_highlight(
     match face {
         FaceId::ConstructionPlane(i) => {
             if let Some(plane) = doc.construction_planes.get(i) {
-                draw_pick_highlight(
-                    painter,
-                    project,
-                    doc,
-                    PickTargetKind::ConstructionPlane(*plane),
-                    color,
-                );
+                let corners = plane_corners(plane, PLANE_DISPLAY_HALF);
+                draw_quad_face_highlight(painter, project, corners, color);
             }
         }
         FaceId::Rect(i) => {
             if let Some(rect) = doc.rects.get(i) {
                 if let Some(corners) = rect_world_corners(doc, rect) {
-                    draw_world_quad(painter, project, corners, color, true);
+                    draw_quad_face_highlight(painter, project, corners, color);
                 }
             }
         }

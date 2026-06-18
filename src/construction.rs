@@ -26,6 +26,9 @@ pub const FACE_PICK_MARGIN_PX: f32 = 8.0;
 /// Visual highlight for a pickable target under the cursor.
 pub const PICK_HOVER_RGBA: egui::Color32 = egui::Color32::from_rgb(255, 210, 90);
 
+/// Fill strength when highlighting a whole sketchable face on hover.
+pub const FACE_HOVER_FILL_MULTIPLIER: f32 = 0.38;
+
 /// Hover accent for axis gizmo drag handles.
 pub const GIZMO_HANDLE_HOVER_RGBA: egui::Color32 = egui::Color32::from_rgb(255, 230, 120);
 
@@ -765,6 +768,22 @@ fn draw_rect_highlight(
     }
 }
 
+/// Highlight a sketchable face quad with a filled overlay and border.
+pub fn draw_quad_face_highlight(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    corners: [Vec3; 4],
+    color: egui::Color32,
+) {
+    let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
+    let Some(pts) = pts else { return };
+    painter.add(egui::Shape::convex_polygon(
+        pts,
+        color.gamma_multiply(FACE_HOVER_FILL_MULTIPLIER),
+        egui::Stroke::new(2.0, color),
+    ));
+}
+
 fn draw_plane_face_highlight(
     painter: &egui::Painter,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
@@ -772,12 +791,7 @@ fn draw_plane_face_highlight(
     color: egui::Color32,
 ) {
     let corners = plane_corners(plane, PLANE_DISPLAY_HALF);
-    let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
-    let Some(pts) = pts else { return };
-    painter.add(egui::Shape::closed_line(
-        pts,
-        egui::Stroke::new(3.5, color),
-    ));
+    draw_quad_face_highlight(painter, project, corners, color);
 }
 
 fn project_point_on_plane(point: Vec3, plane: &ConstructionPlane) -> Vec3 {
@@ -1105,6 +1119,14 @@ mod tests {
     fn live_face_offset_is_signed_distance_along_normal() {
         let offset = live_face_offset(Vec3::ZERO, Vec3::Z, Vec3::new(1.0, 2.0, 15.0));
         assert!((offset - 15.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn face_hover_fill_is_visible_but_translucent() {
+        assert!(
+            FACE_HOVER_FILL_MULTIPLIER > 0.2 && FACE_HOVER_FILL_MULTIPLIER < 0.6,
+            "hover fill should read as a tint, not opaque or invisible"
+        );
     }
 
     #[test]

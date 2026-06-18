@@ -466,13 +466,17 @@ impl AppState {
                     return ActionResult::Err(format!("Unknown face {:?}", face));
                 }
                 if let Some(frame_target) = sketch_camera_target(&self.doc, face) {
+                    let view_direction = self.cam.visible_face_view_direction(
+                        frame_target.target,
+                        frame_target.face_normal,
+                    );
                     let zoom_distance = frame_target.zoom.and_then(|bounds| {
                         let frame = sketch_frame(&self.doc, face)?;
                         let vp = viewport?;
                         let corners = bounds.world_corners(&frame);
                         Some(self.cam.distance_to_fit_corners(
                             frame_target.target,
-                            frame_target.view_direction,
+                            view_direction,
                             &corners,
                             SKETCH_FRAME_PADDING_PX,
                             vp,
@@ -480,7 +484,7 @@ impl AppState {
                     });
                     self.cam.start_sketch_view_transition(
                         frame_target.target,
-                        frame_target.view_direction,
+                        frame_target.face_normal,
                         zoom_distance,
                         VIEW_TRANSITION_DURATION,
                     );

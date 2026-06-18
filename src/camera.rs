@@ -194,6 +194,24 @@ impl Camera {
         (half_h * aspect, half_h)
     }
 
+    /// Outward view direction (from `face_point` toward the eye) that keeps the camera on
+    /// the side of `face_normal` it already occupies — never flips to the opposite face.
+    pub fn visible_face_view_direction(&self, face_point: Vec3, face_normal: Vec3) -> Vec3 {
+        let n = face_normal.normalize_or_zero();
+        if n.length_squared() < 1e-8 {
+            return Vec3::Z;
+        }
+        let toward_eye = self.eye() - face_point;
+        if toward_eye.length_squared() < 1e-8 {
+            return n;
+        }
+        if toward_eye.dot(n) >= 0.0 {
+            n
+        } else {
+            -n
+        }
+    }
+
     /// Convert an outward view direction (from `target` toward the eye) to yaw/pitch.
     pub fn view_direction_to_yaw_pitch(direction: Vec3) -> (f32, f32) {
         let dir = direction.normalize_or_zero();
@@ -234,13 +252,16 @@ impl Camera {
     }
 
     /// Animate to a face-normal view, optionally reframing target and zoom.
+    /// `face_normal` is the face's outward normal; the camera stays on the side it
+    /// already occupies relative to that face.
     pub fn start_sketch_view_transition(
         &mut self,
         target: Vec3,
-        view_direction: Vec3,
+        face_normal: Vec3,
         zoom_distance: Option<f32>,
         duration: f32,
     ) {
+        let view_direction = self.visible_face_view_direction(target, face_normal);
         let (yaw, pitch) = Self::view_direction_to_yaw_pitch(view_direction);
         let to_distance = zoom_distance.unwrap_or(self.distance).clamp(2.0, 50_000.0);
         self.transition = Some(ViewTransition {
@@ -740,6 +761,21 @@ mod tests {
             motion.dot(toward) > 0.0,
             "target should move toward the point under the cursor"
         );
+    }
+
+    #[test]
+    fn visible_face_view_direction_stays_on_current_side() {
+        let mut cam = Camera::default();
+        cam.target = Vec3::ZERO;
+        cam.distance = 400.0;
+        cam.yaw = 0.0;
+        cam.pitch = 1.2;
+        let from_above = cam.visible_face_view_direction(Vec3::ZERO, Vec3::Z);
+        assert!(from_above.z > 0.0, "camera above should keep +Z, got {from_above:?}");
+
+        cam.pitch = -1.2;
+        let from_below = cam.visible_face_view_direction(Vec3::ZERO, Vec3::Z);
+        assert!(from_below.z < 0.0, "camera below should keep -Z, got {from_below:?}");
     }
 
     #[test]

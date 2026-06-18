@@ -97,7 +97,8 @@ pub struct SketchZoomBounds {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SketchCameraTarget {
     pub target: glam::Vec3,
-    pub view_direction: glam::Vec3,
+    /// Outward face normal; the camera picks ±this to stay on the visible side.
+    pub face_normal: glam::Vec3,
     pub zoom: Option<SketchZoomBounds>,
 }
 
@@ -180,7 +181,7 @@ fn children_local_bounds(doc: &Document, face: FaceId) -> Option<SketchZoomBound
 /// Resolve camera target, view direction, and optional zoom bounds for sketch mode.
 pub fn sketch_camera_target(doc: &Document, face: FaceId) -> Option<SketchCameraTarget> {
     let frame = sketch_frame(doc, face)?;
-    let view_direction = frame.normal;
+    let face_normal = frame.normal;
 
     match face {
         FaceId::ConstructionPlane(_) => {
@@ -188,13 +189,13 @@ pub fn sketch_camera_target(doc: &Document, face: FaceId) -> Option<SketchCamera
                 let target = local_to_world(&frame, zoom.center_u, zoom.center_v);
                 Some(SketchCameraTarget {
                     target,
-                    view_direction,
+                    face_normal,
                     zoom: Some(zoom),
                 })
             } else {
                 Some(SketchCameraTarget {
                     target: frame.origin,
-                    view_direction,
+                    face_normal,
                     zoom: None,
                 })
             }
@@ -213,7 +214,7 @@ pub fn sketch_camera_target(doc: &Document, face: FaceId) -> Option<SketchCamera
             let target = local_to_world(&frame, zoom.center_u, zoom.center_v);
             Some(SketchCameraTarget {
                 target,
-                view_direction,
+                face_normal,
                 zoom: Some(zoom),
             })
         }
@@ -378,7 +379,7 @@ mod tests {
         let target = sketch_camera_target(&doc, FaceId::ConstructionPlane(0)).unwrap();
         assert!(target.zoom.is_none());
         assert!(target.target.length_squared() < 1e-8);
-        assert!((target.view_direction.z - 1.0).abs() < 1e-4);
+        assert!((target.face_normal.z - 1.0).abs() < 1e-4);
     }
 
     #[test]
