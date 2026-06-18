@@ -1,0 +1,15 @@
+# Example — draw a line and save a screenshot.
+# Run: cargo run -- --script examples/line.le3script --exit
+
+new
+tool line
+
+click 480 320
+wait 2
+move 580 360
+wait 2
+set_dim length 80
+key enter
+
+wait 100ms
+screenshot line_preview.png

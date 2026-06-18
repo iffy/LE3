@@ -1,13 +1,13 @@
 //! `.le3` file persistence (SPEC §7).
 //!
 //! A `.le3` is a SQLite database. This early version implements only a small
-//! part of the schema from the spec — enough to round-trip the rectangle list —
+//! part of the schema from the spec — enough to round-trip sketch primitives —
 //! but keeps the pieces that matter for forward compatibility: a `meta` table
-//! and a `schema_migrations` table, and rectangles stored as DAG nodes with a
+//! and a `schema_migrations` table, and shapes stored as DAG nodes with a
 //! JSON payload (SPEC §7.3). When real features arrive they slot into the same
 //! `dag_nodes` shape.
 
-use crate::model::{Document, Rect};
+use crate::model::{Document, Line, Rect, ShapeKind};
 use rusqlite::Connection;
 
 /// Bump when the on-disk schema changes; pair with a migration below.
@@ -64,17 +64,45 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
     )
     .map_err(|e| e.to_string())?;
 
-    tx.execute("DELETE FROM dag_nodes WHERE kind = 'rectangle'", [])
-        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM dag_nodes WHERE kind IN ('rectangle', 'line')",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
 
-    for (i, rect) in doc.rects.iter().enumerate() {
-        let payload = serde_json::to_string(rect).map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO dag_nodes (id, component_id, kind, payload)
-             VALUES (?1, 0, 'rectangle', ?2)",
-            rusqlite::params![i as i64, payload],
-        )
-        .map_err(|e| e.to_string())?;
+    let mut rect_i = 0usize;
+    let mut line_i = 0usize;
+    for (id, kind) in doc.shape_order.iter().enumerate() {
+        match kind {
+            ShapeKind::Rect => {
+                let rect = doc
+                    .rects
+                    .get(rect_i)
+                    .ok_or_else(|| "shape_order out of sync with rects".to_string())?;
+                let payload = serde_json::to_string(rect).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
+                     VALUES (?1, 0, 'rectangle', ?2)",
+                    rusqlite::params![id as i64, payload],
+                )
+                .map_err(|e| e.to_string())?;
+                rect_i += 1;
+            }
+            ShapeKind::Line => {
+                let line = doc
+                    .lines
+                    .get(line_i)
+                    .ok_or_else(|| "shape_order out of sync with lines".to_string())?;
+                let payload = serde_json::to_string(line).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
+                     VALUES (?1, 0, 'line', ?2)",
+                    rusqlite::params![id as i64, payload],
+                )
+                .map_err(|e| e.to_string())?;
+                line_i += 1;
+            }
+        }
     }
 
     tx.commit().map_err(|e| e.to_string())?;
@@ -86,21 +114,42 @@ pub fn open(path: &str) -> Result<Document> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
 
     let mut stmt = conn
-        .prepare("SELECT payload FROM dag_nodes WHERE kind = 'rectangle' ORDER BY id")
+        .prepare(
+            "SELECT kind, payload FROM dag_nodes
+             WHERE kind IN ('rectangle', 'line')
+             ORDER BY id",
+        )
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
         .map_err(|e| e.to_string())?;
 
     let mut rects = Vec::new();
+    let mut lines = Vec::new();
+    let mut shape_order = Vec::new();
     for row in rows {
-        let payload = row.map_err(|e| e.to_string())?;
-        let rect: Rect = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
-        rects.push(rect);
+        let (kind, payload) = row.map_err(|e| e.to_string())?;
+        match kind.as_str() {
+            "rectangle" => {
+                let rect: Rect = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+                rects.push(rect);
+                shape_order.push(ShapeKind::Rect);
+            }
+            "line" => {
+                let line: Line = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+                lines.push(line);
+                shape_order.push(ShapeKind::Line);
+            }
+            _ => {}
+        }
     }
 
-    Ok(Document { rects })
+    Ok(Document {
+        rects,
+        lines,
+        shape_order,
+    })
 }
 
 #[cfg(test)]
@@ -119,17 +168,47 @@ mod tests {
                 Rect { x: 1.0, y: 2.0, w: 3.0, h: 4.0 },
                 Rect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 },
             ],
+            lines: vec![],
+            shape_order: vec![ShapeKind::Rect, ShapeKind::Rect],
         };
 
         save(&path, &doc).unwrap();
         let loaded = open(&path).unwrap();
 
         assert_eq!(loaded.rects, doc.rects);
+        assert_eq!(loaded.shape_order, doc.shape_order);
 
-        // Saving again must not duplicate rows.
         save(&path, &doc).unwrap();
         let reloaded = open(&path).unwrap();
         assert_eq!(reloaded.rects.len(), 2);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn round_trips_mixed_shapes_in_order() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("le3_mixed_shapes_test.le3");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let doc = Document {
+            rects: vec![Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            }],
+            lines: vec![
+                Line::from_endpoints(0.0, 0.0, 5.0, 0.0),
+                Line::from_endpoints(1.0, 1.0, 1.0, 6.0),
+            ],
+            shape_order: vec![ShapeKind::Rect, ShapeKind::Line, ShapeKind::Line],
+        };
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert_eq!(loaded, doc);
 
         std::fs::remove_file(&path).unwrap();
     }

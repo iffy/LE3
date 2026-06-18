@@ -16,10 +16,10 @@ mod model;
 mod script;
 mod storage;
 
-use actions::{Action, AppState, CreatingRect, RectAxis, Tool};
+use actions::{Action, AppState, CreatingLine, CreatingRect, RectAxis, Tool};
 use eframe::egui;
 use glam::Vec3;
-use model::Rect;
+use model::{Line, Rect};
 use script::{ScriptRunner, SyntheticInput};
 use std::path::Path;
 
@@ -115,17 +115,33 @@ impl App {
             self.state.apply(Action::CancelOperation);
         }
 
-        if self.state.creating_rect.is_none() && ctx.input(|i| i.key_pressed(egui::Key::R)) {
+        if self.state.creating_rect.is_none()
+            && self.state.creating_line.is_none()
+            && ctx.input(|i| i.key_pressed(egui::Key::R))
+        {
             if self.state.tool != Tool::Rectangle {
                 self.state.apply(Action::SetTool(Tool::Rectangle));
+            }
+        }
+
+        if self.state.creating_rect.is_none()
+            && self.state.creating_line.is_none()
+            && ctx.input(|i| i.key_pressed(egui::Key::L))
+        {
+            if self.state.tool != Tool::Line {
+                self.state.apply(Action::SetTool(Tool::Line));
             }
         }
 
         if self.state.tool != Tool::Rectangle {
             self.state.creating_rect = None;
         }
+        if self.state.tool != Tool::Line {
+            self.state.creating_line = None;
+        }
 
-        let (enter_pressed, tab_pressed) = if self.state.creating_rect.is_some() {
+        let creating = self.state.creating_rect.is_some() || self.state.creating_line.is_some();
+        let (enter_pressed, tab_pressed) = if creating {
             (
                 ctx.input(|i| i.key_pressed(egui::Key::Enter)),
                 ctx.input(|i| i.key_pressed(egui::Key::Tab)),
@@ -150,16 +166,13 @@ impl App {
                     RectAxis::Height
                 };
                 self.state.apply(Action::FocusRectDimension { axis });
-                let target_id = if new_focused == 0 {
-                    egui::Id::new("cr_width")
-                } else {
-                    egui::Id::new("cr_height")
-                };
-                ctx.memory_mut(|m| m.request_focus(target_id));
             }
             if enter_pressed {
                 self.state.apply(Action::CommitRectangle);
             }
+        }
+        if self.state.creating_line.is_some() && enter_pressed {
+            self.state.apply(Action::CommitLine);
         }
     }
 
@@ -246,6 +259,7 @@ impl eframe::App for App {
                 ui.separator();
                 ui.selectable_value(&mut self.state.tool, Tool::Select, "Select");
                 ui.selectable_value(&mut self.state.tool, Tool::Rectangle, "Rectangle");
+                ui.selectable_value(&mut self.state.tool, Tool::Line, "Line");
                 ui.separator();
                 if ui.button("Clear").clicked() {
                     self.state.apply(Action::Clear);
@@ -280,11 +294,337 @@ mod col {
     pub const X_AXIS: Color32 = Color32::from_rgb(200, 70, 70);
     pub const Y_AXIS: Color32 = Color32::from_rgb(70, 190, 90);
     pub const RECT_LINE: Color32 = Color32::from_rgb(120, 170, 240);
+    pub const LINE_STROKE: Color32 = Color32::from_rgb(180, 140, 240);
     pub const PREVIEW: Color32 = Color32::from_rgb(240, 200, 120);
+    pub const DIM_INPUT_BG: Color32 = Color32::from_rgb(22, 24, 30);
+    pub const DIM_INPUT_BG_FOCUS: Color32 = Color32::from_rgb(34, 36, 44);
+    pub const DIM_INPUT_BORDER: Color32 = Color32::from_rgb(110, 118, 136);
+    pub const DIM_INPUT_BORDER_FOCUS: Color32 = Color32::from_rgb(255, 186, 84);
+    pub const DIM_INPUT_TEXT: Color32 = Color32::from_rgb(232, 235, 242);
+    pub const DIM_INPUT_TEXT_FOCUS: Color32 = Color32::from_rgb(255, 255, 255);
+    /// Faint highlight so selected digits stay readable on the dark input background.
+    pub const DIM_INPUT_SELECTION: Color32 = Color32::from_rgba_premultiplied(36, 26, 12, 36);
+    /// Highlight for the dimension edge/segment tied to the focused input.
+    pub const DIM_EDGE_HIGHLIGHT: Color32 = DIM_INPUT_BORDER_FOCUS;
 }
 
 const GRID_EXTENT: f32 = 200.0;
 const GRID_STEP: f32 = 20.0;
+
+/// Screen-space size of a floating dimension input (frame + text field).
+const DIM_INPUT_SIZE: egui::Vec2 = egui::Vec2::new(58.0, 26.0);
+const DIM_LABEL_GAP: f32 = 8.0;
+const DIM_LABEL_PAD: f32 = 2.0;
+const DIM_REPULSION_ITERS: usize = 16;
+
+/// Preferred offsets from edge anchors (width: bottom mid, height: left mid, line: segment mid).
+const WIDTH_LABEL_OFFSET: egui::Vec2 = egui::Vec2::new(-20.0, 14.0);
+const HEIGHT_LABEL_OFFSET: egui::Vec2 = egui::Vec2::new(-48.0, -4.0);
+/// Perpendicular gap from the line to the nearest edge of the dimension input.
+const LINE_LABEL_DISTANCE: f32 = 18.0;
+
+/// Screen-space layout for a floating dimension input.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DimInputLayout {
+    pos: egui::Pos2,
+    rect: egui::Rect,
+}
+
+fn dim_input_rect_at(top_left: egui::Pos2) -> egui::Rect {
+    egui::Rect::from_min_size(top_left, DIM_INPUT_SIZE)
+}
+
+fn layout_at(pos: egui::Pos2) -> DimInputLayout {
+    DimInputLayout {
+        pos,
+        rect: dim_input_rect_at(pos),
+    }
+}
+
+/// Smallest axis-aligned push to separate `moving` from `obstacle` (with padding).
+fn separation_vector(moving: egui::Rect, obstacle: egui::Rect, padding: f32) -> egui::Vec2 {
+    let obs = obstacle.expand(padding);
+    if !moving.intersects(obs) {
+        return egui::Vec2::ZERO;
+    }
+    let pen_left = moving.max.x - obs.min.x;
+    let pen_right = obs.max.x - moving.min.x;
+    let pen_top = moving.max.y - obs.min.y;
+    let pen_bottom = obs.max.y - moving.min.y;
+    // When boxes only touch (penetration 0), still nudge apart so we don't stall.
+    const MIN_PUSH: f32 = 1.0;
+    if pen_left.min(pen_right) < pen_top.min(pen_bottom) {
+        if pen_left <= pen_right {
+            egui::vec2(-pen_left.max(MIN_PUSH), 0.0)
+        } else {
+            egui::vec2(pen_right.max(MIN_PUSH), 0.0)
+        }
+    } else if pen_top <= pen_bottom {
+        egui::vec2(0.0, -pen_top.max(MIN_PUSH))
+    } else {
+        egui::vec2(0.0, pen_bottom.max(MIN_PUSH))
+    }
+}
+
+fn resolve_rectangle_dim_positions(
+    bottom_mid: egui::Pos2,
+    left_mid: egui::Pos2,
+) -> (egui::Pos2, egui::Pos2) {
+    let mut width_pos = bottom_mid + WIDTH_LABEL_OFFSET;
+    let mut height_pos = left_mid + HEIGHT_LABEL_OFFSET;
+    for _ in 0..DIM_REPULSION_ITERS {
+        let w_rect = dim_input_rect_at(width_pos);
+        let h_rect = dim_input_rect_at(height_pos);
+        let w_push = separation_vector(w_rect, h_rect, DIM_LABEL_PAD);
+        let h_push = separation_vector(h_rect, w_rect, DIM_LABEL_PAD);
+        if w_push.length_sq() + h_push.length_sq() < 0.25 {
+            break;
+        }
+        width_pos += w_push;
+        height_pos += h_push;
+    }
+    (width_pos, height_pos)
+}
+
+fn rectangle_labels_clear(width: egui::Rect, height: egui::Rect) -> bool {
+    !width.intersects(height.expand(DIM_LABEL_PAD))
+}
+
+fn rectangle_dim_layouts(
+    bottom_mid: egui::Pos2,
+    left_mid: egui::Pos2,
+) -> (DimInputLayout, DimInputLayout) {
+    let (width_pos, height_pos) = resolve_rectangle_dim_positions(bottom_mid, left_mid);
+    let width = layout_at(width_pos);
+    let height = layout_at(height_pos);
+    debug_assert!(rectangle_labels_clear(width.rect, height.rect));
+    (width, height)
+}
+
+fn rectangle_dim_layout_from_world(
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) -> Option<(DimInputLayout, DimInputLayout)> {
+    let bottom_mid = project(Vec3::new((x0 + x1) * 0.5, y0, 0.0))?;
+    let left_mid = project(Vec3::new(x0, (y0 + y1) * 0.5, 0.0))?;
+    Some(rectangle_dim_layouts(bottom_mid, left_mid))
+}
+
+fn segment_intersects_rect(pa: egui::Pos2, pb: egui::Pos2, rect: egui::Rect) -> bool {
+    if rect.contains(pa) || rect.contains(pb) {
+        return true;
+    }
+    let edges = [
+        (rect.left_top(), rect.right_top()),
+        (rect.right_top(), rect.right_bottom()),
+        (rect.right_bottom(), rect.left_bottom()),
+        (rect.left_bottom(), rect.left_top()),
+    ];
+    for (c, d) in edges {
+        if segments_intersect(pa, pb, c, d) {
+            return true;
+        }
+    }
+    false
+}
+
+fn segments_intersect(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2, d: egui::Pos2) -> bool {
+    fn cross(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> f32 {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    }
+    let ab = cross(a, b, c);
+    let ab_d = cross(a, b, d);
+    let cd = cross(c, d, a);
+    let cd_b = cross(c, d, b);
+    if ab == 0.0 && ab_d == 0.0 {
+        return false;
+    }
+    ab * ab_d <= 0.0 && cd * cd_b <= 0.0
+}
+
+/// Unit vector perpendicular to the line, on the preferred label side (upper-left in screen space).
+fn line_perpendicular_unit(pa: egui::Pos2, pb: egui::Pos2) -> egui::Vec2 {
+    let delta = pb - pa;
+    if delta.length_sq() < 1e-4 {
+        return egui::vec2(-1.0, -1.0).normalized();
+    }
+    let dir = delta.normalized();
+    let perp_a = egui::vec2(-dir.y, dir.x);
+    let perp_b = egui::vec2(dir.y, -dir.x);
+    let prefer = egui::vec2(-1.0, -1.0).normalized();
+    if perp_a.dot(prefer) >= perp_b.dot(prefer) {
+        perp_a
+    } else {
+        perp_b
+    }
+}
+
+fn aabb_half_extent_along(dir: egui::Vec2) -> f32 {
+    if dir.length_sq() < 1e-8 {
+        return 0.0;
+    }
+    let n = dir.normalized();
+    DIM_INPUT_SIZE.x * 0.5 * n.x.abs() + DIM_INPUT_SIZE.y * 0.5 * n.y.abs()
+}
+
+fn line_dim_top_left(pa: egui::Pos2, pb: egui::Pos2, gap_from_line: f32) -> egui::Pos2 {
+    let mid = pa.lerp(pb, 0.5);
+    let perp = line_perpendicular_unit(pa, pb);
+    let center_dist = gap_from_line + aabb_half_extent_along(-perp);
+    let center = mid + perp * center_dist;
+    center - DIM_INPUT_SIZE * 0.5
+}
+
+#[cfg(test)]
+fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    if ab.length_sq() < 1e-8 {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+#[cfg(test)]
+fn dist_rect_to_segment(rect: egui::Rect, pa: egui::Pos2, pb: egui::Pos2) -> f32 {
+    if segment_intersects_rect(pa, pb, rect) {
+        return 0.0;
+    }
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    corners
+        .into_iter()
+        .map(|c| dist_point_to_segment(c, pa, pb))
+        .fold(f32::MAX, f32::min)
+}
+
+fn line_dim_layout(pa: egui::Pos2, pb: egui::Pos2) -> DimInputLayout {
+    let mut gap = LINE_LABEL_DISTANCE;
+    for _ in 0..DIM_REPULSION_ITERS {
+        let pos = line_dim_top_left(pa, pb, gap);
+        let rect = dim_input_rect_at(pos).expand(DIM_LABEL_GAP);
+        if !segment_intersects_rect(pa, pb, rect) {
+            return layout_at(pos);
+        }
+        gap += 2.0;
+    }
+    layout_at(line_dim_top_left(pa, pb, gap))
+}
+
+fn pointer_over_dim_inputs(pointer: egui::Pos2, layouts: &[DimInputLayout]) -> bool {
+    layouts.iter().any(|layout| layout.rect.contains(pointer))
+}
+
+fn format_live_dimension(v: f32) -> String {
+    if v < 0.1 {
+        "0".to_string()
+    } else {
+        format!("{:.1}", v)
+    }
+}
+
+/// Second click on the viewport (not a dimension input) commits the in-progress sketch.
+fn should_commit_sketch_on_click(
+    was_creating: bool,
+    primary_pressed: bool,
+    over_input: bool,
+) -> bool {
+    was_creating && primary_pressed && !over_input
+}
+
+/// Whether the dimension field should keep its entire value selected for overwrite typing.
+fn should_select_all_rect_value(
+    gained_focus: bool,
+    has_focus: bool,
+    is_focus_target: bool,
+    pending_focus: bool,
+    user_edited: bool,
+    changed_this_frame: bool,
+) -> bool {
+    if changed_this_frame {
+        return false;
+    }
+    gained_focus
+        || (is_focus_target && pending_focus && has_focus)
+        || (is_focus_target && has_focus && !user_edited)
+}
+
+/// Show a sketch dimension field; selects all text when it gains focus so typing replaces the value.
+fn show_sketch_dimension_field(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    is_focus_target: bool,
+    pending_focus: &mut bool,
+    user_edited: bool,
+) -> bool {
+    let has_focus = ctx.memory(|m| m.focused()) == Some(id);
+    let frame = egui::Frame::default()
+        .fill(if has_focus {
+            col::DIM_INPUT_BG_FOCUS
+        } else {
+            col::DIM_INPUT_BG
+        })
+        .stroke(egui::Stroke::new(
+            1.5,
+            if has_focus {
+                col::DIM_INPUT_BORDER_FOCUS
+            } else {
+                col::DIM_INPUT_BORDER
+            },
+        ))
+        .inner_margin(egui::Margin::symmetric(5.0, 3.0))
+        .rounding(3.0);
+
+    let output = frame.show(ui, |ui| {
+        ui.style_mut().spacing.text_edit_width = 48.0;
+        ui.visuals_mut().selection.bg_fill = col::DIM_INPUT_SELECTION;
+        egui::TextEdit::singleline(text)
+            .id(id)
+            .frame(false)
+            .desired_width(48.0)
+            .font(egui::FontId::monospace(13.0))
+            .text_color(if has_focus {
+                col::DIM_INPUT_TEXT_FOCUS
+            } else {
+                col::DIM_INPUT_TEXT
+            })
+            .margin(egui::vec2(0.0, 0.0))
+            .show(ui)
+    }).inner;
+    let resp = &output.response;
+    if is_focus_target && *pending_focus {
+        resp.request_focus();
+    }
+    if should_select_all_rect_value(
+        resp.gained_focus(),
+        resp.has_focus(),
+        is_focus_target,
+        *pending_focus,
+        user_edited,
+        resp.changed(),
+    ) {
+        let len = text.chars().count();
+        let mut state = output.state;
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::default(),
+            egui::text::CCursor::new(len),
+        )));
+        state.store(ctx, id);
+    }
+    if is_focus_target && resp.has_focus() {
+        *pending_focus = false;
+    }
+    resp.changed()
+}
 
 impl App {
     fn draw_viewport(&mut self, ui: &mut egui::Ui) {
@@ -313,77 +653,114 @@ impl App {
         if response.hovered() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
-                self.state.cam.zoom(scroll);
+                let focal = response.hover_pos().unwrap_or(viewport.center());
+                self.state.cam.zoom(scroll, focal, viewport);
             }
         }
 
-        let vp = self.state.cam.view_proj(viewport);
-        let project = |w: Vec3| self.state.cam.project(w, viewport, &vp);
+        let cam = self.state.cam;
+        let vp = cam.view_proj(viewport);
+        let project = move |w: Vec3| cam.project(w, viewport, &vp);
 
         if self.state.tool == Tool::Rectangle {
-            let ground = |p: egui::Pos2| self.state.cam.ground_point(p, viewport, &vp);
+            let ground = |p: egui::Pos2| cam.ground_point(p, viewport, &vp);
             let pointer_screen = response.hover_pos().or(response.interact_pointer_pos());
 
             if let Some(pp) = pointer_screen {
                 if let Some(gp) = ground(pp) {
-                    if self.state.creating_rect.is_none()
-                        && ui.input(|i| i.pointer.primary_pressed())
-                    {
+                    let was_creating = self.state.creating_rect.is_some();
+                    let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+
+                    if !was_creating && primary_pressed {
                         self.state.creating_rect = Some(CreatingRect {
                             origin: gp,
                             texts: ["".to_string(), "".to_string()],
                             focused: 0,
                             last_mouse: gp,
                             user_edited: [false, false],
+                            pending_focus: true,
                         });
-                        self.state.status = "Move mouse • type to lock dim • Tab cycle • Enter commit • Esc cancel".to_string();
-                        ui.ctx().memory_mut(|m| m.request_focus(egui::Id::new("cr_width")));
+                        self.state.status = "Move mouse • type to lock dim • Tab cycle • click/Enter commit • Esc cancel"
+                            .to_string();
                     }
 
+                    let mut commit_click = false;
                     if let Some(cr) = &mut self.state.creating_rect {
                         let cur_end = cr.end_point();
                         let x0 = cr.origin.x.min(cur_end.x);
                         let y0 = cr.origin.y.min(cur_end.y);
                         let x1 = cr.origin.x.max(cur_end.x);
                         let y1 = cr.origin.y.max(cur_end.y);
-                        let mid_w = Vec3::new((x0 + x1) * 0.5, y0, 0.0);
-                        let mid_h = Vec3::new(x0, (y0 + y1) * 0.5, 0.0);
-                        let pw = project(mid_w);
-                        let ph = project(mid_h);
+                        let dim_layouts = rectangle_dim_layout_from_world(&project, x0, y0, x1, y1);
+                        let over_input = dim_layouts
+                            .as_ref()
+                            .is_some_and(|(w, h)| w.rect.contains(pp) || h.rect.contains(pp));
 
-                        let mut over_input = false;
-                        if let (Some(pw), Some(ph)) = (pw, ph) {
-                            let r_w = egui::Rect::from_min_size(
-                                pw + egui::vec2(-20.0, 14.0),
-                                egui::vec2(55.0, 20.0),
-                            );
-                            let r_h = egui::Rect::from_min_size(
-                                ph + egui::vec2(-48.0, -4.0),
-                                egui::vec2(55.0, 20.0),
-                            );
-                            if r_w.contains(pp) || r_h.contains(pp) {
-                                over_input = true;
-                            }
-                        }
-
-                        if !over_input {
+                        if should_commit_sketch_on_click(was_creating, primary_pressed, over_input) {
+                            commit_click = true;
+                        } else if !over_input {
                             cr.last_mouse = gp;
                             let rw = (gp.x - cr.origin.x).abs();
                             let rh = (gp.y - cr.origin.y).abs();
-                            let fm = |v: f32| -> String {
-                                if v < 0.1 {
-                                    "0".to_string()
-                                } else {
-                                    format!("{:.1}", v)
-                                }
-                            };
                             if !cr.user_edited[0] {
-                                cr.texts[0] = fm(rw);
+                                cr.texts[0] = format_live_dimension(rw);
                             }
                             if !cr.user_edited[1] {
-                                cr.texts[1] = fm(rh);
+                                cr.texts[1] = format_live_dimension(rh);
                             }
                         }
+                    }
+                    if commit_click {
+                        self.state.apply(Action::CommitRectangle);
+                    }
+                }
+            }
+        }
+
+        if self.state.tool == Tool::Line {
+            let ground = |p: egui::Pos2| cam.ground_point(p, viewport, &vp);
+            let pointer_screen = response.hover_pos().or(response.interact_pointer_pos());
+
+            if let Some(pp) = pointer_screen {
+                if let Some(gp) = ground(pp) {
+                    let was_creating = self.state.creating_line.is_some();
+                    let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+
+                    if !was_creating && primary_pressed {
+                        self.state.creating_line = Some(CreatingLine {
+                            origin: gp,
+                            text: String::new(),
+                            last_mouse: gp,
+                            user_edited: false,
+                            pending_focus: true,
+                        });
+                        self.state.status = "Move mouse • type to lock length • click/Enter commit • Esc cancel"
+                            .to_string();
+                    }
+
+                    let mut commit_click = false;
+                    if let Some(cl) = &mut self.state.creating_line {
+                        let end = cl.end_point();
+                        let over_input = project(Vec3::new(cl.origin.x, cl.origin.y, 0.0))
+                            .zip(project(Vec3::new(end.x, end.y, 0.0)))
+                            .is_some_and(|(pa, pb)| {
+                                pointer_over_dim_inputs(pp, &[line_dim_layout(pa, pb)])
+                            });
+
+                        if should_commit_sketch_on_click(was_creating, primary_pressed, over_input)
+                        {
+                            commit_click = true;
+                        } else if !over_input {
+                            cl.last_mouse = gp;
+                            if !cl.user_edited {
+                                let dx = gp.x - cl.origin.x;
+                                let dy = gp.y - cl.origin.y;
+                                cl.text = format_live_dimension((dx * dx + dy * dy).sqrt());
+                            }
+                        }
+                    }
+                    if commit_click {
+                        self.state.apply(Action::CommitLine);
                     }
                 }
             }
@@ -394,11 +771,22 @@ impl App {
         for r in &self.state.doc.rects {
             draw_rect(&painter, &project, *r, col::RECT_LINE, true);
         }
+        for line in &self.state.doc.lines {
+            draw_line_segment(&painter, &project, *line, col::LINE_STROKE, 2.0);
+        }
         if let Some(cr) = &self.state.creating_rect {
             let end = cr.end_point();
             let preview = Rect::from_corners(cr.origin.x, cr.origin.y, end.x, end.y);
             draw_rect(&painter, &project, preview, col::PREVIEW, false);
             if let Some(sp) = project(cr.origin) {
+                painter.circle_filled(sp, 3.5, col::PREVIEW);
+            }
+        }
+        if let Some(cl) = &self.state.creating_line {
+            let end = cl.end_point();
+            let preview = Line::from_endpoints(cl.origin.x, cl.origin.y, end.x, end.y);
+            draw_line_segment(&painter, &project, preview, col::PREVIEW, 2.0);
+            if let Some(sp) = project(cl.origin) {
                 painter.circle_filled(sp, 3.5, col::PREVIEW);
             }
         }
@@ -409,55 +797,43 @@ impl App {
             let y0 = cr.origin.y.min(end.y);
             let x1 = cr.origin.x.max(end.x);
             let y1 = cr.origin.y.max(end.y);
-            let mid_w = Vec3::new((x0 + x1) * 0.5, y0, 0.0);
-            let mid_h = Vec3::new(x0, (y0 + y1) * 0.5, 0.0);
-            let pw = project(mid_w);
-            let ph = project(mid_h);
-            if let (Some(pw), Some(ph)) = (pw, ph) {
+            if let Some((width_layout, height_layout)) =
+                rectangle_dim_layout_from_world(&project, x0, y0, x1, y1)
+            {
                 let ctx = ui.ctx();
                 let id_w = egui::Id::new("cr_width");
                 let id_h = egui::Id::new("cr_height");
 
                 egui::Area::new(egui::Id::new("cr_width_area"))
-                    .fixed_pos(pw + egui::vec2(-20.0, 14.0))
+                    .fixed_pos(width_layout.pos)
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
-                        ui.style_mut().spacing.text_edit_width = 48.0;
-                        ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_gray(32);
-                        ui.visuals_mut().widgets.inactive.fg_stroke =
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(230));
-                        ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_gray(50);
-                        ui.visuals_mut().widgets.active.fg_stroke =
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 220, 150));
-                        let te = egui::TextEdit::singleline(&mut cr.texts[0])
-                            .id_source(id_w)
-                            .desired_width(48.0)
-                            .font(egui::FontId::proportional(11.0))
-                            .margin(egui::vec2(2.0, 1.0));
-                        let resp = ui.add(te);
-                        if resp.changed() {
+                        if show_sketch_dimension_field(
+                            ui,
+                            ctx,
+                            id_w,
+                            &mut cr.texts[0],
+                            cr.focused == 0,
+                            &mut cr.pending_focus,
+                            cr.user_edited[0],
+                        ) {
                             cr.user_edited[0] = true;
                         }
                     });
 
                 egui::Area::new(egui::Id::new("cr_height_area"))
-                    .fixed_pos(ph + egui::vec2(-48.0, -4.0))
+                    .fixed_pos(height_layout.pos)
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
-                        ui.style_mut().spacing.text_edit_width = 48.0;
-                        ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_gray(32);
-                        ui.visuals_mut().widgets.inactive.fg_stroke =
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(230));
-                        ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_gray(50);
-                        ui.visuals_mut().widgets.active.fg_stroke =
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 220, 150));
-                        let te = egui::TextEdit::singleline(&mut cr.texts[1])
-                            .id_source(id_h)
-                            .desired_width(48.0)
-                            .font(egui::FontId::proportional(11.0))
-                            .margin(egui::vec2(2.0, 1.0));
-                        let resp = ui.add(te);
-                        if resp.changed() {
+                        if show_sketch_dimension_field(
+                            ui,
+                            ctx,
+                            id_h,
+                            &mut cr.texts[1],
+                            cr.focused == 1,
+                            &mut cr.pending_focus,
+                            cr.user_edited[1],
+                        ) {
                             cr.user_edited[1] = true;
                         }
                     });
@@ -467,24 +843,94 @@ impl App {
                     cr.focused = 0;
                 } else if current == Some(id_h) {
                     cr.focused = 1;
-                }
-
-                if current != Some(id_w) && current != Some(id_h) {
+                } else if cr.pending_focus {
                     let target_id = if cr.focused == 0 { id_w } else { id_h };
                     ctx.memory_mut(|m| m.request_focus(target_id));
+                }
+
+                if let Some(edge) = current
+                    .and_then(|id| {
+                        if id == id_w {
+                            rect_dim_edge_for_focus(0)
+                        } else if id == id_h {
+                            rect_dim_edge_for_focus(1)
+                        } else {
+                            None
+                        }
+                    })
+                {
+                    let (a, b) = rect_edge_endpoints(x0, y0, x1, y1, edge);
+                    draw_world_segment(
+                        &painter,
+                        &project,
+                        a,
+                        b,
+                        col::DIM_EDGE_HIGHLIGHT,
+                        3.5,
+                    );
+                }
+            }
+        }
+
+        if let Some(cl) = &mut self.state.creating_line {
+            let end = cl.end_point();
+            if let (Some(pa), Some(pb)) = (
+                project(Vec3::new(cl.origin.x, cl.origin.y, 0.0)),
+                project(Vec3::new(end.x, end.y, 0.0)),
+            ) {
+                let layout = line_dim_layout(pa, pb);
+                let ctx = ui.ctx();
+                let id_len = egui::Id::new("cl_length");
+
+                egui::Area::new(egui::Id::new("cl_length_area"))
+                    .fixed_pos(layout.pos)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        if show_sketch_dimension_field(
+                            ui,
+                            ctx,
+                            id_len,
+                            &mut cl.text,
+                            true,
+                            &mut cl.pending_focus,
+                            cl.user_edited,
+                        ) {
+                            cl.user_edited = true;
+                        }
+                    });
+
+                let length_focused = ctx.memory(|m| m.focused()) == Some(id_len);
+                if !length_focused && cl.pending_focus {
+                    ctx.memory_mut(|m| m.request_focus(id_len));
+                } else if length_focused {
+                    let preview = Line::from_endpoints(cl.origin.x, cl.origin.y, end.x, end.y);
+                    draw_line_segment(
+                        &painter,
+                        &project,
+                        preview,
+                        col::DIM_EDGE_HIGHLIGHT,
+                        3.5,
+                    );
                 }
             }
         }
 
         let hint = match self.state.tool {
             Tool::Select => {
-                "Right-drag: orbit  •  Shift+right-drag: pan  •  Wheel: zoom  •  r: rectangle"
+                "Right-drag: orbit  •  Shift+right-drag: pan  •  Wheel: zoom  •  r: rectangle  •  l: line"
             }
             Tool::Rectangle => {
                 if self.state.creating_rect.is_some() {
-                    "Move mouse (free dim) • Type in focused input to constrain • Tab: switch dims • Enter: create rect • Esc: cancel"
+                    "Move mouse (free dim) • Type in focused input to constrain • Tab: switch dims • Click/Enter: create rect • Esc: cancel"
                 } else {
                     "r: rectangle  •  Left-click to set corner • move to size • Right-drag: orbit  • Shift+right-drag: pan  •  Wheel: zoom"
+                }
+            }
+            Tool::Line => {
+                if self.state.creating_line.is_some() {
+                    "Move mouse (free length) • Type in length input to constrain • Click/Enter: create line • Esc: cancel"
+                } else {
+                    "l: line  •  Left-click to set start • move to aim • Right-drag: orbit  • Shift+right-drag: pan  •  Wheel: zoom"
                 }
             }
         };
@@ -498,6 +944,43 @@ impl App {
     }
 }
 
+/// Which normalized rectangle edge corresponds to a dimension input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RectDimEdge {
+    /// Horizontal edge at min Y (width).
+    Width,
+    /// Vertical edge at min X (height).
+    Height,
+}
+
+fn rect_dim_edge_for_focus(focused: usize) -> Option<RectDimEdge> {
+    match focused {
+        0 => Some(RectDimEdge::Width),
+        1 => Some(RectDimEdge::Height),
+        _ => None,
+    }
+}
+
+fn rect_edge_endpoints(x0: f32, y0: f32, x1: f32, y1: f32, edge: RectDimEdge) -> (Vec3, Vec3) {
+    match edge {
+        RectDimEdge::Width => (Vec3::new(x0, y0, 0.0), Vec3::new(x1, y0, 0.0)),
+        RectDimEdge::Height => (Vec3::new(x0, y0, 0.0), Vec3::new(x0, y1, 0.0)),
+    }
+}
+
+fn draw_world_segment(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    a: Vec3,
+    b: Vec3,
+    color: egui::Color32,
+    width: f32,
+) {
+    if let (Some(pa), Some(pb)) = (project(a), project(b)) {
+        painter.line_segment([pa, pb], egui::Stroke::new(width, color));
+    }
+}
+
 fn rect_corners(r: Rect) -> [Vec3; 4] {
     [
         Vec3::new(r.x, r.y, 0.0),
@@ -505,6 +988,20 @@ fn rect_corners(r: Rect) -> [Vec3; 4] {
         Vec3::new(r.x + r.w, r.y + r.h, 0.0),
         Vec3::new(r.x, r.y + r.h, 0.0),
     ]
+}
+
+fn draw_line_segment(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    line: Line,
+    color: egui::Color32,
+    width: f32,
+) {
+    let a = Vec3::new(line.x0, line.y0, 0.0);
+    let b = Vec3::new(line.x1, line.y1, 0.0);
+    if let (Some(pa), Some(pb)) = (project(a), project(b)) {
+        painter.line_segment([pa, pb], egui::Stroke::new(width, color));
+    }
 }
 
 fn draw_rect(
@@ -557,7 +1054,177 @@ fn draw_ground(painter: &egui::Painter, project: &impl Fn(Vec3) -> Option<egui::
 #[cfg(test)]
 mod tests {
     use super::actions::CreatingRect;
+    use super::{
+        should_commit_sketch_on_click, should_select_all_rect_value,
+    };
     use glam::Vec3;
+
+    #[test]
+    fn second_viewport_click_commits_sketch() {
+        assert!(should_commit_sketch_on_click(true, true, false));
+        assert!(!should_commit_sketch_on_click(false, true, false));
+        assert!(!should_commit_sketch_on_click(true, true, true));
+        assert!(!should_commit_sketch_on_click(true, false, false));
+    }
+
+    #[test]
+    fn select_all_while_focused_and_not_user_edited() {
+        assert!(should_select_all_rect_value(false, true, true, false, false, false));
+    }
+
+    #[test]
+    fn select_all_on_focus_gain_or_pending_focus() {
+        assert!(should_select_all_rect_value(true, true, true, false, true, false));
+        assert!(should_select_all_rect_value(false, true, true, true, true, false));
+    }
+
+    #[test]
+    fn no_select_all_after_user_edited_without_focus_change() {
+        assert!(!should_select_all_rect_value(false, true, true, false, true, false));
+    }
+
+    #[test]
+    fn typing_multi_digit_value_does_not_reselect_after_each_digit() {
+        // First keystroke on a live-tracked value: don't re-select after the digit lands.
+        assert!(!should_select_all_rect_value(false, true, true, false, false, true));
+        // Later frames while the user continues typing.
+        assert!(!should_select_all_rect_value(false, true, true, false, true, false));
+        assert!(!should_select_all_rect_value(false, true, true, false, true, true));
+    }
+
+    #[test]
+    fn live_mouse_tracking_still_selects_before_user_types() {
+        assert!(should_select_all_rect_value(false, true, true, false, false, false));
+    }
+
+    fn rectangle_anchors(shape: egui::Rect) -> (egui::Pos2, egui::Pos2) {
+        (
+            egui::pos2(shape.center().x, shape.max.y),
+            egui::pos2(shape.min.x, shape.center().y),
+        )
+    }
+
+    #[test]
+    fn rectangle_dim_labels_use_preferred_offsets_when_clear() {
+        use super::{
+            rectangle_dim_layouts, HEIGHT_LABEL_OFFSET, WIDTH_LABEL_OFFSET,
+        };
+        let shape = egui::Rect::from_min_max(egui::pos2(50.0, 50.0), egui::pos2(400.0, 400.0));
+        let (bottom_mid, left_mid) = rectangle_anchors(shape);
+        let (width, height) = rectangle_dim_layouts(bottom_mid, left_mid);
+        assert_eq!(width.pos, bottom_mid + WIDTH_LABEL_OFFSET);
+        assert_eq!(height.pos, left_mid + HEIGHT_LABEL_OFFSET);
+    }
+
+    #[test]
+    fn rectangle_dim_labels_avoid_each_other() {
+        use super::{rectangle_dim_layouts, rectangle_labels_clear};
+        let shape = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(200.0, 160.0));
+        let (bottom_mid, left_mid) = rectangle_anchors(shape);
+        let (width, height) = rectangle_dim_layouts(bottom_mid, left_mid);
+        assert!(rectangle_labels_clear(width.rect, height.rect));
+    }
+
+    #[test]
+    fn rectangle_dim_labels_push_apart_when_overlapping() {
+        use super::{
+            rectangle_dim_layouts, rectangle_labels_clear, HEIGHT_LABEL_OFFSET,
+            WIDTH_LABEL_OFFSET,
+        };
+        // Very short preview: preferred width/height labels overlap near the bottom-left corner.
+        let shape = egui::Rect::from_min_max(egui::pos2(300.0, 300.0), egui::pos2(340.0, 308.0));
+        let (bottom_mid, left_mid) = rectangle_anchors(shape);
+        let (width, height) = rectangle_dim_layouts(bottom_mid, left_mid);
+        assert!(
+            width.pos != bottom_mid + WIDTH_LABEL_OFFSET
+                || height.pos != left_mid + HEIGHT_LABEL_OFFSET,
+            "at least one label should move when they overlap"
+        );
+        assert!(rectangle_labels_clear(width.rect, height.rect));
+    }
+
+    fn line_dim_center(layout: super::DimInputLayout) -> egui::Pos2 {
+        layout.pos + super::DIM_INPUT_SIZE * 0.5
+    }
+
+    #[test]
+    fn line_dim_label_stays_on_line_midpoint() {
+        use super::{line_dim_layout, line_perpendicular_unit};
+        let pa = egui::pos2(40.0, 180.0);
+        let pb = egui::pos2(360.0, 220.0);
+        let mid = pa.lerp(pb, 0.5);
+        let dir = (pb - pa).normalized();
+        let center = line_dim_center(line_dim_layout(pa, pb));
+        let rel = center - mid;
+        let along = rel.dot(dir);
+        assert!(
+            along.abs() < 1.0,
+            "label center should sit on the line midpoint, along={along}"
+        );
+        let perp = line_perpendicular_unit(pa, pb);
+        assert!(rel.dot(perp).abs() > 0.0);
+    }
+
+    #[test]
+    fn line_dim_label_keeps_perpendicular_distance_when_line_tilts() {
+        use super::{dist_rect_to_segment, line_dim_layout, LINE_LABEL_DISTANCE};
+        let pa = egui::pos2(100.0, 200.0);
+        for dy in [0.0, 40.0, 80.0, 120.0, -60.0] {
+            let pb = egui::pos2(300.0, 200.0 + dy);
+            let mid = pa.lerp(pb, 0.5);
+            let dir = (pb - pa).normalized();
+            let layout = line_dim_layout(pa, pb);
+            let center = line_dim_center(layout);
+            let along = (center - mid).dot(dir);
+            assert!(along.abs() < 1.0, "dy={dy}: along={along}");
+            let gap = dist_rect_to_segment(layout.rect, pa, pb);
+            assert!(
+                (gap - LINE_LABEL_DISTANCE).abs() < 1.0,
+                "dy={dy}: expected gap {LINE_LABEL_DISTANCE}, got {gap}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_dim_label_avoids_segment() {
+        use super::{line_dim_layout, segment_intersects_rect, DIM_LABEL_GAP};
+        let pa = egui::pos2(200.0, 200.0);
+        let pb = egui::pos2(320.0, 260.0);
+        let layout = line_dim_layout(pa, pb);
+        assert!(!segment_intersects_rect(
+            pa,
+            pb,
+            layout.rect.expand(DIM_LABEL_GAP)
+        ));
+    }
+
+    #[test]
+    fn width_focus_maps_to_bottom_edge() {
+        use super::{rect_dim_edge_for_focus, rect_edge_endpoints, RectDimEdge};
+        assert_eq!(rect_dim_edge_for_focus(0), Some(RectDimEdge::Width));
+        let (a, b) = rect_edge_endpoints(1.0, 2.0, 5.0, 8.0, RectDimEdge::Width);
+        assert_eq!(a, Vec3::new(1.0, 2.0, 0.0));
+        assert_eq!(b, Vec3::new(5.0, 2.0, 0.0));
+    }
+
+    #[test]
+    fn height_focus_maps_to_left_edge() {
+        use super::{rect_dim_edge_for_focus, rect_edge_endpoints, RectDimEdge};
+        assert_eq!(rect_dim_edge_for_focus(1), Some(RectDimEdge::Height));
+        let (a, b) = rect_edge_endpoints(1.0, 2.0, 5.0, 8.0, RectDimEdge::Height);
+        assert_eq!(a, Vec3::new(1.0, 2.0, 0.0));
+        assert_eq!(b, Vec3::new(1.0, 8.0, 0.0));
+    }
+
+    #[test]
+    fn dim_input_selection_highlight_is_faint() {
+        use super::col::DIM_INPUT_SELECTION;
+        assert!(
+            DIM_INPUT_SELECTION.a() <= 48,
+            "selection fill should be faint (alpha <= 48), got {}",
+            DIM_INPUT_SELECTION.a()
+        );
+    }
 
     fn make_cr(origin: (f32, f32), texts: [&str; 2], mouse: (f32, f32)) -> CreatingRect {
         CreatingRect {
@@ -566,6 +1233,7 @@ mod tests {
             focused: 0,
             last_mouse: Vec3::new(mouse.0, mouse.1, 0.0),
             user_edited: [true, true],
+            pending_focus: false,
         }
     }
 

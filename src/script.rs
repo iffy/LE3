@@ -20,7 +20,9 @@ pub enum Instruction {
     Undo,
     Tool(Tool),
     SetDim { axis: RectAxis, value: String },
+    SetLineLength { value: String },
     FocusDim(RectAxis),
+    FocusLineLength,
     Orbit { dx: f32, dy: f32 },
     Pan { dx: f32, dy: f32 },
     Zoom { scroll: f32 },
@@ -64,6 +66,7 @@ impl Instruction {
             Instruction::Undo => "undo".to_string(),
             Instruction::Tool(Tool::Select) => "tool select".to_string(),
             Instruction::Tool(Tool::Rectangle) => "tool rectangle".to_string(),
+            Instruction::Tool(Tool::Line) => "tool line".to_string(),
             Instruction::SetDim { axis, value } => {
                 let name = match axis {
                     RectAxis::Width => "width",
@@ -71,6 +74,7 @@ impl Instruction {
                 };
                 format!("set_dim {name} {value}")
             }
+            Instruction::SetLineLength { value } => format!("set_dim length {value}"),
             Instruction::FocusDim(axis) => {
                 let name = match axis {
                     RectAxis::Width => "width",
@@ -78,6 +82,7 @@ impl Instruction {
                 };
                 format!("focus_dim {name}")
             }
+            Instruction::FocusLineLength => "focus_dim length".to_string(),
             Instruction::Orbit { dx, dy } => format!("orbit {dx} {dy}"),
             Instruction::Pan { dx, dy } => format!("pan {dx} {dy}"),
             Instruction::Zoom { scroll } => format!("zoom {scroll}"),
@@ -179,7 +184,9 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
         "tool" => {
             let name = rest.split_whitespace().next().unwrap_or("");
             Tool::from_name(name).map(Instruction::Tool).ok_or_else(|| {
-                err(&format!("unknown tool '{name}' (expected select or rectangle)"))
+                err(&format!(
+                    "unknown tool '{name}' (expected select, rectangle, or line)"
+                ))
             })
         }
 
@@ -187,19 +194,29 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
             let mut parts = rest.split_whitespace();
             let axis_name = parts.next().ok_or_else(|| err("set_dim requires axis and value"))?;
             let value = parts.next().ok_or_else(|| err("set_dim requires a value"))?;
-            let axis = RectAxis::from_name(axis_name)
-                .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
-            Ok(Instruction::SetDim {
-                axis,
-                value: value.to_string(),
-            })
+            if matches!(axis_name.to_ascii_lowercase().as_str(), "length" | "len" | "l") {
+                Ok(Instruction::SetLineLength {
+                    value: value.to_string(),
+                })
+            } else {
+                let axis = RectAxis::from_name(axis_name)
+                    .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
+                Ok(Instruction::SetDim {
+                    axis,
+                    value: value.to_string(),
+                })
+            }
         }
 
         "focus_dim" | "focusdim" => {
             let axis_name = rest.split_whitespace().next().unwrap_or("");
-            let axis = RectAxis::from_name(axis_name)
-                .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
-            Ok(Instruction::FocusDim(axis))
+            if matches!(axis_name.to_ascii_lowercase().as_str(), "length" | "len" | "l") {
+                Ok(Instruction::FocusLineLength)
+            } else {
+                let axis = RectAxis::from_name(axis_name)
+                    .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
+                Ok(Instruction::FocusDim(axis))
+            }
         }
 
         "orbit" | "right_drag" | "rightdrag" => {
@@ -776,16 +793,16 @@ impl ScriptRunner {
                 let _ = state.apply(Action::SetRectDimension { axis, value });
                 StepResult::Continue
             }
+            Instruction::SetLineLength { value } => {
+                let _ = state.apply(Action::SetLineLength { value });
+                StepResult::Continue
+            }
             Instruction::FocusDim(axis) => {
                 let _ = state.apply(Action::FocusRectDimension { axis });
-                if viewport.is_some() {
-                    let id = if axis.index() == 0 {
-                        egui::Id::new("cr_width")
-                    } else {
-                        egui::Id::new("cr_height")
-                    };
-                    ctx.memory_mut(|m| m.request_focus(id));
-                }
+                StepResult::Continue
+            }
+            Instruction::FocusLineLength => {
+                let _ = state.apply(Action::FocusLineLength);
                 StepResult::Continue
             }
             Instruction::Orbit { dx, dy } => {
@@ -801,7 +818,14 @@ impl ScriptRunner {
                 StepResult::Continue
             }
             Instruction::Zoom { scroll } => {
-                state.apply(Action::ZoomCamera { scroll });
+                let Some(vp) = viewport else {
+                    return StepResult::Wait;
+                };
+                state.apply(Action::ZoomCamera {
+                    scroll,
+                    focal: vp.center(),
+                    viewport: vp,
+                });
                 StepResult::Continue
             }
 
@@ -1077,6 +1101,21 @@ mod tests {
         runner.tick(&mut state, &mut synthetic, Some(vp), &ctx);
         assert!(state.doc.rects.is_empty());
         assert!(runner.done);
+    }
+
+    #[test]
+    fn parses_line_tool_and_length_dim() {
+        let ins = parse("tool line\nset_dim length 25\nfocus_dim length").unwrap();
+        assert_eq!(
+            ins,
+            vec![
+                Instruction::Tool(Tool::Line),
+                Instruction::SetLineLength {
+                    value: "25".to_string()
+                },
+                Instruction::FocusLineLength,
+            ]
+        );
     }
 
     #[test]

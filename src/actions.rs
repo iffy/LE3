@@ -4,7 +4,7 @@
 //! same [`Action`] values so behaviour stays in sync.
 
 use crate::camera::Camera;
-use crate::model::{Document, Rect};
+use crate::model::{Document, Line, Rect, ShapeKind};
 use eframe::egui;
 use glam::Vec3;
 
@@ -17,6 +17,9 @@ pub enum Tool {
     /// Click to fix first corner of rectangle; move to position opposite corner;
     /// on-screen number inputs allow typing constraints; Enter commits.
     Rectangle,
+    /// Click to fix first endpoint; move mouse for direction and length;
+    /// on-screen length input allows typing a constraint; Enter commits.
+    Line,
 }
 
 impl Tool {
@@ -24,6 +27,7 @@ impl Tool {
         match name.to_ascii_lowercase().as_str() {
             "select" => Some(Tool::Select),
             "rectangle" | "rect" => Some(Tool::Rectangle),
+            "line" => Some(Tool::Line),
             _ => None,
         }
     }
@@ -42,6 +46,8 @@ pub struct CreatingRect {
     pub last_mouse: Vec3,
     /// Tracks whether user has typed into each field.
     pub user_edited: [bool; 2],
+    /// When true, the focused dimension input should claim keyboard focus.
+    pub pending_focus: bool,
 }
 
 impl CreatingRect {
@@ -65,6 +71,44 @@ impl CreatingRect {
     }
 }
 
+/// State for the in-progress (pre-Enter) line creation.
+#[derive(Clone, Debug)]
+pub struct CreatingLine {
+    /// Fixed first endpoint in ground coords.
+    pub origin: Vec3,
+    /// Text content of the length input.
+    pub text: String,
+    /// Current mouse projected ground point (drives free length + direction).
+    pub last_mouse: Vec3,
+    /// Tracks whether user has typed into the length field.
+    pub user_edited: bool,
+    /// When true, the length input should claim keyboard focus.
+    pub pending_focus: bool,
+}
+
+impl CreatingLine {
+    /// Current second endpoint, respecting any locked length from `text`.
+    pub fn end_point(&self) -> Vec3 {
+        let dx = self.last_mouse.x - self.origin.x;
+        let dy = self.last_mouse.y - self.origin.y;
+        let dist = (dx * dx + dy * dy).sqrt();
+        let len = if let Ok(v) = self.text.trim().parse::<f32>() {
+            if v > 0.0 { v } else { dist }
+        } else {
+            dist
+        };
+        if dist < 1e-6 {
+            return Vec3::new(self.origin.x + len, self.origin.y, 0.0);
+        }
+        let scale = len / dist;
+        Vec3::new(
+            self.origin.x + dx * scale,
+            self.origin.y + dy * scale,
+            0.0,
+        )
+    }
+}
+
 /// Every user-visible operation the app supports.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
@@ -78,9 +122,16 @@ pub enum Action {
     CommitRectangle,
     SetRectDimension { axis: RectAxis, value: String },
     FocusRectDimension { axis: RectAxis },
+    CommitLine,
+    SetLineLength { value: String },
+    FocusLineLength,
     OrbitCamera { delta: (f32, f32) },
     PanCamera { delta: (f32, f32), viewport_height: f32 },
-    ZoomCamera { scroll: f32 },
+    ZoomCamera {
+        scroll: f32,
+        focal: egui::Pos2,
+        viewport: egui::Rect,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +164,7 @@ pub struct AppState {
     pub tool: Tool,
     pub cam: Camera,
     pub creating_rect: Option<CreatingRect>,
+    pub creating_line: Option<CreatingLine>,
     pub status: String,
 }
 
@@ -124,6 +176,7 @@ impl Default for AppState {
             tool: Tool::default(),
             cam: Camera::default(),
             creating_rect: None,
+            creating_line: None,
             status: String::new(),
         }
     }
@@ -145,17 +198,19 @@ impl AppState {
                 self.doc = Document::default();
                 self.path = None;
                 self.creating_rect = None;
+                self.creating_line = None;
                 self.status = "New document".to_string();
                 ActionResult::Ok
             }
             Action::Open { path } => match crate::storage::open(&path) {
                 Ok(doc) => {
+                    let n_rects = doc.rects.len();
+                    let n_lines = doc.lines.len();
                     self.doc = doc;
                     self.path = Some(path.clone());
                     self.status = format!(
-                        "Opened {} ({} rectangle(s))",
-                        path,
-                        self.doc.rects.len()
+                        "Opened {} ({} rectangle(s), {} line(s))",
+                        path, n_rects, n_lines
                     );
                     ActionResult::Ok
                 }
@@ -173,14 +228,22 @@ impl AppState {
             }
             Action::Clear => {
                 self.doc.rects.clear();
+                self.doc.lines.clear();
+                self.doc.shape_order.clear();
                 self.status = "Cleared".to_string();
                 ActionResult::Ok
             }
             Action::UndoLast => {
-                if self.doc.rects.pop().is_some() {
-                    self.status = "Undid last rectangle".to_string();
-                } else {
-                    self.status = "Nothing to undo".to_string();
+                match self.doc.shape_order.pop() {
+                    Some(ShapeKind::Rect) => {
+                        self.doc.rects.pop();
+                        self.status = "Undid last rectangle".to_string();
+                    }
+                    Some(ShapeKind::Line) => {
+                        self.doc.lines.pop();
+                        self.status = "Undid last line".to_string();
+                    }
+                    None => self.status = "Nothing to undo".to_string(),
                 }
                 ActionResult::Ok
             }
@@ -188,15 +251,19 @@ impl AppState {
                 if self.creating_rect.is_some() && tool != Tool::Rectangle {
                     self.creating_rect = None;
                 }
+                if self.creating_line.is_some() && tool != Tool::Line {
+                    self.creating_line = None;
+                }
                 self.tool = tool;
                 self.status = match tool {
                     Tool::Select => "Select tool".to_string(),
                     Tool::Rectangle => "Rectangle tool".to_string(),
+                    Tool::Line => "Line tool".to_string(),
                 };
                 ActionResult::Ok
             }
             Action::CancelOperation => {
-                if self.creating_rect.take().is_some() {
+                if self.creating_rect.take().is_some() || self.creating_line.take().is_some() {
                     self.status = "Cancelled".to_string();
                 } else if self.tool != Tool::Select {
                     self.tool = Tool::Select;
@@ -212,9 +279,11 @@ impl AppState {
                 let rect = Rect::from_corners(cr.origin.x, cr.origin.y, end.x, end.y);
                 if rect.w > 0.5 && rect.h > 0.5 {
                     self.doc.rects.push(rect);
+                    self.doc.shape_order.push(ShapeKind::Rect);
                     self.status = format!("Added rectangle ({:.1} × {:.1} mm)", rect.w, rect.h);
                     ActionResult::Ok
                 } else {
+                    self.creating_rect = Some(cr);
                     self.status = "Rectangle too small".to_string();
                     ActionResult::Err("Rectangle too small".to_string())
                 }
@@ -233,6 +302,40 @@ impl AppState {
                     return ActionResult::Err("No rectangle in progress".to_string());
                 };
                 cr.focused = axis.index();
+                cr.pending_focus = true;
+                ActionResult::Ok
+            }
+            Action::CommitLine => {
+                let Some(cl) = self.creating_line.take() else {
+                    return ActionResult::Err("No line in progress".to_string());
+                };
+                let end = cl.end_point();
+                let line = Line::from_endpoints(cl.origin.x, cl.origin.y, end.x, end.y);
+                if line.length() > 0.5 {
+                    let len = line.length();
+                    self.doc.lines.push(line);
+                    self.doc.shape_order.push(ShapeKind::Line);
+                    self.status = format!("Added line ({:.1} mm)", len);
+                    ActionResult::Ok
+                } else {
+                    self.creating_line = Some(cl);
+                    self.status = "Line too short".to_string();
+                    ActionResult::Err("Line too short".to_string())
+                }
+            }
+            Action::SetLineLength { value } => {
+                let Some(cl) = &mut self.creating_line else {
+                    return ActionResult::Err("No line in progress".to_string());
+                };
+                cl.text = value;
+                cl.user_edited = true;
+                ActionResult::Ok
+            }
+            Action::FocusLineLength => {
+                let Some(cl) = &mut self.creating_line else {
+                    return ActionResult::Err("No line in progress".to_string());
+                };
+                cl.pending_focus = true;
                 ActionResult::Ok
             }
             Action::OrbitCamera { delta } => {
@@ -246,8 +349,12 @@ impl AppState {
                 self.cam.pan(egui::vec2(delta.0, delta.1), viewport_height);
                 ActionResult::Ok
             }
-            Action::ZoomCamera { scroll } => {
-                self.cam.zoom(scroll);
+            Action::ZoomCamera {
+                scroll,
+                focal,
+                viewport,
+            } => {
+                self.cam.zoom(scroll, focal, viewport);
                 ActionResult::Ok
             }
         }
@@ -257,7 +364,12 @@ impl AppState {
         match crate::storage::save(path, &self.doc) {
             Ok(()) => {
                 self.path = Some(path.to_string());
-                self.status = format!("Saved {} rectangle(s) to {}", self.doc.rects.len(), path);
+                self.status = format!(
+                    "Saved {} rectangle(s), {} line(s) to {}",
+                    self.doc.rects.len(),
+                    self.doc.lines.len(),
+                    path
+                );
                 ActionResult::Ok
             }
             Err(e) => {
@@ -281,21 +393,24 @@ mod tests {
             w: 10.,
             h: 10.,
         });
+        state.doc.lines.push(Line::from_endpoints(0., 0., 1., 0.));
+        state.doc.shape_order.push(ShapeKind::Line);
         state.path = Some("/tmp/test.le3".to_string());
         state.apply(Action::NewDocument);
         assert!(state.doc.rects.is_empty());
+        assert!(state.doc.lines.is_empty());
         assert!(state.path.is_none());
     }
 
     #[test]
-    fn set_tool_rectangle() {
+    fn set_tool_line() {
         let mut state = AppState::default();
-        state.apply(Action::SetTool(Tool::Rectangle));
-        assert_eq!(state.tool, Tool::Rectangle);
+        state.apply(Action::SetTool(Tool::Line));
+        assert_eq!(state.tool, Tool::Line);
     }
 
     #[test]
-    fn undo_last_removes_rectangle() {
+    fn undo_last_removes_most_recent_shape() {
         let mut state = AppState::default();
         state.doc.rects.push(Rect {
             x: 0.,
@@ -303,8 +418,109 @@ mod tests {
             w: 1.,
             h: 1.,
         });
+        state.doc.shape_order.push(ShapeKind::Rect);
+        state.doc.lines.push(Line::from_endpoints(0., 0., 5., 0.));
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.apply(Action::UndoLast);
+        assert_eq!(state.doc.lines.len(), 0);
+        assert_eq!(state.doc.rects.len(), 1);
         state.apply(Action::UndoLast);
         assert!(state.doc.rects.is_empty());
+    }
+
+    #[test]
+    fn commit_rectangle_adds_to_document() {
+        let mut state = AppState::default();
+        state.creating_rect = Some(CreatingRect {
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            texts: ["10".to_string(), "5".to_string()],
+            focused: 0,
+            last_mouse: Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [true, true],
+            pending_focus: false,
+        });
+        state.apply(Action::CommitRectangle);
+        assert_eq!(state.doc.rects.len(), 1);
+        assert!((state.doc.rects[0].w - 10.0).abs() < 1e-4);
+        assert!((state.doc.rects[0].h - 5.0).abs() < 1e-4);
+        assert!(state.creating_rect.is_none());
+    }
+
+    #[test]
+    fn commit_line_adds_to_document() {
+        let mut state = AppState::default();
+        state.creating_line = Some(CreatingLine {
+            origin: Vec3::ZERO,
+            text: "10".to_string(),
+            last_mouse: Vec3::new(10.0, 0.0, 0.0),
+            user_edited: true,
+            pending_focus: false,
+        });
+        state.apply(Action::CommitLine);
+        assert_eq!(state.doc.lines.len(), 1);
+        assert!((state.doc.lines[0].length() - 10.0).abs() < 1e-4);
+        assert!(state.creating_line.is_none());
+    }
+
+    #[test]
+    fn line_end_point_uses_locked_length() {
+        let cl = CreatingLine {
+            origin: Vec3::new(1.0, 2.0, 0.0),
+            text: "5".to_string(),
+            last_mouse: Vec3::new(4.0, 6.0, 0.0),
+            user_edited: true,
+            pending_focus: false,
+        };
+        let end = cl.end_point();
+        let line = Line::from_endpoints(cl.origin.x, cl.origin.y, end.x, end.y);
+        assert!((line.length() - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn line_end_point_defaults_along_x_when_no_direction() {
+        let cl = CreatingLine {
+            origin: Vec3::ZERO,
+            text: "7".to_string(),
+            last_mouse: Vec3::ZERO,
+            user_edited: true,
+            pending_focus: false,
+        };
+        let end = cl.end_point();
+        assert!((end.x - 7.0).abs() < 1e-4);
+        assert!(end.y.abs() < 1e-4);
+    }
+
+    #[test]
+    fn focus_rect_dimension_sets_pending_focus() {
+        let mut state = AppState::default();
+        state.creating_rect = Some(CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["".to_string(), "".to_string()],
+            focused: 0,
+            last_mouse: Vec3::ZERO,
+            user_edited: [false, false],
+            pending_focus: false,
+        });
+        state.apply(Action::FocusRectDimension {
+            axis: RectAxis::Height,
+        });
+        let cr = state.creating_rect.as_ref().unwrap();
+        assert_eq!(cr.focused, 1);
+        assert!(cr.pending_focus);
+    }
+
+    #[test]
+    fn focus_line_length_sets_pending_focus() {
+        let mut state = AppState::default();
+        state.creating_line = Some(CreatingLine {
+            origin: Vec3::ZERO,
+            text: String::new(),
+            last_mouse: Vec3::ZERO,
+            user_edited: false,
+            pending_focus: false,
+        });
+        state.apply(Action::FocusLineLength);
+        assert!(state.creating_line.as_ref().unwrap().pending_focus);
     }
 
     #[test]
