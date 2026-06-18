@@ -52,18 +52,31 @@ impl Line {
     }
 }
 
+/// A construction plane in world space (millimetres). Not exported to `.le3`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConstructionPlane {
+    pub origin: glam::Vec3,
+    pub normal: glam::Vec3,
+    pub u_axis: glam::Vec3,
+    pub v_axis: glam::Vec3,
+}
+
 /// Which sketch primitive was created, in chronological order (for undo).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeKind {
     Rect,
     Line,
+    ConstructionPlane,
 }
 
-/// The whole document: rectangles and lines on one sketch.
+/// The whole document: rectangles and lines on one sketch, plus in-session construction.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub rects: Vec<Rect>,
     pub lines: Vec<Line>,
+    /// Construction planes live in the document but are not written to `.le3`.
+    #[serde(skip)]
+    pub construction_planes: Vec<ConstructionPlane>,
     pub shape_order: Vec<ShapeKind>,
 }
 

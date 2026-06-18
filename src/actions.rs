@@ -4,8 +4,11 @@
 //! same [`Action`] values so behaviour stays in sync.
 
 use crate::camera::{Camera, ProjectionMode, StandardView, VIEW_TRANSITION_DURATION};
+use crate::construction::{
+    live_axis_dims, live_face_offset, resolve_plane, PlaneDim, PlaneReference,
+};
 use crate::view_cube::{self, CubeCornerId, CubeEdgeId};
-use crate::model::{Document, Line, Rect, ShapeKind};
+use crate::model::{ConstructionPlane, Document, Line, Rect, ShapeKind};
 use eframe::egui;
 use glam::Vec3;
 
@@ -21,6 +24,8 @@ pub enum Tool {
     /// Click to fix first endpoint; move mouse for direction and length;
     /// on-screen length input allows typing a constraint; Enter commits.
     Line,
+    /// Click a face or axis/line, then set offset (and angle for axes); Enter commits.
+    ConstructionPlane,
 }
 
 impl Tool {
@@ -29,6 +34,9 @@ impl Tool {
             "select" => Some(Tool::Select),
             "rectangle" | "rect" => Some(Tool::Rectangle),
             "line" => Some(Tool::Line),
+            "plane" | "construction_plane" | "constructionplane" | "construction plane" => {
+                Some(Tool::ConstructionPlane)
+            }
             _ => None,
         }
     }
@@ -110,6 +118,47 @@ impl CreatingLine {
     }
 }
 
+/// State for the in-progress construction-plane creation.
+#[derive(Clone, Debug)]
+pub struct CreatingConstructionPlane {
+    pub reference: PlaneReference,
+    pub offset_text: String,
+    pub angle_text: String,
+    pub focused: PlaneDim,
+    pub last_mouse: Vec3,
+    pub user_edited_offset: bool,
+    pub user_edited_angle: bool,
+    pub pending_focus: bool,
+}
+
+impl CreatingConstructionPlane {
+    pub fn preview_plane(&self) -> ConstructionPlane {
+        let (live_offset, live_angle) = self.live_dims();
+        resolve_plane(
+            &self.reference,
+            &self.offset_text,
+            &self.angle_text,
+            live_offset,
+            live_angle,
+            self.user_edited_offset,
+            self.user_edited_angle,
+        )
+    }
+
+    pub fn live_dims(&self) -> (f32, f32) {
+        match &self.reference {
+            PlaneReference::Face { origin, normal, .. } => {
+                (live_face_offset(*origin, *normal, self.last_mouse), 0.0)
+            }
+            PlaneReference::Axis {
+                origin,
+                direction,
+                ..
+            } => live_axis_dims(*origin, *direction, self.last_mouse),
+        }
+    }
+}
+
 /// Every user-visible operation the app supports.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
@@ -126,6 +175,11 @@ pub enum Action {
     CommitLine,
     SetLineLength { value: String },
     FocusLineLength,
+    BeginConstructionPlane { reference: PlaneReference },
+    CommitConstructionPlane,
+    SetPlaneOffset { value: String },
+    SetPlaneAngle { value: String },
+    FocusPlaneDim { dim: PlaneDim },
     OrbitCamera { delta: (f32, f32) },
     PanCamera { delta: (f32, f32), viewport_height: f32 },
     ZoomCamera {
@@ -238,6 +292,7 @@ pub struct AppState {
     pub cam: Camera,
     pub creating_rect: Option<CreatingRect>,
     pub creating_line: Option<CreatingLine>,
+    pub creating_plane: Option<CreatingConstructionPlane>,
     pub panes: PaneVisibility,
     pub status: String,
 }
@@ -251,6 +306,7 @@ impl Default for AppState {
             cam: Camera::default(),
             creating_rect: None,
             creating_line: None,
+            creating_plane: None,
             panes: PaneVisibility::default(),
             status: String::new(),
         }
@@ -278,6 +334,7 @@ impl AppState {
                 self.path = None;
                 self.creating_rect = None;
                 self.creating_line = None;
+                self.creating_plane = None;
                 self.status = "New document".to_string();
                 ActionResult::Ok
             }
@@ -308,6 +365,7 @@ impl AppState {
             Action::Clear => {
                 self.doc.rects.clear();
                 self.doc.lines.clear();
+                self.doc.construction_planes.clear();
                 self.doc.shape_order.clear();
                 self.status = "Cleared".to_string();
                 ActionResult::Ok
@@ -322,6 +380,10 @@ impl AppState {
                         self.doc.lines.pop();
                         self.status = "Undid last line".to_string();
                     }
+                    Some(ShapeKind::ConstructionPlane) => {
+                        self.doc.construction_planes.pop();
+                        self.status = "Undid last construction plane".to_string();
+                    }
                     None => self.status = "Nothing to undo".to_string(),
                 }
                 ActionResult::Ok
@@ -333,16 +395,23 @@ impl AppState {
                 if self.creating_line.is_some() && tool != Tool::Line {
                     self.creating_line = None;
                 }
+                if self.creating_plane.is_some() && tool != Tool::ConstructionPlane {
+                    self.creating_plane = None;
+                }
                 self.tool = tool;
                 self.status = match tool {
                     Tool::Select => "Select tool".to_string(),
                     Tool::Rectangle => "Rectangle tool".to_string(),
                     Tool::Line => "Line tool".to_string(),
+                    Tool::ConstructionPlane => "Construction plane tool".to_string(),
                 };
                 ActionResult::Ok
             }
             Action::CancelOperation => {
-                if self.creating_rect.take().is_some() || self.creating_line.take().is_some() {
+                if self.creating_rect.take().is_some()
+                    || self.creating_line.take().is_some()
+                    || self.creating_plane.take().is_some()
+                {
                     self.status = "Cancelled".to_string();
                 } else if self.tool != Tool::Select {
                     self.tool = Tool::Select;
@@ -415,6 +484,64 @@ impl AppState {
                     return ActionResult::Err("No line in progress".to_string());
                 };
                 cl.pending_focus = true;
+                ActionResult::Ok
+            }
+            Action::BeginConstructionPlane { reference } => {
+                let hover = match &reference {
+                    PlaneReference::Face { origin, .. } => *origin,
+                    PlaneReference::Axis { origin, .. } => *origin,
+                };
+                self.creating_plane = Some(CreatingConstructionPlane {
+                    reference,
+                    offset_text: String::new(),
+                    angle_text: String::new(),
+                    focused: PlaneDim::Offset,
+                    last_mouse: hover,
+                    user_edited_offset: false,
+                    user_edited_angle: false,
+                    pending_focus: true,
+                });
+                self.status = "Set offset • type to lock • Tab cycle dims • click/Enter commit • Esc cancel"
+                    .to_string();
+                ActionResult::Ok
+            }
+            Action::CommitConstructionPlane => {
+                let Some(cp) = self.creating_plane.take() else {
+                    return ActionResult::Err("No construction plane in progress".to_string());
+                };
+                let plane = cp.preview_plane();
+                let (live_offset, _) = cp.live_dims();
+                self.doc.construction_planes.push(plane);
+                self.doc.shape_order.push(ShapeKind::ConstructionPlane);
+                self.status = format!(
+                    "Added construction plane ({:.1} mm from {})",
+                    live_offset,
+                    cp.reference.label()
+                );
+                ActionResult::Ok
+            }
+            Action::SetPlaneOffset { value } => {
+                let Some(cp) = &mut self.creating_plane else {
+                    return ActionResult::Err("No construction plane in progress".to_string());
+                };
+                cp.offset_text = value;
+                cp.user_edited_offset = true;
+                ActionResult::Ok
+            }
+            Action::SetPlaneAngle { value } => {
+                let Some(cp) = &mut self.creating_plane else {
+                    return ActionResult::Err("No construction plane in progress".to_string());
+                };
+                cp.angle_text = value;
+                cp.user_edited_angle = true;
+                ActionResult::Ok
+            }
+            Action::FocusPlaneDim { dim } => {
+                let Some(cp) = &mut self.creating_plane else {
+                    return ActionResult::Err("No construction plane in progress".to_string());
+                };
+                cp.focused = dim;
+                cp.pending_focus = true;
                 ActionResult::Ok
             }
             Action::OrbitCamera { delta } => {
@@ -527,6 +654,55 @@ mod tests {
         let mut state = AppState::default();
         state.apply(Action::SetTool(Tool::Line));
         assert_eq!(state.tool, Tool::Line);
+    }
+
+    #[test]
+    fn set_tool_construction_plane() {
+        let mut state = AppState::default();
+        state.apply(Action::SetTool(Tool::ConstructionPlane));
+        assert_eq!(state.tool, Tool::ConstructionPlane);
+    }
+
+    #[test]
+    fn commit_construction_plane_adds_to_document_not_export_list() {
+        let mut state = AppState::default();
+        state.apply(Action::BeginConstructionPlane {
+            reference: PlaneReference::Face {
+                origin: Vec3::ZERO,
+                normal: Vec3::Z,
+                label: "Ground".to_string(),
+            },
+        });
+        let mut cp = state.creating_plane.take().unwrap();
+        cp.offset_text = "20".to_string();
+        cp.user_edited_offset = true;
+        state.creating_plane = Some(cp);
+        state.apply(Action::CommitConstructionPlane);
+        assert_eq!(state.doc.construction_planes.len(), 1);
+        assert!((state.doc.construction_planes[0].origin.z - 20.0).abs() < 1e-3);
+        assert_eq!(
+            state.doc.shape_order,
+            vec![ShapeKind::ConstructionPlane]
+        );
+    }
+
+    #[test]
+    fn undo_construction_plane() {
+        let mut state = AppState::default();
+        state.apply(Action::BeginConstructionPlane {
+            reference: PlaneReference::Face {
+                origin: Vec3::ZERO,
+                normal: Vec3::Z,
+                label: "Ground".to_string(),
+            },
+        });
+        let mut cp = state.creating_plane.take().unwrap();
+        cp.offset_text = "5".to_string();
+        cp.user_edited_offset = true;
+        state.creating_plane = Some(cp);
+        state.apply(Action::CommitConstructionPlane);
+        state.apply(Action::UndoLast);
+        assert!(state.doc.construction_planes.is_empty());
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! via synthetic pointer/keyboard events and headless actions.
 
 use crate::actions::{Action, AppState, Pane, RectAxis, Tool};
+use crate::construction::PlaneDim;
 use crate::camera::{ProjectionMode, StandardView};
 use crate::view_cube::{CubeCornerId, CubeEdgeId};
 
@@ -24,8 +25,11 @@ pub enum Instruction {
     Tool(Tool),
     SetDim { axis: RectAxis, value: String },
     SetLineLength { value: String },
+    SetPlaneOffset { value: String },
+    SetPlaneAngle { value: String },
     FocusDim(RectAxis),
     FocusLineLength,
+    FocusPlaneDim(PlaneDim),
     Orbit { dx: f32, dy: f32 },
     Pan { dx: f32, dy: f32 },
     Zoom { scroll: f32 },
@@ -77,6 +81,7 @@ impl Instruction {
             Instruction::Tool(Tool::Select) => "tool select".to_string(),
             Instruction::Tool(Tool::Rectangle) => "tool rectangle".to_string(),
             Instruction::Tool(Tool::Line) => "tool line".to_string(),
+            Instruction::Tool(Tool::ConstructionPlane) => "tool plane".to_string(),
             Instruction::SetDim { axis, value } => {
                 let name = match axis {
                     RectAxis::Width => "width",
@@ -85,6 +90,8 @@ impl Instruction {
                 format!("set_dim {name} {value}")
             }
             Instruction::SetLineLength { value } => format!("set_dim length {value}"),
+            Instruction::SetPlaneOffset { value } => format!("set_dim offset {value}"),
+            Instruction::SetPlaneAngle { value } => format!("set_dim angle {value}"),
             Instruction::FocusDim(axis) => {
                 let name = match axis {
                     RectAxis::Width => "width",
@@ -93,6 +100,8 @@ impl Instruction {
                 format!("focus_dim {name}")
             }
             Instruction::FocusLineLength => "focus_dim length".to_string(),
+            Instruction::FocusPlaneDim(PlaneDim::Offset) => "focus_dim offset".to_string(),
+            Instruction::FocusPlaneDim(PlaneDim::Angle) => "focus_dim angle".to_string(),
             Instruction::Orbit { dx, dy } => format!("orbit {dx} {dy}"),
             Instruction::Pan { dx, dy } => format!("pan {dx} {dy}"),
             Instruction::Zoom { scroll } => format!("zoom {scroll}"),
@@ -212,7 +221,7 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
             let name = rest.split_whitespace().next().unwrap_or("");
             Tool::from_name(name).map(Instruction::Tool).ok_or_else(|| {
                 err(&format!(
-                    "unknown tool '{name}' (expected select, rectangle, or line)"
+                    "unknown tool '{name}' (expected select, rectangle, line, or plane)"
                 ))
             })
         }
@@ -239,28 +248,43 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
             let mut parts = rest.split_whitespace();
             let axis_name = parts.next().ok_or_else(|| err("set_dim requires axis and value"))?;
             let value = parts.next().ok_or_else(|| err("set_dim requires a value"))?;
-            if matches!(axis_name.to_ascii_lowercase().as_str(), "length" | "len" | "l") {
-                Ok(Instruction::SetLineLength {
+            match axis_name.to_ascii_lowercase().as_str() {
+                "length" | "len" | "l" => Ok(Instruction::SetLineLength {
                     value: value.to_string(),
-                })
-            } else {
-                let axis = RectAxis::from_name(axis_name)
-                    .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
-                Ok(Instruction::SetDim {
-                    axis,
-                    value: value.to_string(),
-                })
+                }),
+                _ if PlaneDim::from_name(axis_name).is_some() => {
+                    match PlaneDim::from_name(axis_name).unwrap() {
+                        PlaneDim::Offset => Ok(Instruction::SetPlaneOffset {
+                            value: value.to_string(),
+                        }),
+                        PlaneDim::Angle => Ok(Instruction::SetPlaneAngle {
+                            value: value.to_string(),
+                        }),
+                    }
+                }
+                _ => {
+                    let axis = RectAxis::from_name(axis_name)
+                        .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
+                    Ok(Instruction::SetDim {
+                        axis,
+                        value: value.to_string(),
+                    })
+                }
             }
         }
 
         "focus_dim" | "focusdim" => {
             let axis_name = rest.split_whitespace().next().unwrap_or("");
-            if matches!(axis_name.to_ascii_lowercase().as_str(), "length" | "len" | "l") {
-                Ok(Instruction::FocusLineLength)
-            } else {
-                let axis = RectAxis::from_name(axis_name)
-                    .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
-                Ok(Instruction::FocusDim(axis))
+            match axis_name.to_ascii_lowercase().as_str() {
+                "length" | "len" | "l" => Ok(Instruction::FocusLineLength),
+                _ if PlaneDim::from_name(axis_name).is_some() => {
+                    Ok(Instruction::FocusPlaneDim(PlaneDim::from_name(axis_name).unwrap()))
+                }
+                _ => {
+                    let axis = RectAxis::from_name(axis_name)
+                        .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
+                    Ok(Instruction::FocusDim(axis))
+                }
             }
         }
 
@@ -933,12 +957,24 @@ impl ScriptRunner {
                 let _ = state.apply(Action::SetLineLength { value });
                 StepResult::Continue
             }
+            Instruction::SetPlaneOffset { value } => {
+                let _ = state.apply(Action::SetPlaneOffset { value });
+                StepResult::Continue
+            }
+            Instruction::SetPlaneAngle { value } => {
+                let _ = state.apply(Action::SetPlaneAngle { value });
+                StepResult::Continue
+            }
             Instruction::FocusDim(axis) => {
                 let _ = state.apply(Action::FocusRectDimension { axis });
                 StepResult::Continue
             }
             Instruction::FocusLineLength => {
                 let _ = state.apply(Action::FocusLineLength);
+                StepResult::Continue
+            }
+            Instruction::FocusPlaneDim(dim) => {
+                let _ = state.apply(Action::FocusPlaneDim { dim });
                 StepResult::Continue
             }
             Instruction::Orbit { dx, dy } => {
@@ -1399,6 +1435,25 @@ mod tests {
                     value: "25".to_string()
                 },
                 Instruction::FocusLineLength,
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_plane_tool_and_dims() {
+        let ins = parse("tool plane\nset_dim offset 12\nset_dim angle 45\nfocus_dim angle")
+            .unwrap();
+        assert_eq!(
+            ins,
+            vec![
+                Instruction::Tool(Tool::ConstructionPlane),
+                Instruction::SetPlaneOffset {
+                    value: "12".to_string()
+                },
+                Instruction::SetPlaneAngle {
+                    value: "45".to_string()
+                },
+                Instruction::FocusPlaneDim(PlaneDim::Angle),
             ]
         );
     }

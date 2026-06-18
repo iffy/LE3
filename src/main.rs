@@ -12,6 +12,7 @@
 
 mod actions;
 mod camera;
+mod construction;
 mod model;
 mod native_menu;
 mod script;
@@ -19,10 +20,13 @@ mod storage;
 mod view_cube;
 
 use actions::{Action, AppState, CreatingLine, CreatingRect, Pane, RectAxis, Tool};
+use construction::{
+    pick_reference, plane_corners, PlaneDim, PlaneReference, PLANE_DISPLAY_HALF,
+};
 use eframe::egui;
 use native_menu::{MenuCommand, NativeMenu};
-use glam::Vec3;
-use model::{Line, Rect};
+use glam::{Quat, Vec3};
+use model::{ConstructionPlane, Line, Rect};
 use script::{ScriptRunner, SyntheticInput};
 use std::path::Path;
 
@@ -180,10 +184,21 @@ impl App {
 
         if self.state.creating_rect.is_none()
             && self.state.creating_line.is_none()
+            && self.state.creating_plane.is_none()
             && ctx.input(|i| i.key_pressed(egui::Key::L))
         {
             if self.state.tool != Tool::Line {
                 self.state.apply(Action::SetTool(Tool::Line));
+            }
+        }
+
+        if self.state.creating_rect.is_none()
+            && self.state.creating_line.is_none()
+            && self.state.creating_plane.is_none()
+            && ctx.input(|i| i.key_pressed(egui::Key::P))
+        {
+            if self.state.tool != Tool::ConstructionPlane {
+                self.state.apply(Action::SetTool(Tool::ConstructionPlane));
             }
         }
 
@@ -193,8 +208,13 @@ impl App {
         if self.state.tool != Tool::Line {
             self.state.creating_line = None;
         }
+        if self.state.tool != Tool::ConstructionPlane {
+            self.state.creating_plane = None;
+        }
 
-        let creating = self.state.creating_rect.is_some() || self.state.creating_line.is_some();
+        let creating = self.state.creating_rect.is_some()
+            || self.state.creating_line.is_some()
+            || self.state.creating_plane.is_some();
         let (enter_pressed, tab_pressed) = if creating {
             (
                 ctx.input(|i| i.key_pressed(egui::Key::Enter)),
@@ -227,6 +247,20 @@ impl App {
         }
         if self.state.creating_line.is_some() && enter_pressed {
             self.state.apply(Action::CommitLine);
+        }
+
+        if let Some(cp) = &mut self.state.creating_plane {
+            if tab_pressed && cp.reference.is_axis() {
+                let next = if cp.focused == PlaneDim::Offset {
+                    PlaneDim::Angle
+                } else {
+                    PlaneDim::Offset
+                };
+                self.state.apply(Action::FocusPlaneDim { dim: next });
+            }
+            if enter_pressed {
+                self.state.apply(Action::CommitConstructionPlane);
+            }
         }
     }
 
@@ -308,6 +342,11 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.state.tool, Tool::Select, "Select");
                 ui.selectable_value(&mut self.state.tool, Tool::Rectangle, "Rectangle");
                 ui.selectable_value(&mut self.state.tool, Tool::Line, "Line");
+                ui.selectable_value(
+                    &mut self.state.tool,
+                    Tool::ConstructionPlane,
+                    "Plane",
+                );
                 ui.separator();
                 if ui.button("Clear").clicked() {
                     self.state.apply(Action::Clear);
@@ -356,6 +395,8 @@ mod col {
     pub const DIM_INPUT_SELECTION: Color32 = Color32::from_rgba_premultiplied(36, 26, 12, 36);
     /// Highlight for the dimension edge/segment tied to the focused input.
     pub const DIM_EDGE_HIGHLIGHT: Color32 = DIM_INPUT_BORDER_FOCUS;
+    /// All construction geometry (planes, etc.) shares this colour.
+    pub const CONSTRUCTION: Color32 = crate::construction::CONSTRUCTION_RGBA;
 }
 
 const GRID_EXTENT: f32 = 200.0;
@@ -817,6 +858,94 @@ impl App {
             }
         }
 
+        if self.state.tool == Tool::ConstructionPlane {
+            let ground = |p: egui::Pos2| cam.ground_point(p, viewport, &vp);
+            let pointer_screen = response.hover_pos().or(response.interact_pointer_pos());
+
+            if let Some(pp) = pointer_screen {
+                let gp = ground(pp);
+                let was_creating = self.state.creating_plane.is_some();
+                let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+
+                if !was_creating && primary_pressed {
+                    if let Some(reference) =
+                        pick_reference(pp, &project, gp, &self.state.doc)
+                    {
+                        self.state.apply(Action::BeginConstructionPlane { reference });
+                    }
+                }
+
+                let mut commit_click = false;
+                if let Some(cp) = &mut self.state.creating_plane {
+                    let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                    if scroll != 0.0 && !cp.user_edited_offset {
+                        let (live_offset, _) = cp.live_dims();
+                        let new_offset = (live_offset + scroll * 0.05).max(0.0);
+                        match &cp.reference {
+                            PlaneReference::Face { origin, normal, .. } => {
+                                cp.last_mouse = *origin + normal.normalize_or_zero() * new_offset;
+                            }
+                            PlaneReference::Axis { origin, direction, .. } => {
+                                let (off, ang) =
+                                    construction::live_axis_dims(*origin, *direction, cp.last_mouse);
+                                let new_off = (off + scroll * 0.05).max(0.0);
+                                let n = (Quat::from_axis_angle(
+                                    direction.normalize_or_zero(),
+                                    ang.to_radians(),
+                                ) * direction.cross(Vec3::Z).normalize_or_zero())
+                                .normalize_or_zero();
+                                cp.last_mouse = *origin + n * new_off;
+                            }
+                        }
+                    } else if let Some(gp) = gp {
+                        match &cp.reference {
+                            PlaneReference::Face { origin, normal, .. } => {
+                                if normal.z.abs() < 0.9 {
+                                    cp.last_mouse = *origin
+                                        + normal.normalize_or_zero()
+                                            * construction::live_face_offset(
+                                                *origin, *normal, gp,
+                                            );
+                                } else {
+                                    cp.last_mouse.x = gp.x;
+                                    cp.last_mouse.y = gp.y;
+                                }
+                            }
+                            PlaneReference::Axis { .. } => {
+                                cp.last_mouse = gp;
+                            }
+                        }
+                    }
+
+                    if !cp.user_edited_offset {
+                        let (off, ang) = cp.live_dims();
+                        cp.offset_text = format_live_dimension(off);
+                        if cp.reference.is_axis() && !cp.user_edited_angle {
+                            cp.angle_text = format!("{:.0}", ang);
+                        }
+                    }
+
+                    let preview = cp.preview_plane();
+                    let dim_layouts =
+                        plane_dim_layouts(&project, &preview, cp.reference.is_axis());
+                    let over_input = dim_layouts.as_ref().is_some_and(|(offset, angle)| {
+                        let mut layouts = vec![*offset];
+                        if let Some(angle) = angle {
+                            layouts.push(*angle);
+                        }
+                        pointer_over_dim_inputs(pp, &layouts)
+                    });
+
+                    if should_commit_sketch_on_click(was_creating, primary_pressed, over_input) {
+                        commit_click = true;
+                    }
+                }
+                if commit_click {
+                    self.state.apply(Action::CommitConstructionPlane);
+                }
+            }
+        }
+
         draw_ground(&painter, &project, viewport);
 
         for r in &self.state.doc.rects {
@@ -824,6 +953,9 @@ impl App {
         }
         for line in &self.state.doc.lines {
             draw_line_segment(&painter, &project, *line, col::LINE_STROKE, 2.0);
+        }
+        for plane in &self.state.doc.construction_planes {
+            draw_construction_plane(&painter, &project, plane, col::CONSTRUCTION, true);
         }
         if let Some(cr) = &self.state.creating_rect {
             let end = cr.end_point();
@@ -840,6 +972,10 @@ impl App {
             if let Some(sp) = project(cl.origin) {
                 painter.circle_filled(sp, 3.5, col::PREVIEW);
             }
+        }
+        if let Some(cp) = &self.state.creating_plane {
+            let preview = cp.preview_plane();
+            draw_construction_plane(&painter, &project, &preview, col::PREVIEW, false);
         }
 
         if let Some(cr) = &mut self.state.creating_rect {
@@ -966,13 +1102,82 @@ impl App {
             }
         }
 
+        if let Some(cp) = &mut self.state.creating_plane {
+            let preview = cp.preview_plane();
+            if let Some((offset_layout, angle_layout)) =
+                plane_dim_layouts(&project, &preview, cp.reference.is_axis())
+            {
+                let ctx = ui.ctx();
+                let id_offset = egui::Id::new("cp_offset");
+                let id_angle = egui::Id::new("cp_angle");
+
+                egui::Area::new(egui::Id::new("cp_offset_area"))
+                    .fixed_pos(offset_layout.pos)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        if show_sketch_dimension_field(
+                            ui,
+                            ctx,
+                            id_offset,
+                            &mut cp.offset_text,
+                            cp.focused == PlaneDim::Offset,
+                            &mut cp.pending_focus,
+                            cp.user_edited_offset,
+                        ) {
+                            cp.user_edited_offset = true;
+                        }
+                    });
+
+                if let Some(angle_layout) = angle_layout {
+                    egui::Area::new(egui::Id::new("cp_angle_area"))
+                        .fixed_pos(angle_layout.pos)
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            if show_sketch_dimension_field(
+                                ui,
+                                ctx,
+                                id_angle,
+                                &mut cp.angle_text,
+                                cp.focused == PlaneDim::Angle,
+                                &mut cp.pending_focus,
+                                cp.user_edited_angle,
+                            ) {
+                                cp.user_edited_angle = true;
+                            }
+                        });
+                }
+
+                let current = ctx.memory(|m| m.focused());
+                if current == Some(id_offset) {
+                    cp.focused = PlaneDim::Offset;
+                } else if current == Some(id_angle) {
+                    cp.focused = PlaneDim::Angle;
+                } else if cp.pending_focus {
+                    let target_id = if cp.focused == PlaneDim::Offset {
+                        id_offset
+                    } else {
+                        id_angle
+                    };
+                    ctx.memory_mut(|m| m.request_focus(target_id));
+                }
+
+                draw_construction_plane(
+                    &painter,
+                    &project,
+                    &preview,
+                    col::DIM_EDGE_HIGHLIGHT,
+                    false,
+                );
+            }
+        }
+
         if self.state.panes.is_visible(Pane::ViewCube) {
             view_cube::show_hud(ui.ctx(), &mut self.state.cam, viewport);
         }
 
         let hint = match self.state.tool {
             Tool::Select => {
-                "Right-drag: orbit  •  Shift+right-drag: pan  •  Wheel: zoom  •  r: rectangle  •  l: line"
+                "Right-drag: orbit  •  Shift+right-drag: pan  •  Wheel: zoom  •  r: rectangle  •  l: line  •  p: plane"
             }
             Tool::Rectangle => {
                 if self.state.creating_rect.is_some() {
@@ -986,6 +1191,13 @@ impl App {
                     "Move mouse (free length) • Type in length input to constrain • Click/Enter: create line • Esc: cancel"
                 } else {
                     "l: line  •  Left-click to set start • move to aim • Right-drag: orbit  • Shift+right-drag: pan  •  Wheel: zoom"
+                }
+            }
+            Tool::ConstructionPlane => {
+                if self.state.creating_plane.is_some() {
+                    "Set offset (wheel or type) • Tab: switch dims on axis • Click/Enter: create plane • Esc: cancel"
+                } else {
+                    "p: plane  •  Click a face, line, or ground • then set offset (and angle for lines) • Wheel: nudge offset"
                 }
             }
         };
@@ -1056,6 +1268,45 @@ fn draw_line_segment(
     let b = Vec3::new(line.x1, line.y1, 0.0);
     if let (Some(pa), Some(pb)) = (project(a), project(b)) {
         painter.line_segment([pa, pb], egui::Stroke::new(width, color));
+    }
+}
+
+fn plane_dim_layouts(
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    plane: &ConstructionPlane,
+    axis_mode: bool,
+) -> Option<(DimInputLayout, Option<DimInputLayout>)> {
+    let center = project(plane.origin)?;
+    let offset_layout = layout_at(center + egui::vec2(-28.0, 16.0));
+    let angle_layout = if axis_mode {
+        Some(layout_at(center + egui::vec2(-28.0, -24.0)))
+    } else {
+        None
+    };
+    Some((offset_layout, angle_layout))
+}
+
+fn draw_construction_plane(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    plane: &ConstructionPlane,
+    color: egui::Color32,
+    fill: bool,
+) {
+    let corners = plane_corners(plane, PLANE_DISPLAY_HALF);
+    let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
+    let Some(pts) = pts else { return };
+    if fill {
+        painter.add(egui::Shape::convex_polygon(
+            pts.clone(),
+            color.gamma_multiply(0.18),
+            egui::Stroke::new(1.5, color),
+        ));
+    } else {
+        painter.add(egui::Shape::closed_line(
+            pts,
+            egui::Stroke::new(2.0, color),
+        ));
     }
 }
 

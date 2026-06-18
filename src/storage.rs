@@ -102,6 +102,7 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
                 .map_err(|e| e.to_string())?;
                 line_i += 1;
             }
+            ShapeKind::ConstructionPlane => {}
         }
     }
 
@@ -148,6 +149,7 @@ pub fn open(path: &str) -> Result<Document> {
     Ok(Document {
         rects,
         lines,
+        construction_planes: Vec::new(),
         shape_order,
     })
 }
@@ -169,6 +171,7 @@ mod tests {
                 Rect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 },
             ],
             lines: vec![],
+            construction_planes: vec![],
             shape_order: vec![ShapeKind::Rect, ShapeKind::Rect],
         };
 
@@ -181,6 +184,39 @@ mod tests {
         save(&path, &doc).unwrap();
         let reloaded = open(&path).unwrap();
         assert_eq!(reloaded.rects.len(), 2);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn construction_planes_are_not_exported() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("le3_construction_skip_test.le3");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let doc = Document {
+            rects: vec![Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            }],
+            lines: vec![],
+            construction_planes: vec![crate::model::ConstructionPlane {
+                origin: glam::Vec3::new(0.0, 0.0, 25.0),
+                normal: glam::Vec3::Z,
+                u_axis: glam::Vec3::X,
+                v_axis: glam::Vec3::Y,
+            }],
+            shape_order: vec![ShapeKind::Rect, ShapeKind::ConstructionPlane],
+        };
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert_eq!(loaded.rects.len(), 1);
+        assert!(loaded.construction_planes.is_empty());
+        assert_eq!(loaded.shape_order, vec![ShapeKind::Rect]);
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -203,6 +239,7 @@ mod tests {
                 Line::from_endpoints(0.0, 0.0, 5.0, 0.0),
                 Line::from_endpoints(1.0, 1.0, 1.0, 6.0),
             ],
+            construction_planes: vec![],
             shape_order: vec![ShapeKind::Rect, ShapeKind::Line, ShapeKind::Line],
         };
 
