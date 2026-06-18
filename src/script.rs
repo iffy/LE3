@@ -3,7 +3,7 @@
 //! Scripts are human-readable, one instruction per line. They drive the live UI
 //! via synthetic pointer/keyboard events and headless actions.
 
-use crate::actions::{Action, AppState, RectAxis, Tool};
+use crate::actions::{Action, AppState, Pane, RectAxis, Tool};
 use crate::camera::{ProjectionMode, StandardView};
 use crate::view_cube::{CubeCornerId, CubeEdgeId};
 
@@ -34,6 +34,8 @@ pub enum Instruction {
     ViewCorner(CubeCornerId),
     ProjectionMode(ProjectionMode),
     ToggleProjectionMode,
+    /// Show/hide a UI pane. `None` toggles.
+    SetPane { pane: Pane, visible: Option<bool> },
 
     // Synthetic input (viewport-local pixel coordinates)
     Move { x: f32, y: f32 },
@@ -103,6 +105,14 @@ impl Instruction {
                 format!("view {}", projection_mode_script_name(*mode))
             }
             Instruction::ToggleProjectionMode => "toggle_projection".to_string(),
+            Instruction::SetPane { pane, visible } => {
+                let verb = match visible {
+                    Some(true) => "show",
+                    Some(false) => "hide",
+                    None => "toggle",
+                };
+                format!("pane {} {verb}", pane.script_name())
+            }
             Instruction::Move { x, y } => format!("move {x} {y}"),
             Instruction::Click { x, y } => format!("click {x} {y}"),
             Instruction::MoveGround { x, y } => format!("move_ground {x} {y}"),
@@ -205,6 +215,24 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
                     "unknown tool '{name}' (expected select, rectangle, or line)"
                 ))
             })
+        }
+
+        "pane" => {
+            let mut parts = rest.split_whitespace();
+            let name = parts.next().ok_or_else(|| err("pane requires a name"))?;
+            let pane = Pane::from_name(name)
+                .ok_or_else(|| err(&format!("unknown pane '{name}' (expected view_cube)")))?;
+            let visible = match parts.next().map(|s| s.to_ascii_lowercase()).as_deref() {
+                None | Some("toggle") => None,
+                Some("show") | Some("on") | Some("true") => Some(true),
+                Some("hide") | Some("off") | Some("false") => Some(false),
+                Some(other) => {
+                    return Err(err(&format!(
+                        "unknown pane state '{other}' (expected show, hide, or toggle)"
+                    )))
+                }
+            };
+            Ok(Instruction::SetPane { pane, visible })
         }
 
         "set_dim" | "setdim" => {
@@ -959,6 +987,13 @@ impl ScriptRunner {
                 state.apply(Action::ToggleProjectionMode);
                 StepResult::Continue
             }
+            Instruction::SetPane { pane, visible } => {
+                match visible {
+                    Some(v) => state.apply(Action::SetPaneVisible { pane, visible: v }),
+                    None => state.apply(Action::TogglePane(pane)),
+                };
+                StepResult::Continue
+            }
 
             Instruction::Move { x, y } => {
                 let Some(vp) = viewport else {
@@ -1258,6 +1293,47 @@ mod tests {
                 Instruction::ToggleProjectionMode,
             ]
         );
+    }
+
+    #[test]
+    fn parses_pane_commands() {
+        let ins = parse("pane view_cube show\npane cube hide\npane hud toggle\npane viewcube")
+            .unwrap();
+        assert_eq!(
+            ins,
+            vec![
+                Instruction::SetPane {
+                    pane: Pane::ViewCube,
+                    visible: Some(true),
+                },
+                Instruction::SetPane {
+                    pane: Pane::ViewCube,
+                    visible: Some(false),
+                },
+                Instruction::SetPane {
+                    pane: Pane::ViewCube,
+                    visible: None,
+                },
+                Instruction::SetPane {
+                    pane: Pane::ViewCube,
+                    visible: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_command_round_trips_through_as_line() {
+        for line in ["pane view_cube show", "pane view_cube hide", "pane view_cube toggle"] {
+            let ins = parse(line).unwrap();
+            assert_eq!(ins[0].as_line(), line);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_pane() {
+        assert!(parse("pane parameters show").is_err());
+        assert!(parse("pane view_cube sideways").is_err());
     }
 
     #[test]

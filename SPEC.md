@@ -382,6 +382,12 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
 - **Tiled panes only** — avoid floating windows and modals. Use docking/splitting.
 - Core panes: 3D viewport, action-DAG/history graph, parameters, feature/constraint
   properties, component/assembly browser.
+- A standard **application menu bar** (File / Edit / View / Help) sits above the
+  workspace. Menu items dispatch the shared action layer (§8) so menu, toolbar,
+  shortcuts, and scripting stay in sync. The **View** menu contains a **Panes**
+  submenu that shows/hides each available pane via a checkbox. (The menu bar is
+  drawn in-window rather than as a native OS menu so it appears in screenshot
+  regression tests, §9.3, and stays consistent across platforms.)
 
 ### 11.2 Command palette
 - VS Code-style palette listing **context-pertinent** commands. Commands come from the

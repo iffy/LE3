@@ -17,7 +17,7 @@ mod script;
 mod storage;
 mod view_cube;
 
-use actions::{Action, AppState, CreatingLine, CreatingRect, RectAxis, Tool};
+use actions::{Action, AppState, CreatingLine, CreatingRect, Pane, RectAxis, Tool};
 use eframe::egui;
 use glam::Vec3;
 use model::{Line, Rect};
@@ -109,6 +109,70 @@ impl App {
             let path = path.to_string_lossy().to_string();
             self.state.apply(Action::Open { path });
         }
+    }
+
+    /// Standard application menu bar (File / Edit / View / Help). Items dispatch
+    /// the same [`Action`] values as the toolbar and scripts, per SPEC §8.
+    fn show_menu_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("New").clicked() {
+                        self.state.apply(Action::NewDocument);
+                        ui.close_menu();
+                    }
+                    if ui.button("Open…").clicked() {
+                        self.open();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Save").clicked() {
+                        self.save();
+                        ui.close_menu();
+                    }
+                    if ui.button("Save As…").clicked() {
+                        self.save_as();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Undo").clicked() {
+                        self.state.apply(Action::UndoLast);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Clear").clicked() {
+                        self.state.apply(Action::Clear);
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("View", |ui| {
+                    ui.menu_button("Panes", |ui| {
+                        for &pane in Pane::ALL {
+                            let mut visible = self.state.panes.is_visible(pane);
+                            if ui.checkbox(&mut visible, pane.label()).changed() {
+                                self.state
+                                    .apply(Action::SetPaneVisible { pane, visible });
+                            }
+                        }
+                    });
+                });
+
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About LE3").clicked() {
+                        self.state.status =
+                            "LE3 — on-device parametric CAD (prototype)".to_string();
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
@@ -247,6 +311,8 @@ impl eframe::App for App {
         self.synthetic.inject(ctx);
 
         self.handle_keyboard(ctx);
+
+        self.show_menu_bar(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -924,7 +990,9 @@ impl App {
             }
         }
 
-        view_cube::show_hud(ui.ctx(), &mut self.state.cam, viewport);
+        if self.state.panes.is_visible(Pane::ViewCube) {
+            view_cube::show_hud(ui.ctx(), &mut self.state.cam, viewport);
+        }
 
         let hint = match self.state.tool {
             Tool::Select => {

@@ -61,6 +61,7 @@ Other useful instructions:
 | `pan 10 5` | Pan camera |
 | `wheel 120` | Zoom with mouse wheel delta |
 | `click_ground 0 0` | Left-click at world position (mm) |
+| `pane view_cube hide` | Show/hide/`toggle` a pane (View ▸ Panes menu) |
 | `wait 100ms` | Pause for 100 milliseconds |
 | `quit` | Close the app when the script ends |
 

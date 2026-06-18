@@ -138,6 +138,73 @@ pub enum Action {
     SetViewCorner(CubeCornerId),
     SetProjectionMode(ProjectionMode),
     ToggleProjectionMode,
+    SetPaneVisible { pane: Pane, visible: bool },
+    TogglePane(Pane),
+}
+
+/// A toggleable UI pane (SPEC §11.1). For now only the orientation HUD cube
+/// exists; this grows as the viewport, parameters, history, etc. panes land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pane {
+    /// The rotating orientation cube in the viewport corner ([`view_cube`]).
+    ViewCube,
+}
+
+impl Pane {
+    /// All panes, in menu order.
+    pub const ALL: &'static [Pane] = &[Pane::ViewCube];
+
+    /// Human-readable label for menus.
+    pub fn label(self) -> &'static str {
+        match self {
+            Pane::ViewCube => "Orientation Cube",
+        }
+    }
+
+    /// Stable name used in instruction scripts.
+    pub fn script_name(self) -> &'static str {
+        match self {
+            Pane::ViewCube => "view_cube",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "view_cube" | "viewcube" | "cube" | "hud" => Some(Pane::ViewCube),
+            _ => None,
+        }
+    }
+}
+
+/// Which panes are currently shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaneVisibility {
+    pub view_cube: bool,
+}
+
+impl Default for PaneVisibility {
+    fn default() -> Self {
+        Self { view_cube: true }
+    }
+}
+
+impl PaneVisibility {
+    pub fn is_visible(&self, pane: Pane) -> bool {
+        match pane {
+            Pane::ViewCube => self.view_cube,
+        }
+    }
+
+    pub fn set(&mut self, pane: Pane, visible: bool) {
+        match pane {
+            Pane::ViewCube => self.view_cube = visible,
+        }
+    }
+
+    pub fn toggle(&mut self, pane: Pane) {
+        let next = !self.is_visible(pane);
+        self.set(pane, next);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +238,7 @@ pub struct AppState {
     pub cam: Camera,
     pub creating_rect: Option<CreatingRect>,
     pub creating_line: Option<CreatingLine>,
+    pub panes: PaneVisibility,
     pub status: String,
 }
 
@@ -183,9 +251,14 @@ impl Default for AppState {
             cam: Camera::default(),
             creating_rect: None,
             creating_line: None,
+            panes: PaneVisibility::default(),
             status: String::new(),
         }
     }
+}
+
+fn pane_status(pane: Pane, visible: bool) -> String {
+    format!("{} {}", pane.label(), if visible { "shown" } else { "hidden" })
 }
 
 /// Result of dispatching an action.
@@ -394,6 +467,16 @@ impl AppState {
                 self.status = format!("Projection: {:?}", self.cam.projection_mode());
                 ActionResult::Ok
             }
+            Action::SetPaneVisible { pane, visible } => {
+                self.panes.set(pane, visible);
+                self.status = pane_status(pane, visible);
+                ActionResult::Ok
+            }
+            Action::TogglePane(pane) => {
+                self.panes.toggle(pane);
+                self.status = pane_status(pane, self.panes.is_visible(pane));
+                ActionResult::Ok
+            }
         }
     }
 
@@ -558,6 +641,37 @@ mod tests {
         });
         state.apply(Action::FocusLineLength);
         assert!(state.creating_line.as_ref().unwrap().pending_focus);
+    }
+
+    #[test]
+    fn view_cube_pane_visible_by_default() {
+        let state = AppState::default();
+        assert!(state.panes.is_visible(Pane::ViewCube));
+    }
+
+    #[test]
+    fn toggle_pane_hides_then_shows() {
+        let mut state = AppState::default();
+        state.apply(Action::TogglePane(Pane::ViewCube));
+        assert!(!state.panes.is_visible(Pane::ViewCube));
+        state.apply(Action::TogglePane(Pane::ViewCube));
+        assert!(state.panes.is_visible(Pane::ViewCube));
+    }
+
+    #[test]
+    fn set_pane_visible_is_explicit() {
+        let mut state = AppState::default();
+        state.apply(Action::SetPaneVisible {
+            pane: Pane::ViewCube,
+            visible: false,
+        });
+        assert!(!state.panes.is_visible(Pane::ViewCube));
+        // Setting the same value again is idempotent.
+        state.apply(Action::SetPaneVisible {
+            pane: Pane::ViewCube,
+            visible: false,
+        });
+        assert!(!state.panes.is_visible(Pane::ViewCube));
     }
 
     #[test]
