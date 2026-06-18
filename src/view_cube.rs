@@ -4,7 +4,7 @@
 use crate::camera::{Camera, ProjectionMode, StandardView, VIEW_TRANSITION_DURATION};
 use crate::stl::{fit_mesh_to_unit_cube, parse_ascii_stl, scale_mesh, MeshTriangle};
 use eframe::egui::epaint::TextShape;
-use eframe::egui::{self, Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
+use eframe::egui::{self, Color32, FontId, Mesh, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 use glam::Vec3;
 
 const CUBE_SIZE: f32 = 96.0;
@@ -23,12 +23,18 @@ const PRESET_TOGGLE_ICON_PAD: f32 = 4.0;
 const PRESET_TOGGLE_ICON_STROKE: f32 = 1.4;
 /// Hide faces that are too edge-on to the camera (they flare when orthographically projected).
 const FACE_CULL_DOT: f32 = 0.22;
+/// Hide bear facets that are too edge-on; path feathering on thin fills causes streaks.
+const BEAR_TRIANGLE_CULL_DOT: f32 = 0.12;
+const BEAR_MAX_SCREEN_EDGE: f32 = CUBE_SIZE * 0.55;
 /// World-space origin for the X/Y/Z axis triad (front–left–bottom corner).
 const AXIS_ORIGIN: Vec3 = Vec3::new(-HALF, -HALF, -HALF);
 const AXIS_LENGTH: f32 = 1.0;
 const AXIS_STROKE: f32 = 2.0;
 const BEAR_STL: &str = include_str!("assets/bear.stl");
-const BEAR_FILL: Color32 = Color32::from_rgb(156, 118, 78);
+const BEAR_BASE_COLOR: [f32; 3] = [156.0, 118.0, 78.0];
+const BEAR_AMBIENT: f32 = 0.34;
+/// Fixed directional light in HUD world space (Z-up).
+const BEAR_LIGHT_DIR: Vec3 = Vec3::new(0.42, -0.28, 0.86);
 const BEAR_MESH_MARGIN: f32 = 0.0;
 /// Extra scale so the bear fills the HUD bbox (clipped to the cube silhouette when drawn).
 const BEAR_MESH_SCALE: f32 = 2.45;
@@ -132,6 +138,29 @@ struct ProjectedFace {
 struct ProjectedBearTriangle {
     points: [Pos2; 3],
     depth: f32,
+    color: Color32,
+}
+
+fn bear_world_normal(tri: &MeshTriangle, right: Vec3, up: Vec3, forward: Vec3) -> Vec3 {
+    let e0 = tri.vertices[1] - tri.vertices[0];
+    let e1 = tri.vertices[2] - tri.vertices[0];
+    let mut normal = e0.cross(e1);
+    if transform_vertex(normal, right, up, forward).z >= 0.0 {
+        normal = -normal;
+    }
+    normal.normalize_or_zero()
+}
+
+fn shade_bear_color(normal: Vec3) -> Color32 {
+    let n = normal.normalize_or_zero();
+    let light = BEAR_LIGHT_DIR.normalize_or_zero();
+    let diffuse = n.dot(light).max(0.0);
+    let factor = BEAR_AMBIENT + (1.0 - BEAR_AMBIENT) * diffuse;
+    Color32::from_rgb(
+        (BEAR_BASE_COLOR[0] * factor).round() as u8,
+        (BEAR_BASE_COLOR[1] * factor).round() as u8,
+        (BEAR_BASE_COLOR[2] * factor).round() as u8,
+    )
 }
 
 fn bear_mesh() -> &'static [MeshTriangle] {
@@ -162,39 +191,78 @@ fn max_triangle_edge_length(points: [Pos2; 3]) -> f32 {
     .fold(0.0f32, f32::max)
 }
 
+fn wind_triangle_clockwise(points: [Pos2; 3]) -> [Pos2; 3] {
+    let a = points[1] - points[0];
+    let b = points[2] - points[0];
+    if a.x * b.y - a.y * b.x < 0.0 {
+        [points[0], points[2], points[1]]
+    } else {
+        points
+    }
+}
+
+fn bear_triangle_drawable(view_pts: [Vec3; 3]) -> Option<f32> {
+    let e0 = view_pts[1] - view_pts[0];
+    let e1 = view_pts[2] - view_pts[0];
+    let normal = e0.cross(e1);
+    let normal_len_sq = normal.length_squared();
+    if normal.z >= 0.0 || normal_len_sq < 1e-10 {
+        return None;
+    }
+
+    let head_on = (-normal.z) / normal_len_sq.sqrt();
+    if head_on < BEAR_TRIANGLE_CULL_DOT {
+        return None;
+    }
+
+    let min_z = view_pts[0].z.min(view_pts[1].z).min(view_pts[2].z);
+    let max_z = view_pts[0].z.max(view_pts[1].z).max(view_pts[2].z);
+    if min_z < 0.0 && max_z > 0.0 && head_on < 0.45 {
+        return None;
+    }
+
+    Some((view_pts[0].z + view_pts[1].z + view_pts[2].z) / 3.0)
+}
+
 fn project_bear(cam: &Camera, center: Pos2, scale: f32) -> Vec<ProjectedBearTriangle> {
     let (right, up, forward) = view_cube_basis(cam);
 
     let mut triangles = Vec::new();
     for tri in bear_mesh() {
         let view_pts = tri.vertices.map(|v| transform_vertex(v, right, up, forward));
-        let e0 = view_pts[1] - view_pts[0];
-        let e1 = view_pts[2] - view_pts[0];
-        let normal = e0.cross(e1);
-        if normal.z >= 0.0 || normal.length_squared() < 1e-10 {
+        let Some(depth) = bear_triangle_drawable(view_pts) else {
             continue;
-        }
+        };
 
-        let points = view_pts.map(|v| project_to_hud(v, center, scale));
+        let points = wind_triangle_clockwise(view_pts.map(|v| project_to_hud(v, center, scale)));
         if tri_screen_area(points) < 0.5 {
             continue;
         }
+        if max_triangle_edge_length(points) > BEAR_MAX_SCREEN_EDGE {
+            continue;
+        }
 
-        let depth = (view_pts[0].z + view_pts[1].z + view_pts[2].z) / 3.0;
-        triangles.push(ProjectedBearTriangle { points, depth });
+        let color = shade_bear_color(bear_world_normal(tri, right, up, forward));
+        triangles.push(ProjectedBearTriangle { points, depth, color });
     }
     triangles.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal));
     triangles
 }
 
-fn draw_bear(painter: &Painter, triangles: &[ProjectedBearTriangle]) {
-    for tri in triangles {
-        painter.add(Shape::convex_polygon(
-            tri.points.to_vec(),
-            BEAR_FILL,
-            Stroke::NONE,
-        ));
+fn draw_bear(painter: &Painter, clip: Rect, triangles: &[ProjectedBearTriangle]) {
+    if triangles.is_empty() {
+        return;
     }
+    let mut mesh = Mesh::default();
+    mesh.reserve_triangles(triangles.len());
+    for tri in triangles {
+        let base = mesh.vertices.len() as u32;
+        for p in tri.points {
+            mesh.colored_vertex(p, tri.color);
+        }
+        mesh.add_triangle(base, base + 1, base + 2);
+    }
+    painter.with_clip_rect(clip).add(Shape::mesh(mesh));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1024,7 +1092,7 @@ fn show(ui: &mut Ui, cam: &mut Camera, screen_rect: Rect) {
     draw_axes(ui, &axes);
 
     let painter = ui.painter();
-    draw_bear(painter, &bear_triangles);
+    draw_bear(painter, pad_rect, &bear_triangles);
     if let Some(view) = hover_face {
         if let Some(face) = faces.iter().find(|f| f.view == view) {
             draw_hovered_face(painter, face);
@@ -1157,6 +1225,29 @@ mod tests {
     }
 
     #[test]
+    fn shade_bear_color_is_brightest_facing_light() {
+        let light = BEAR_LIGHT_DIR.normalize();
+        let lit = shade_bear_color(light);
+        let away = shade_bear_color(-light);
+        let ambient = shade_bear_color(Vec3::new(0.0, 1.0, 0.0));
+        assert!(lit.r() > away.r());
+        assert!(lit.r() > ambient.r());
+        assert!(away.r() >= ambient.r());
+    }
+
+    #[test]
+    fn bear_projection_uses_per_triangle_shading() {
+        let cam = Camera::default();
+        let center = Pos2::new(120.0, 120.0);
+        let triangles = project_bear(&cam, center, 40.0);
+        let first = triangles.first().expect("triangles").color;
+        assert!(
+            triangles.iter().any(|t| t.color != first),
+            "bear shading should vary across facets"
+        );
+    }
+
+    #[test]
     fn bear_projects_visible_triangles_from_default_view() {
         let cam = Camera::default();
         let center = Pos2::new(120.0, 120.0);
@@ -1165,10 +1256,34 @@ mod tests {
     }
 
     #[test]
+    fn bear_projection_bounds_stay_near_hud_center() {
+        let cam = Camera::default();
+        let center = Pos2::new(60.0, 60.0);
+        let scale = CUBE_SIZE * 0.42;
+        let tris = project_bear(&cam, center, scale);
+        let mut min = Pos2::new(f32::INFINITY, f32::INFINITY);
+        let mut max = Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for t in &tris {
+            for p in t.points {
+                min.x = min.x.min(p.x);
+                min.y = min.y.min(p.y);
+                max.x = max.x.max(p.x);
+                max.y = max.y.max(p.y);
+            }
+        }
+        let pad = 8.0;
+        let hud = Rect::from_center_size(center, Vec2::splat(CUBE_SIZE));
+        assert!(min.x >= hud.min.x - pad, "min.x={}", min.x);
+        assert!(min.y >= hud.min.y - pad, "min.y={}", min.y);
+        assert!(max.x <= hud.max.x + pad, "max.x={}", max.x);
+        assert!(max.y <= hud.max.y + pad, "max.y={}", max.y);
+    }
+
+    #[test]
     fn bear_projection_has_no_silhouette_spikes() {
         let center = Pos2::new(120.0, 120.0);
         let scale = CUBE_SIZE * 0.42;
-        let max_edge = CUBE_SIZE * 0.75;
+        let max_edge = BEAR_MAX_SCREEN_EDGE;
         for yaw in [0.0, 0.35, 0.8, 1.4, 2.2, 3.5] {
             for pitch in [-1.2, -0.5, 0.0, 0.35, 0.6, 1.1] {
                 let mut cam = Camera::default();
