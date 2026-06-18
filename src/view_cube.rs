@@ -1,10 +1,10 @@
-//! View-cube HUD (top-right): oriented cube with labeled faces, drag-to-orbit,
-//! click-to-animate standard views.
+//! View-cube HUD (top-right): bear model inside an oriented bounding box,
+//! drag-to-orbit, click faces/edges/corners to animate standard views.
 
 use crate::camera::{Camera, ProjectionMode, StandardView, VIEW_TRANSITION_DURATION};
+use crate::stl::{fit_mesh_to_unit_cube, parse_ascii_stl, scale_mesh, MeshTriangle};
 use eframe::egui::epaint::TextShape;
 use eframe::egui::{self, Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
-use egui::emath::Rot2;
 use glam::Vec3;
 
 const CUBE_SIZE: f32 = 96.0;
@@ -13,10 +13,10 @@ const HALF: f32 = 0.5;
 const DRAG_CLICK_THRESHOLD: f32 = 4.0;
 const EDGE_HIT_RADIUS: f32 = 6.0;
 const CORNER_HIT_RADIUS: f32 = 7.0;
-const EDGE_STROKE: f32 = 1.5;
 const EDGE_STROKE_HOVER: f32 = 3.5;
-const CORNER_RADIUS: f32 = 3.5;
+const FACE_STROKE_HOVER: f32 = 2.0;
 const CORNER_RADIUS_HOVER: f32 = 5.5;
+const BBOX_HOVER_STROKE: Color32 = Color32::from_rgb(255, 220, 120);
 const PRESET_TOGGLE_SIZE: f32 = 20.0;
 const PRESET_TOGGLE_MARGIN: f32 = 3.0;
 const PRESET_TOGGLE_ICON_PAD: f32 = 4.0;
@@ -27,6 +27,11 @@ const FACE_CULL_DOT: f32 = 0.22;
 const AXIS_ORIGIN: Vec3 = Vec3::new(-HALF, -HALF, -HALF);
 const AXIS_LENGTH: f32 = 1.0;
 const AXIS_STROKE: f32 = 2.0;
+const BEAR_STL: &str = include_str!("assets/bear.stl");
+const BEAR_FILL: Color32 = Color32::from_rgb(156, 118, 78);
+const BEAR_MESH_MARGIN: f32 = 0.0;
+/// Extra scale so the bear fills the HUD bbox (clipped to the cube silhouette when drawn).
+const BEAR_MESH_SCALE: f32 = 2.45;
 
 #[derive(Clone, Copy)]
 struct AxisDef {
@@ -56,90 +61,130 @@ const AXES: [AxisDef; 3] = [
 #[derive(Clone, Copy)]
 struct CubeFace {
     view: StandardView,
-    label: &'static str,
     corners: [Vec3; 4],
-    fill: Color32,
 }
 
 const FACES: [CubeFace; 6] = [
     CubeFace {
         view: StandardView::Front,
-        label: "FRONT",
         corners: [
             Vec3::new(-HALF, -HALF, -HALF),
             Vec3::new(HALF, -HALF, -HALF),
             Vec3::new(HALF, -HALF, HALF),
             Vec3::new(-HALF, -HALF, HALF),
         ],
-        fill: Color32::from_rgb(58, 64, 78),
     },
     CubeFace {
         view: StandardView::Back,
-        label: "BACK",
         corners: [
             Vec3::new(HALF, HALF, -HALF),
             Vec3::new(-HALF, HALF, -HALF),
             Vec3::new(-HALF, HALF, HALF),
             Vec3::new(HALF, HALF, HALF),
         ],
-        fill: Color32::from_rgb(50, 56, 68),
     },
     CubeFace {
         view: StandardView::Right,
-        label: "RIGHT",
         corners: [
             Vec3::new(HALF, -HALF, -HALF),
             Vec3::new(HALF, HALF, -HALF),
             Vec3::new(HALF, HALF, HALF),
             Vec3::new(HALF, -HALF, HALF),
         ],
-        fill: Color32::from_rgb(64, 70, 84),
     },
     CubeFace {
         view: StandardView::Left,
-        label: "LEFT",
         corners: [
             Vec3::new(-HALF, HALF, -HALF),
             Vec3::new(-HALF, -HALF, -HALF),
             Vec3::new(-HALF, -HALF, HALF),
             Vec3::new(-HALF, HALF, HALF),
         ],
-        fill: Color32::from_rgb(54, 60, 72),
     },
     CubeFace {
         view: StandardView::Top,
-        label: "TOP",
         corners: [
             Vec3::new(-HALF, -HALF, HALF),
             Vec3::new(HALF, -HALF, HALF),
             Vec3::new(HALF, HALF, HALF),
             Vec3::new(-HALF, HALF, HALF),
         ],
-        fill: Color32::from_rgb(72, 78, 92),
     },
     CubeFace {
         view: StandardView::Bottom,
-        label: "BOTTOM",
         corners: [
             Vec3::new(-HALF, HALF, -HALF),
             Vec3::new(HALF, HALF, -HALF),
             Vec3::new(HALF, -HALF, -HALF),
             Vec3::new(-HALF, -HALF, -HALF),
         ],
-        fill: Color32::from_rgb(44, 48, 58),
     },
 ];
 
 struct ProjectedFace {
     view: StandardView,
-    label: &'static str,
     points: [Pos2; 4],
     center: Pos2,
     /// Average corner depth along the camera forward axis (for painter order).
     depth: f32,
-    /// How head-on the face is to the view (1 = perpendicular, 0 = edge-on).
-    head_on: f32,
-    area: f32,
+}
+
+struct ProjectedBearTriangle {
+    points: [Pos2; 3],
+    depth: f32,
+}
+
+fn bear_mesh() -> &'static [MeshTriangle] {
+    static MESH: std::sync::OnceLock<Vec<MeshTriangle>> = std::sync::OnceLock::new();
+    MESH.get_or_init(|| {
+        let raw = parse_ascii_stl(BEAR_STL).expect("bear.stl");
+        // bear.stl forward is +X; skip the old −Y reorientation.
+        scale_mesh(
+            &fit_mesh_to_unit_cube(&raw, HALF, BEAR_MESH_MARGIN),
+            BEAR_MESH_SCALE,
+        )
+    })
+}
+
+fn triangle_visible(normal: Vec3, right: Vec3, up: Vec3, forward: Vec3) -> bool {
+    face_visible_for_normal(normal, right, up, forward)
+}
+
+fn project_bear(cam: &Camera, center: Pos2, scale: f32) -> Vec<ProjectedBearTriangle> {
+    let (right, up, forward) = view_cube_basis(cam);
+    let max_r = cube_silhouette_radius(right, up, forward, scale);
+
+    let mut triangles = Vec::new();
+    for tri in bear_mesh() {
+        if !triangle_visible(tri.normal, right, up, forward) {
+            continue;
+        }
+        let mut depth = 0.0;
+        let mut points = [Pos2::ZERO; 3];
+        for (i, vertex) in tri.vertices.iter().enumerate() {
+            let t = transform_vertex(*vertex, right, up, forward);
+            depth += t.z;
+            points[i] = clamp_point_to_silhouette(
+                project_to_hud(t, center, scale),
+                center,
+                max_r,
+            );
+        }
+        depth /= 3.0;
+        triangles.push(ProjectedBearTriangle { points, depth });
+    }
+    triangles.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal));
+    triangles
+}
+
+fn draw_bear(painter: &Painter, triangles: &[ProjectedBearTriangle]) {
+    for tri in triangles {
+        painter.add(Shape::convex_polygon(
+            tri.points.to_vec(),
+            BEAR_FILL,
+            Stroke::NONE,
+        ));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -568,7 +613,6 @@ fn project_faces(cam: &Camera, center: Pos2, scale: f32) -> Vec<ProjectedFace> {
     let max_r = cube_silhouette_radius(right, up, forward, scale);
     let mut faces = Vec::with_capacity(FACES.len());
     for face in &FACES {
-        let head_on = face_head_on(face.corners, right, up, forward);
         if !face_visible_in_view(face.corners, right, up, forward) {
             continue;
         }
@@ -590,12 +634,9 @@ fn project_faces(cam: &Camera, center: Pos2, scale: f32) -> Vec<ProjectedFace> {
         );
         faces.push(ProjectedFace {
             view: face.view,
-            label: face.label,
             points,
             center: center_pt,
             depth,
-            head_on,
-            area: quad_area(points),
         });
     }
     // Paint farther faces first; nearer faces (smaller depth) win hit tests.
@@ -754,88 +795,35 @@ fn apply_cube_pick(cam: &mut Camera, pick: CubePick) {
     }
 }
 
-fn draw_edges(painter: &egui::Painter, edges: &[ProjectedEdge], hover: Option<CubeEdgeId>) {
-    for edge in edges {
-        let highlighted = hover == Some(edge.id);
-        let stroke = if highlighted {
-            Stroke::new(EDGE_STROKE_HOVER, Color32::from_rgb(255, 220, 120))
-        } else {
-            Stroke::new(EDGE_STROKE, Color32::from_gray(95))
-        };
-        painter.line_segment([edge.a, edge.b], stroke);
-    }
-}
-
-fn draw_corners(painter: &egui::Painter, corners: &[ProjectedCorner], hover: Option<CubeCornerId>) {
-    for corner in corners {
-        let highlighted = hover == Some(corner.id);
-        let radius = if highlighted {
-            CORNER_RADIUS_HOVER
-        } else {
-            CORNER_RADIUS
-        };
-        let color = if highlighted {
-            Color32::from_rgb(255, 220, 120)
-        } else {
-            Color32::from_gray(110)
-        };
-        painter.circle_filled(corner.pos, radius, color);
-        if highlighted {
-            painter.circle_stroke(
-                corner.pos,
-                radius + 1.0,
-                Stroke::new(1.0, Color32::from_gray(220)),
-            );
-        }
-    }
-}
-
-fn quad_area(points: [Pos2; 4]) -> f32 {
-    let a = points[2] - points[0];
-    let b = points[3] - points[1];
-    (a.x * b.y - a.y * b.x).abs() * 0.5
-}
-
-/// Screen-space angle for label text affixed to the face (edge 0→1 is the baseline).
-fn face_label_angle(points: [Pos2; 4]) -> f32 {
-    let baseline = points[1] - points[0];
-    baseline.y.atan2(baseline.x)
-}
-
-fn face_label_font_size(area: f32, label: &str) -> f32 {
-    let side = area.sqrt();
-    let mut size = side * 0.34;
-    if label.len() > 4 {
-        size *= 0.82;
-    }
-    size.clamp(6.0, 10.0)
-}
-
-fn should_draw_face_label(head_on: f32, area: f32) -> bool {
-    head_on > FACE_CULL_DOT && area > 120.0
-}
-
-fn draw_face_label(ui: &mut Ui, face: &ProjectedFace) {
-    if !should_draw_face_label(face.head_on, face.area) {
+fn draw_hovered_edge(painter: &egui::Painter, edges: &[ProjectedEdge], id: CubeEdgeId) {
+    let Some(edge) = edges.iter().find(|e| e.id == id) else {
         return;
-    }
-    let angle = face_label_angle(face.points);
-    let font_size = face_label_font_size(face.area, face.label);
-    let color = Color32::from_gray(235);
-    let galley = ui.fonts(|fonts| {
-        fonts.layout_no_wrap(
-            face.label.to_owned(),
-            FontId::proportional(font_size),
-            Color32::PLACEHOLDER,
-        )
-    });
-    let half = galley.size() * 0.5;
-    let pos = face.center - Rot2::from_angle(angle) * half;
-    ui.painter().add(
-        TextShape::new(pos, galley, color)
-            .with_angle(angle)
-            .with_override_text_color(color),
+    };
+    painter.line_segment(
+        [edge.a, edge.b],
+        Stroke::new(EDGE_STROKE_HOVER, BBOX_HOVER_STROKE),
     );
+}
+
+fn draw_hovered_corner(painter: &egui::Painter, corners: &[ProjectedCorner], id: CubeCornerId) {
+    let Some(corner) = corners.iter().find(|c| c.id == id) else {
+        return;
+    };
+    painter.circle_filled(corner.pos, CORNER_RADIUS_HOVER, BBOX_HOVER_STROKE);
+    painter.circle_stroke(
+        corner.pos,
+        CORNER_RADIUS_HOVER + 1.0,
+        Stroke::new(1.0, Color32::from_gray(220)),
+    );
+}
+
+fn draw_hovered_face(painter: &egui::Painter, face: &ProjectedFace) {
+    let stroke = Stroke::new(FACE_STROKE_HOVER, BBOX_HOVER_STROKE);
+    let points = face.points;
+    for i in 0..4 {
+        let j = (i + 1) % 4;
+        painter.line_segment([points[i], points[j]], stroke);
+    }
 }
 
 fn view_preset_toggle_rect(pad_rect: Rect) -> Rect {
@@ -973,6 +961,7 @@ fn show(ui: &mut Ui, cam: &mut Camera, screen_rect: Rect) {
     let faces = project_faces(cam, center, scale);
     let edges = project_edges(cam, center, scale);
     let corners = project_corners(cam, center, scale);
+    let bear_triangles = project_bear(cam, center, scale);
 
     let response = ui.allocate_rect(screen_rect, Sense::click_and_drag());
 
@@ -1014,44 +1003,30 @@ fn show(ui: &mut Ui, cam: &mut Camera, screen_rect: Rect) {
         }
     }
 
-    let painter = ui.painter();
     let pad_rect = screen_rect.expand(4.0);
-    painter.rect_filled(pad_rect, 6.0, Color32::from_rgba_unmultiplied(18, 20, 26, 200));
-    painter.rect_stroke(pad_rect, 6.0, Stroke::new(1.0, Color32::from_gray(70)));
-
-    for face in &faces {
-        let hovered = hover_face == Some(face.view);
-        let fill = if hovered {
-            face_fill_hover(face.view)
-        } else {
-            face_fill(face.view)
-        };
-        painter.add(Shape::convex_polygon(
-            face.points.to_vec(),
-            fill,
-            Stroke::new(1.0, Color32::from_gray(120)),
-        ));
+    {
+        let painter = ui.painter();
+        painter.rect_filled(pad_rect, 6.0, Color32::from_rgba_unmultiplied(18, 20, 26, 200));
+        painter.rect_stroke(pad_rect, 6.0, Stroke::new(1.0, Color32::from_gray(70)));
     }
-    draw_edges(painter, &edges, hover_edge);
-    draw_corners(painter, &corners, hover_corner);
+
     let axes = project_axes(cam, center, scale);
     draw_axes(ui, &axes);
-    for face in &faces {
-        draw_face_label(ui, face);
+
+    let painter = ui.painter();
+    draw_bear(painter, &bear_triangles);
+    if let Some(view) = hover_face {
+        if let Some(face) = faces.iter().find(|f| f.view == view) {
+            draw_hovered_face(painter, face);
+        }
+    }
+    if let Some(id) = hover_edge {
+        draw_hovered_edge(painter, &edges, id);
+    }
+    if let Some(id) = hover_corner {
+        draw_hovered_corner(painter, &corners, id);
     }
     show_projection_mode_toggle(ui, cam, pad_rect);
-}
-
-fn face_fill(view: StandardView) -> Color32 {
-    FACES
-        .iter()
-        .find(|f| f.view == view)
-        .map(|f| f.fill)
-        .unwrap_or(Color32::from_gray(60))
-}
-
-fn face_fill_hover(view: StandardView) -> Color32 {
-    face_fill(view).gamma_multiply(1.35)
 }
 
 #[cfg(test)]
@@ -1155,58 +1130,28 @@ mod tests {
     }
 
     #[test]
-    fn face_label_angle_follows_face_without_upright_flip() {
-        let horizontal = [
-            Pos2::new(0.0, 0.0),
-            Pos2::new(40.0, 0.0),
-            Pos2::new(40.0, 10.0),
-            Pos2::new(0.0, 10.0),
-        ];
-        assert!(face_label_angle(horizontal).abs() < 0.01);
-
-        // Baseline reversed on screen — text reads backward/upside-down like paint on the cube.
-        let reversed = [
-            Pos2::new(40.0, 10.0),
-            Pos2::new(0.0, 10.0),
-            Pos2::new(0.0, 0.0),
-            Pos2::new(40.0, 0.0),
-        ];
-        let angle = face_label_angle(reversed);
+    fn bear_mesh_is_scaled_to_fill_hud() {
+        let mut max_abs = 0.0f32;
+        for tri in bear_mesh() {
+            for vertex in tri.vertices {
+                max_abs = max_abs
+                    .max(vertex.x.abs())
+                    .max(vertex.y.abs())
+                    .max(vertex.z.abs());
+            }
+        }
         assert!(
-            angle.abs() > std::f32::consts::FRAC_PI_2,
-            "label should not be forced upright, got {angle}"
+            max_abs > HALF,
+            "bear should extend past the unit cube to fill the HUD, got {max_abs}"
         );
     }
 
     #[test]
-    fn face_label_rotates_when_face_tilts() {
+    fn bear_projects_visible_triangles_from_default_view() {
+        let cam = Camera::default();
         let center = Pos2::new(120.0, 120.0);
-        let scale = 40.0;
-        let head_on = project_faces(&cam_at_view(StandardView::Back), center, scale)
-            .into_iter()
-            .find(|f| f.view == StandardView::Back)
-            .expect("back");
-        let tilted = project_faces(&Camera::default(), center, scale)
-            .into_iter()
-            .find(|f| f.view == StandardView::Back)
-            .expect("back");
-        assert!(
-            (face_label_angle(tilted.points) - face_label_angle(head_on.points)).abs() > 0.08,
-            "label should rotate with the face as the view tilts"
-        );
-    }
-
-    #[test]
-    fn face_label_center_lies_on_face_quad() {
-        let cam = cam_at_view(StandardView::Front);
-        let center = Pos2::new(200.0, 120.0);
-        let faces = project_faces(&cam, center, 40.0);
-        let front = faces
-            .iter()
-            .find(|f| f.view == StandardView::Front)
-            .expect("front");
-        assert!(should_draw_face_label(front.head_on, front.area));
-        assert!(point_in_quad(front.center, front.points));
+        let triangles = project_bear(&cam, center, 40.0);
+        assert!(!triangles.is_empty(), "bear should have visible triangles");
     }
 
     #[test]

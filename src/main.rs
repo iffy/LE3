@@ -16,6 +16,7 @@ mod construction;
 mod model;
 mod native_menu;
 mod script;
+mod stl;
 mod storage;
 mod view_cube;
 
