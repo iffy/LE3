@@ -4,7 +4,10 @@
 use crate::camera::{Camera, ProjectionMode, StandardView, VIEW_TRANSITION_DURATION};
 use crate::stl::{fit_mesh_to_unit_cube, parse_ascii_stl, scale_mesh, MeshTriangle};
 use eframe::egui::epaint::TextShape;
-use eframe::egui::{self, Color32, FontId, Mesh, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
+use eframe::egui::{
+    self, Color32, ColorImage, FontId, Id, Painter, Pos2, Rect, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, Vec2,
+};
 use glam::Vec3;
 
 const CUBE_SIZE: f32 = 96.0;
@@ -23,9 +26,8 @@ const PRESET_TOGGLE_ICON_PAD: f32 = 4.0;
 const PRESET_TOGGLE_ICON_STROKE: f32 = 1.4;
 /// Hide faces that are too edge-on to the camera (they flare when orthographically projected).
 const FACE_CULL_DOT: f32 = 0.22;
-/// Hide bear facets that are too edge-on; path feathering on thin fills causes streaks.
-const BEAR_TRIANGLE_CULL_DOT: f32 = 0.12;
-const BEAR_MAX_SCREEN_EDGE: f32 = CUBE_SIZE * 0.55;
+/// Hide only nearly edge-on facets (grazing triangles are unstable to rasterize).
+const BEAR_TRIANGLE_CULL_DOT: f32 = 0.02;
 /// World-space origin for the X/Y/Z axis triad (front–left–bottom corner).
 const AXIS_ORIGIN: Vec3 = Vec3::new(-HALF, -HALF, -HALF);
 const AXIS_LENGTH: f32 = 1.0;
@@ -130,21 +132,18 @@ const FACES: [CubeFace; 6] = [
 struct ProjectedFace {
     view: StandardView,
     points: [Pos2; 4],
-    center: Pos2,
     /// Average corner depth along the camera forward axis (for painter order).
     depth: f32,
 }
 
 struct ProjectedBearTriangle {
     points: [Pos2; 3],
-    depth: f32,
+    zs: [f32; 3],
     color: Color32,
 }
 
 fn bear_world_normal(tri: &MeshTriangle, right: Vec3, up: Vec3, forward: Vec3) -> Vec3 {
-    let e0 = tri.vertices[1] - tri.vertices[0];
-    let e1 = tri.vertices[2] - tri.vertices[0];
-    let mut normal = e0.cross(e1);
+    let mut normal = tri.normal;
     if transform_vertex(normal, right, up, forward).z >= 0.0 {
         normal = -normal;
     }
@@ -181,6 +180,7 @@ fn tri_screen_area(points: [Pos2; 3]) -> f32 {
     (a.x * b.y - a.y * b.x).abs() * 0.5
 }
 
+#[cfg(test)]
 fn max_triangle_edge_length(points: [Pos2; 3]) -> f32 {
     [
         (points[0] - points[1]).length(),
@@ -191,37 +191,120 @@ fn max_triangle_edge_length(points: [Pos2; 3]) -> f32 {
     .fold(0.0f32, f32::max)
 }
 
-fn wind_triangle_clockwise(points: [Pos2; 3]) -> [Pos2; 3] {
+fn wind_triangle_clockwise_with_z(
+    points: [Pos2; 3],
+    zs: [f32; 3],
+) -> ([Pos2; 3], [f32; 3]) {
     let a = points[1] - points[0];
     let b = points[2] - points[0];
     if a.x * b.y - a.y * b.x < 0.0 {
-        [points[0], points[2], points[1]]
+        ([points[0], points[2], points[1]], [zs[0], zs[2], zs[1]])
     } else {
-        points
+        (points, zs)
     }
 }
 
-fn bear_triangle_drawable(view_pts: [Vec3; 3]) -> Option<f32> {
-    let e0 = view_pts[1] - view_pts[0];
-    let e1 = view_pts[2] - view_pts[0];
-    let normal = e0.cross(e1);
-    let normal_len_sq = normal.length_squared();
-    if normal.z >= 0.0 || normal_len_sq < 1e-10 {
+fn triangle_barycentric(p: Pos2, a: Pos2, b: Pos2, c: Pos2) -> Option<[f32; 3]> {
+    let v0 = c - a;
+    let v1 = b - a;
+    let v2 = p - a;
+    let dot00 = v0.dot(v0);
+    let dot01 = v0.dot(v1);
+    let dot02 = v0.dot(v2);
+    let dot11 = v1.dot(v1);
+    let dot12 = v1.dot(v2);
+    let denom = dot00 * dot11 - dot01 * dot01;
+    if denom.abs() < 1e-8 {
         return None;
     }
+    let inv = 1.0 / denom;
+    let u = (dot11 * dot02 - dot01 * dot12) * inv;
+    let v = (dot00 * dot12 - dot01 * dot02) * inv;
+    let w = 1.0 - u - v;
+    Some([w, v, u])
+}
 
-    let head_on = (-normal.z) / normal_len_sq.sqrt();
-    if head_on < BEAR_TRIANGLE_CULL_DOT {
-        return None;
+fn rasterize_bear_triangle(
+    points: [Pos2; 3],
+    zs: [f32; 3],
+    color: Color32,
+    origin: Pos2,
+    width: usize,
+    height: usize,
+    z_buf: &mut [f32],
+    pixels: &mut [Color32],
+) {
+    let min_x = points[0].x.min(points[1].x).min(points[2].x).floor() as i32;
+    let max_x = points[0].x.max(points[1].x).max(points[2].x).ceil() as i32;
+    let min_y = points[0].y.min(points[1].y).min(points[2].y).floor() as i32;
+    let max_y = points[0].y.max(points[1].y).max(points[2].y).ceil() as i32;
+
+    let x0 = origin.x.floor() as i32;
+    let y0 = origin.y.floor() as i32;
+    let x1 = x0 + width as i32 - 1;
+    let y1 = y0 + height as i32 - 1;
+
+    for y in min_y.max(y0)..=max_y.min(y1) {
+        for x in min_x.max(x0)..=max_x.min(x1) {
+            let sample = Pos2::new(x as f32 + 0.5, y as f32 + 0.5);
+            let Some(bc) = triangle_barycentric(sample, points[0], points[1], points[2]) else {
+                continue;
+            };
+            if bc[0] < -1e-4 || bc[1] < -1e-4 || bc[2] < -1e-4 {
+                continue;
+            }
+            let depth = bc[0] * zs[0] + bc[1] * zs[1] + bc[2] * zs[2];
+            let lx = x - x0;
+            let ly = y - y0;
+            let idx = ly as usize * width + lx as usize;
+            if depth < z_buf[idx] {
+                z_buf[idx] = depth;
+                pixels[idx] = color;
+            }
+        }
+    }
+}
+
+fn rasterize_bear(triangles: &[ProjectedBearTriangle], rect: Rect) -> ColorImage {
+    let width = rect.width().ceil().max(1.0) as usize;
+    let height = rect.height().ceil().max(1.0) as usize;
+    let mut z_buf = vec![f32::INFINITY; width * height];
+    let mut pixels = vec![Color32::TRANSPARENT; width * height];
+    let origin = rect.min;
+
+    for tri in triangles {
+        rasterize_bear_triangle(
+            tri.points,
+            tri.zs,
+            tri.color,
+            origin,
+            width,
+            height,
+            &mut z_buf,
+            &mut pixels,
+        );
     }
 
-    let min_z = view_pts[0].z.min(view_pts[1].z).min(view_pts[2].z);
-    let max_z = view_pts[0].z.max(view_pts[1].z).max(view_pts[2].z);
-    if min_z < 0.0 && max_z > 0.0 && head_on < 0.45 {
-        return None;
+    ColorImage {
+        size: [width, height],
+        pixels,
+    }
+}
+
+fn bear_triangle_visible(
+    tri: &MeshTriangle,
+    right: Vec3,
+    up: Vec3,
+    forward: Vec3,
+) -> bool {
+    let view_normal = transform_vertex(tri.normal.normalize_or_zero(), right, up, forward);
+    let normal_len_sq = view_normal.length_squared();
+    if view_normal.z >= 0.0 || normal_len_sq < 1e-10 {
+        return false;
     }
 
-    Some((view_pts[0].z + view_pts[1].z + view_pts[2].z) / 3.0)
+    let head_on = (-view_normal.z) / normal_len_sq.sqrt();
+    head_on >= BEAR_TRIANGLE_CULL_DOT
 }
 
 fn project_bear(cam: &Camera, center: Pos2, scale: f32) -> Vec<ProjectedBearTriangle> {
@@ -230,39 +313,60 @@ fn project_bear(cam: &Camera, center: Pos2, scale: f32) -> Vec<ProjectedBearTria
     let mut triangles = Vec::new();
     for tri in bear_mesh() {
         let view_pts = tri.vertices.map(|v| transform_vertex(v, right, up, forward));
-        let Some(depth) = bear_triangle_drawable(view_pts) else {
-            continue;
-        };
-
-        let points = wind_triangle_clockwise(view_pts.map(|v| project_to_hud(v, center, scale)));
-        if tri_screen_area(points) < 0.5 {
+        if !bear_triangle_visible(tri, right, up, forward) {
             continue;
         }
-        if max_triangle_edge_length(points) > BEAR_MAX_SCREEN_EDGE {
+
+        let zs = [view_pts[0].z, view_pts[1].z, view_pts[2].z];
+        let (points, zs) = wind_triangle_clockwise_with_z(
+            view_pts.map(|v| project_to_hud(v, center, scale)),
+            zs,
+        );
+        if tri_screen_area(points) < 0.25 {
             continue;
         }
 
         let color = shade_bear_color(bear_world_normal(tri, right, up, forward));
-        triangles.push(ProjectedBearTriangle { points, depth, color });
+        triangles.push(ProjectedBearTriangle { points, zs, color });
     }
-    triangles.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal));
     triangles
 }
 
-fn draw_bear(painter: &Painter, clip: Rect, triangles: &[ProjectedBearTriangle]) {
+fn draw_bear(ui: &Ui, painter: &Painter, raster_rect: Rect, triangles: &[ProjectedBearTriangle]) {
     if triangles.is_empty() {
         return;
     }
-    let mut mesh = Mesh::default();
-    mesh.reserve_triangles(triangles.len());
-    for tri in triangles {
-        let base = mesh.vertices.len() as u32;
-        for p in tri.points {
-            mesh.colored_vertex(p, tri.color);
-        }
-        mesh.add_triangle(base, base + 1, base + 2);
-    }
-    painter.with_clip_rect(clip).add(Shape::mesh(mesh));
+    let image = rasterize_bear(triangles, raster_rect);
+    let ctx = ui.ctx();
+    let bear_tex_storage = Id::new("view_cube_bear_raster");
+
+    // `load_texture` allocates once; per-frame updates use `TextureHandle::set`.
+    // Calling `load_texture` every frame destroys the GPU texture while wgpu may
+    // still reference it from the previous frame.
+    let texture_id = if let Some(mut handle) =
+        ctx.data(|d| d.get_temp::<TextureHandle>(bear_tex_storage))
+    {
+        handle.set(image, TextureOptions::NEAREST);
+        let id = handle.id();
+        ctx.data_mut(|d| d.insert_temp(bear_tex_storage, handle));
+        id
+    } else {
+        let handle = ctx.load_texture(
+            "view_cube_bear_raster",
+            image,
+            TextureOptions::NEAREST,
+        );
+        let id = handle.id();
+        ctx.data_mut(|d| d.insert_temp(bear_tex_storage, handle));
+        id
+    };
+
+    painter.image(
+        texture_id,
+        raster_rect,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -706,14 +810,9 @@ fn project_faces(cam: &Camera, center: Pos2, scale: f32) -> Vec<ProjectedFace> {
             );
         }
         depth /= 4.0;
-        let center_pt = Pos2::new(
-            (points[0].x + points[1].x + points[2].x + points[3].x) * 0.25,
-            (points[0].y + points[1].y + points[2].y + points[3].y) * 0.25,
-        );
         faces.push(ProjectedFace {
             view: face.view,
             points,
-            center: center_pt,
             depth,
         });
     }
@@ -1092,7 +1191,7 @@ fn show(ui: &mut Ui, cam: &mut Camera, screen_rect: Rect) {
     draw_axes(ui, &axes);
 
     let painter = ui.painter();
-    draw_bear(painter, pad_rect, &bear_triangles);
+    draw_bear(ui, painter, screen_rect, &bear_triangles);
     if let Some(view) = hover_face {
         if let Some(face) = faces.iter().find(|f| f.view == view) {
             draw_hovered_face(painter, face);
@@ -1128,6 +1227,13 @@ mod tests {
         cam
     }
 
+    fn face_center(face: &ProjectedFace) -> Pos2 {
+        Pos2::new(
+            (face.points[0].x + face.points[1].x + face.points[2].x + face.points[3].x) * 0.25,
+            (face.points[0].y + face.points[1].y + face.points[2].y + face.points[3].y) * 0.25,
+        )
+    }
+
     #[test]
     fn front_face_visible_from_front_view() {
         let cam = cam_at_view(StandardView::Front);
@@ -1138,7 +1244,7 @@ mod tests {
             .iter()
             .find(|f| f.view == StandardView::Front)
             .expect("front face");
-        assert!(point_in_quad(front.center, front.points));
+        assert!(point_in_quad(face_center(front), front.points));
     }
 
     #[test]
@@ -1192,7 +1298,7 @@ mod tests {
             .iter()
             .find(|f| f.view == StandardView::Front)
             .expect("front");
-        assert_eq!(pick_face(&faces, front.center), Some(StandardView::Front));
+        assert_eq!(pick_face(&faces, face_center(front)), Some(StandardView::Front));
     }
 
     #[test]
@@ -1256,6 +1362,51 @@ mod tests {
     }
 
     #[test]
+    fn bear_back_faces_are_never_drawn() {
+        for yaw in [0.0, 0.35, 0.8, 1.4, 2.2, 3.5] {
+            for pitch in [-1.2, -0.5, 0.0, 0.35, 0.6, 1.1] {
+                let mut cam = Camera::default();
+                cam.yaw = yaw;
+                cam.pitch = pitch;
+                let (right, up, forward) = view_cube_basis(&cam);
+                for tri in bear_mesh() {
+                    let view_normal =
+                        transform_vertex(tri.normal.normalize_or_zero(), right, up, forward);
+                    if view_normal.z >= 0.0 {
+                        assert!(
+                            !bear_triangle_visible(tri, right, up, forward),
+                            "back-facing facet should be culled at yaw={yaw} pitch={pitch}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bear_raster_has_opaque_coverage() {
+        let cam = Camera::default();
+        let rect = Rect::from_center_size(Pos2::new(60.0, 60.0), Vec2::splat(CUBE_SIZE));
+        let tris = project_bear(&cam, rect.center(), CUBE_SIZE * 0.42);
+        let image = rasterize_bear(&tris, rect);
+        let opaque = image.pixels.iter().filter(|p| p.a() == 255).count();
+        assert!(
+            opaque > 400,
+            "bear raster should be mostly solid, got {opaque} opaque pixels"
+        );
+    }
+
+    #[test]
+    fn bear_projection_keeps_facets_from_isometric_view() {
+        let cam = Camera::default();
+        let count = project_bear(&cam, Pos2::new(60.0, 60.0), CUBE_SIZE * 0.42).len();
+        assert!(
+            count >= 55,
+            "isometric view should show most of the bear, got {count}"
+        );
+    }
+
+    #[test]
     fn bear_projection_bounds_stay_near_hud_center() {
         let cam = Camera::default();
         let center = Pos2::new(60.0, 60.0);
@@ -1283,7 +1434,7 @@ mod tests {
     fn bear_projection_has_no_silhouette_spikes() {
         let center = Pos2::new(120.0, 120.0);
         let scale = CUBE_SIZE * 0.42;
-        let max_edge = BEAR_MAX_SCREEN_EDGE;
+        let max_edge = CUBE_SIZE * 0.75;
         for yaw in [0.0, 0.35, 0.8, 1.4, 2.2, 3.5] {
             for pitch in [-1.2, -0.5, 0.0, 0.35, 0.6, 1.1] {
                 let mut cam = Camera::default();

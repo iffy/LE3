@@ -125,7 +125,6 @@ pub struct CreatingConstructionPlane {
     pub offset_text: String,
     pub angle_text: String,
     pub focused: PlaneDim,
-    pub last_mouse: Vec3,
     /// Live offset (mm); updated by gizmo drag or wheel.
     pub offset_live: f32,
     /// Live angle for axis references (degrees); updated by gizmo drag.
@@ -486,16 +485,11 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::BeginConstructionPlane { reference } => {
-                let hover = match &reference {
-                    PlaneReference::Face { origin, .. } => *origin,
-                    PlaneReference::Axis { origin, .. } => *origin,
-                };
                 self.creating_plane = Some(CreatingConstructionPlane {
                     reference,
                     offset_text: String::new(),
                     angle_text: String::new(),
                     focused: PlaneDim::Offset,
-                    last_mouse: hover,
                     offset_live: 0.0,
                     axis_angle_deg: 0.0,
                     user_edited_offset: false,
@@ -707,7 +701,6 @@ mod tests {
         let cp = state.creating_plane.as_mut().unwrap();
         cp.offset_live = 12.0;
         cp.axis_angle_deg = 45.0;
-        cp.last_mouse = Vec3::new(99.0, 99.0, 0.0);
         assert_eq!(cp.live_dims(), (12.0, 45.0));
     }
 

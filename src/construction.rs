@@ -181,6 +181,7 @@ pub fn plane_corners(plane: &ConstructionPlane, half: f32) -> [Vec3; 4] {
 }
 
 /// Live offset for a face reference from a world-space hover point.
+#[cfg(test)]
 pub fn live_face_offset(origin: Vec3, normal: Vec3, hover: Vec3) -> f32 {
     let n = normal.normalize_or_zero();
     (hover - origin).dot(n).max(0.0)

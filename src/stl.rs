@@ -91,6 +91,7 @@ pub fn scale_mesh(triangles: &[MeshTriangle], scale: f32) -> Vec<MeshTriangle> {
 }
 
 /// Orient the mesh so its longest horizontal axis points toward −Y (HUD front).
+#[cfg(test)]
 pub fn orient_mesh_front_negative_y(triangles: &[MeshTriangle]) -> Vec<MeshTriangle> {
     triangles
         .iter()
@@ -101,11 +102,13 @@ pub fn orient_mesh_front_negative_y(triangles: &[MeshTriangle]) -> Vec<MeshTrian
         .collect()
 }
 
+#[cfg(test)]
 fn front_negative_y(v: Vec3) -> Vec3 {
     // Rotate +90° about Z so +X (typical STL forward) maps to −Y.
     Vec3::new(v.y, -v.x, v.z)
 }
 
+#[cfg(test)]
 pub fn mesh_bounds(triangles: &[MeshTriangle]) -> (Vec3, Vec3) {
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);

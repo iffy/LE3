@@ -148,6 +148,7 @@ impl Camera {
     }
 
     /// How head-on the ground plane (XY) is to the view. 1 = plan view, 0 = edge-on.
+    #[cfg(test)]
     pub fn ground_plane_head_on(&self) -> f32 {
         (self.target - self.eye()).normalize().z.abs()
     }
