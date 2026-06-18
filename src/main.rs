@@ -21,7 +21,8 @@ mod view_cube;
 
 use actions::{Action, AppState, CreatingLine, CreatingRect, Pane, RectAxis, Tool};
 use construction::{
-    pick_reference, plane_corners, PlaneDim, PlaneReference, PLANE_DISPLAY_HALF,
+    pick_reference, plane_corners, resolve_pick_target, PlaneDim, PlaneReference,
+    PLANE_DISPLAY_HALF,
 };
 use eframe::egui;
 use native_menu::{MenuCommand, NativeMenu};
@@ -976,6 +977,15 @@ impl App {
         if let Some(cp) = &self.state.creating_plane {
             let preview = cp.preview_plane();
             draw_construction_plane(&painter, &project, &preview, col::PREVIEW, false);
+        }
+
+        if self.state.tool == Tool::ConstructionPlane && self.state.creating_plane.is_none() {
+            if let Some(pp) = response.hover_pos().or(response.interact_pointer_pos()) {
+                let gp = cam.ground_point(pp, viewport, &vp);
+                if let Some(target) = resolve_pick_target(pp, &project, gp, &self.state.doc) {
+                    target.draw_highlight(&painter, &project);
+                }
+            }
         }
 
         if let Some(cr) = &mut self.state.creating_rect {

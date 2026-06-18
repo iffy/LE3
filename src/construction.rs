@@ -12,8 +12,17 @@ pub const CONSTRUCTION_RGBA: egui::Color32 = egui::Color32::from_rgb(230, 120, 4
 /// Half-edge length of the visible plane quad (millimetres).
 pub const PLANE_DISPLAY_HALF: f32 = 50.0;
 
-/// Screen-space pick tolerance for lines when choosing an axis reference (pixels).
-pub const LINE_PICK_RADIUS_PX: f32 = 10.0;
+/// Screen-space pick tolerance for lines (pixels). The pointer need not land on the stroke.
+pub const LINE_PICK_RADIUS_PX: f32 = 12.0;
+
+/// Screen-space pick tolerance for points such as line endpoints (pixels).
+pub const POINT_PICK_RADIUS_PX: f32 = 12.0;
+
+/// Extra margin when picking faces by proximity to their projected edges (pixels).
+pub const FACE_PICK_MARGIN_PX: f32 = 8.0;
+
+/// Visual highlight for a pickable target under the cursor.
+pub const PICK_HOVER_RGBA: egui::Color32 = egui::Color32::from_rgb(255, 210, 90);
 
 /// What the user picked as the plane reference on the first click.
 #[derive(Clone, Debug, PartialEq)]
@@ -185,6 +194,118 @@ pub fn live_axis_dims(origin: Vec3, direction: Vec3, hover: Vec3) -> (f32, f32) 
     (offset, angle_rad.to_degrees().rem_euclid(360.0))
 }
 
+/// Which geometry would be selected at a viewport position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PickTargetKind {
+    Line(Line),
+    Rect(Rect),
+    ConstructionPlane(ConstructionPlane),
+    Ground(Vec3),
+}
+
+/// A resolved pick target with its plane reference and screen-space distance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PickTarget {
+    pub kind: PickTargetKind,
+    pub reference: PlaneReference,
+    distance_px: f32,
+    priority: u8,
+}
+
+impl PickTarget {
+    /// Draw a hover highlight for this target.
+    pub fn draw_highlight(
+        &self,
+        painter: &egui::Painter,
+        project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    ) {
+        draw_pick_highlight(painter, project, self.kind, PICK_HOVER_RGBA);
+    }
+}
+
+/// Resolve the best pick target under the cursor (shared by hover and click).
+pub fn resolve_pick_target(
+    screen: egui::Pos2,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    ground_point: Option<Vec3>,
+    doc: &Document,
+) -> Option<PickTarget> {
+    let mut best: Option<PickTarget> = None;
+
+    let mut consider = |candidate: PickTarget| {
+        if best.as_ref().is_none_or(|b| candidate.beats(b)) {
+            best = Some(candidate);
+        }
+    };
+
+    if let Some((line, dist)) = nearest_line(screen, project, &doc.lines) {
+        consider(PickTarget {
+            kind: PickTargetKind::Line(line),
+            reference: PlaneReference::Axis {
+                origin: line_midpoint(line),
+                direction: line_direction(line),
+                label: "Line".to_string(),
+            },
+            distance_px: dist,
+            priority: 0,
+        });
+    }
+
+    if let Some((rect, dist)) = nearest_rect(screen, project, &doc.rects) {
+        let origin = ground_point.unwrap_or(rect_center(rect));
+        consider(PickTarget {
+            kind: PickTargetKind::Rect(rect),
+            reference: PlaneReference::Face {
+                origin: Vec3::new(origin.x, origin.y, 0.0),
+                normal: Vec3::Z,
+                label: "Rectangle face".to_string(),
+            },
+            distance_px: dist,
+            priority: 1,
+        });
+    }
+
+    if let Some((plane, dist)) = nearest_construction_plane(screen, project, &doc.construction_planes)
+    {
+        let origin = ground_point.unwrap_or(plane.origin);
+        let projected = project_point_on_plane(origin, &plane);
+        consider(PickTarget {
+            kind: PickTargetKind::ConstructionPlane(plane),
+            reference: PlaneReference::Face {
+                origin: projected,
+                normal: plane.normal,
+                label: "Construction plane".to_string(),
+            },
+            distance_px: dist,
+            priority: 2,
+        });
+    }
+
+    if let Some(p) = ground_point {
+        consider(PickTarget {
+            kind: PickTargetKind::Ground(p),
+            reference: PlaneReference::Face {
+                origin: p,
+                normal: Vec3::Z,
+                label: "Ground".to_string(),
+            },
+            distance_px: f32::MAX,
+            priority: 3,
+        });
+    }
+
+    best
+}
+
+impl PickTarget {
+    fn beats(&self, other: &PickTarget) -> bool {
+        if self.priority != other.priority {
+            return self.priority < other.priority;
+        }
+        self.distance_px < other.distance_px
+    }
+}
+
 /// Pick a plane/axis reference from a viewport click.
 pub fn pick_reference(
     screen: egui::Pos2,
@@ -192,39 +313,92 @@ pub fn pick_reference(
     ground_point: Option<Vec3>,
     doc: &Document,
 ) -> Option<PlaneReference> {
-    if let Some((line, _)) = pick_line(screen, project, &doc.lines) {
-        let origin = line_midpoint(line);
-        return Some(PlaneReference::Axis {
-            origin,
-            direction: line_direction(line),
-            label: "Line".to_string(),
-        });
-    }
+    resolve_pick_target(screen, project, ground_point, doc).map(|t| t.reference)
+}
 
-    if let Some(rect) = pick_rect(screen, project, &doc.rects) {
-        let origin = ground_point.unwrap_or(rect_center(rect));
-        return Some(PlaneReference::Face {
-            origin: Vec3::new(origin.x, origin.y, 0.0),
-            normal: Vec3::Z,
-            label: "Rectangle face".to_string(),
-        });
+/// Draw a hover highlight for a pickable target.
+pub fn draw_pick_highlight(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    kind: PickTargetKind,
+    color: egui::Color32,
+) {
+    match kind {
+        PickTargetKind::Line(line) => {
+            draw_line_highlight(painter, project, line, color);
+        }
+        PickTargetKind::Rect(rect) => {
+            draw_rect_highlight(painter, project, rect, color);
+        }
+        PickTargetKind::ConstructionPlane(plane) => {
+            draw_plane_face_highlight(painter, project, &plane, color);
+        }
+        PickTargetKind::Ground(p) => {
+            if let Some(sp) = project(p) {
+                painter.circle_stroke(sp, 8.0, egui::Stroke::new(2.0, color));
+                let r = 6.0;
+                painter.line_segment(
+                    [sp + egui::vec2(-r, 0.0), sp + egui::vec2(r, 0.0)],
+                    egui::Stroke::new(2.0, color),
+                );
+                painter.line_segment(
+                    [sp + egui::vec2(0.0, -r), sp + egui::vec2(0.0, r)],
+                    egui::Stroke::new(2.0, color),
+                );
+            }
+        }
     }
+}
 
-    if let Some(plane) = pick_construction_plane(screen, project, &doc.construction_planes) {
-        let origin = ground_point.unwrap_or(plane.origin);
-        let projected = project_point_on_plane(origin, &plane);
-        return Some(PlaneReference::Face {
-            origin: projected,
-            normal: plane.normal,
-            label: "Construction plane".to_string(),
-        });
+fn draw_line_highlight(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    line: Line,
+    color: egui::Color32,
+) {
+    let a = Vec3::new(line.x0, line.y0, 0.0);
+    let b = Vec3::new(line.x1, line.y1, 0.0);
+    if let (Some(pa), Some(pb)) = (project(a), project(b)) {
+        painter.line_segment([pa, pb], egui::Stroke::new(4.0, color));
+        for p in [pa, pb] {
+            painter.circle_filled(p, 5.0, color);
+        }
     }
+}
 
-    ground_point.map(|p| PlaneReference::Face {
-        origin: p,
-        normal: Vec3::Z,
-        label: "Ground".to_string(),
-    })
+fn draw_rect_highlight(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    rect: Rect,
+    color: egui::Color32,
+) {
+    let corners = rect_corners_world(rect);
+    let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
+    let Some(pts) = pts else { return };
+    painter.add(egui::Shape::closed_line(
+        pts,
+        egui::Stroke::new(3.0, color),
+    ));
+    for p in corners {
+        if let Some(sp) = project(p) {
+            painter.circle_filled(sp, 4.0, color);
+        }
+    }
+}
+
+fn draw_plane_face_highlight(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    plane: &ConstructionPlane,
+    color: egui::Color32,
+) {
+    let corners = plane_corners(plane, PLANE_DISPLAY_HALF);
+    let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
+    let Some(pts) = pts else { return };
+    painter.add(egui::Shape::closed_line(
+        pts,
+        egui::Stroke::new(3.5, color),
+    ));
 }
 
 fn project_point_on_plane(point: Vec3, plane: &ConstructionPlane) -> Vec3 {
@@ -282,7 +456,7 @@ fn dist_point_to_segment_px(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 
     (p - (a + ab * t)).length()
 }
 
-fn pick_line(
+fn nearest_line(
     screen: egui::Pos2,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
     lines: &[Line],
@@ -294,8 +468,16 @@ fn pick_line(
         let (Some(pa), Some(pb)) = (project(a), project(b)) else {
             continue;
         };
-        let dist = dist_point_to_segment_px(screen, pa, pb);
-        if dist <= LINE_PICK_RADIUS_PX {
+        let seg_dist = dist_point_to_segment_px(screen, pa, pb);
+        let end_a = (screen - pa).length();
+        let end_b = (screen - pb).length();
+        let dist = seg_dist.min(end_a).min(end_b);
+        let threshold = if end_a <= POINT_PICK_RADIUS_PX || end_b <= POINT_PICK_RADIUS_PX {
+            POINT_PICK_RADIUS_PX
+        } else {
+            LINE_PICK_RADIUS_PX
+        };
+        if dist <= threshold {
             if best.map(|(_, d)| dist < d).unwrap_or(true) {
                 best = Some((line, dist));
             }
@@ -304,46 +486,62 @@ fn pick_line(
     best
 }
 
-fn pick_rect(
+fn nearest_rect(
     screen: egui::Pos2,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
     rects: &[Rect],
-) -> Option<Rect> {
+) -> Option<(Rect, f32)> {
     let mut best: Option<(Rect, f32)> = None;
     for &rect in rects {
         let corners = rect_corners_world(rect);
         let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
         let Some(pts) = pts else { continue };
         let quad = [pts[0], pts[1], pts[2], pts[3]];
-        if point_in_screen_quad(screen, quad) {
-            let area = quad_area(quad);
-            if best.map(|(_, a)| area < a).unwrap_or(true) {
-                best = Some((rect, area));
+        let dist = if point_in_screen_quad(screen, quad) {
+            0.0
+        } else {
+            dist_point_to_quad_edges(screen, quad)
+        };
+        if dist <= FACE_PICK_MARGIN_PX {
+            if best.map(|(_, d)| dist < d).unwrap_or(true) {
+                best = Some((rect, dist));
             }
         }
     }
-    best.map(|(r, _)| r)
+    best
 }
 
-fn pick_construction_plane(
+fn nearest_construction_plane(
     screen: egui::Pos2,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
     planes: &[ConstructionPlane],
-) -> Option<ConstructionPlane> {
+) -> Option<(ConstructionPlane, f32)> {
     let mut best: Option<(ConstructionPlane, f32)> = None;
     for &plane in planes.iter().rev() {
         let corners = plane_corners(&plane, PLANE_DISPLAY_HALF);
         let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
         let Some(pts) = pts else { continue };
         let quad = [pts[0], pts[1], pts[2], pts[3]];
-        if point_in_screen_quad(screen, quad) {
-            let area = quad_area(quad);
-            if best.map(|(_, a)| area < a).unwrap_or(true) {
-                best = Some((plane, area));
+        let dist = if point_in_screen_quad(screen, quad) {
+            0.0
+        } else {
+            dist_point_to_quad_edges(screen, quad)
+        };
+        if dist <= FACE_PICK_MARGIN_PX {
+            if best.map(|(_, d)| dist < d).unwrap_or(true) {
+                best = Some((plane, dist));
             }
         }
     }
-    best.map(|(p, _)| p)
+    best
+}
+
+fn dist_point_to_quad_edges(p: egui::Pos2, quad: [egui::Pos2; 4]) -> f32 {
+    let edges = [(0, 1), (1, 2), (2, 3), (3, 0)];
+    edges
+        .iter()
+        .map(|&(i, j)| dist_point_to_segment_px(p, quad[i], quad[j]))
+        .fold(f32::MAX, f32::min)
 }
 
 fn rect_corners_world(rect: Rect) -> [Vec3; 4] {
@@ -353,12 +551,6 @@ fn rect_corners_world(rect: Rect) -> [Vec3; 4] {
         Vec3::new(rect.x + rect.w, rect.y + rect.h, 0.0),
         Vec3::new(rect.x, rect.y + rect.h, 0.0),
     ]
-}
-
-fn quad_area(quad: [egui::Pos2; 4]) -> f32 {
-    let a = quad[0].distance(quad[1]);
-    let b = quad[1].distance(quad[2]);
-    a * b
 }
 
 #[cfg(test)]
@@ -426,6 +618,53 @@ mod tests {
         let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
         let reference = pick_reference(Pos2::new(50.0, 2.0), &project, Some(Vec3::ZERO), &doc);
         assert!(matches!(reference, Some(PlaneReference::Axis { .. })));
+    }
+
+    #[test]
+    fn line_picked_within_proximity_threshold() {
+        let doc = Document {
+            lines: vec![Line::from_endpoints(0.0, 0.0, 100.0, 0.0)],
+            ..Default::default()
+        };
+        let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
+        let target = resolve_pick_target(Pos2::new(50.0, 8.0), &project, None, &doc);
+        assert!(matches!(
+            target.map(|t| t.kind),
+            Some(PickTargetKind::Line(_))
+        ));
+    }
+
+    #[test]
+    fn line_endpoint_picked_within_point_threshold() {
+        let doc = Document {
+            lines: vec![Line::from_endpoints(0.0, 0.0, 100.0, 0.0)],
+            ..Default::default()
+        };
+        let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
+        let target = resolve_pick_target(Pos2::new(0.0, 9.0), &project, None, &doc);
+        assert!(matches!(
+            target.map(|t| t.kind),
+            Some(PickTargetKind::Line(_))
+        ));
+    }
+
+    #[test]
+    fn rect_picked_near_edge_within_margin() {
+        let doc = Document {
+            rects: vec![Rect {
+                x: 10.0,
+                y: 10.0,
+                w: 40.0,
+                h: 30.0,
+            }],
+            ..Default::default()
+        };
+        let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
+        let target = resolve_pick_target(Pos2::new(8.0, 25.0), &project, None, &doc);
+        assert!(matches!(
+            target.map(|t| t.kind),
+            Some(PickTargetKind::Rect(_))
+        ));
     }
 
     #[test]

@@ -418,6 +418,16 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
   *Select* is the default and only orbits/pans/zooms — geometry is created only when a
   drawing tool is active, so navigation never creates geometry by accident. Tools are part
   of the shared action layer (§8) so they appear in the palette and are rebindable.
+- **Selectable hover feedback:** in any tool mode where the user can click to select
+  geometry (e.g. picking a reference face or axis for a construction plane), every
+  pickable target under the cursor is highlighted before click. The highlight uses a
+  distinct accent colour and follows the shape of the target (line stroke, face outline,
+  ground crosshair, etc.).
+- **Proximity picking:** thin or point-like geometry (lines, endpoints, vertices) must
+  be pickable within a screen-space tolerance — the pointer need not land exactly on the
+  stroke. Lines use a pixel-radius threshold around the segment and its endpoints; faces
+  use a margin around their projected edges. Hover resolution and click picking share the
+  same resolver so feedback matches what a click would select.
 
 ---
 
