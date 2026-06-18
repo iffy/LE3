@@ -1,0 +1,18 @@
+# Example instruction script — draw a rectangle and save a screenshot.
+# Run: cargo run -- --script examples/rectangle.le3script --exit
+
+new
+tool rectangle
+
+# Viewport coordinates are relative to the 3D panel (below the toolbar).
+click 480 320
+wait 2
+move 580 380
+wait 2
+set_dim width 80
+key tab
+set_dim height 50
+key enter
+
+wait 100ms
+screenshot rectangle_preview.png
