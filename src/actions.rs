@@ -3,7 +3,7 @@
 //! GUI buttons, keyboard shortcuts, and instruction scripts all dispatch the
 //! same [`Action`] values so behaviour stays in sync.
 
-use crate::camera::{Camera, StandardView, VIEW_TRANSITION_DURATION};
+use crate::camera::{Camera, ProjectionMode, StandardView, VIEW_TRANSITION_DURATION};
 use crate::view_cube::{self, CubeCornerId, CubeEdgeId};
 use crate::model::{Document, Line, Rect, ShapeKind};
 use eframe::egui;
@@ -136,6 +136,8 @@ pub enum Action {
     SetStandardView(StandardView),
     SetViewEdge(CubeEdgeId),
     SetViewCorner(CubeCornerId),
+    SetProjectionMode(ProjectionMode),
+    ToggleProjectionMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,6 +382,16 @@ impl AppState {
                     VIEW_TRANSITION_DURATION,
                 );
                 self.status = format!("View corner: {:?}", corner);
+                ActionResult::Ok
+            }
+            Action::SetProjectionMode(mode) => {
+                self.cam.set_projection_mode(mode);
+                self.status = format!("Projection: {:?}", mode);
+                ActionResult::Ok
+            }
+            Action::ToggleProjectionMode => {
+                self.cam.toggle_projection_mode();
+                self.status = format!("Projection: {:?}", self.cam.projection_mode());
                 ActionResult::Ok
             }
         }

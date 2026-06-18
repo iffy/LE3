@@ -1,9 +1,9 @@
 //! View-cube HUD (top-right): oriented cube with labeled faces, drag-to-orbit,
 //! click-to-animate standard views.
 
-use crate::camera::{Camera, StandardView, VIEW_TRANSITION_DURATION};
+use crate::camera::{Camera, ProjectionMode, StandardView, VIEW_TRANSITION_DURATION};
 use eframe::egui::epaint::TextShape;
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
+use eframe::egui::{self, Color32, FontId, Painter, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 use egui::emath::Rot2;
 use glam::Vec3;
 
@@ -17,6 +17,10 @@ const EDGE_STROKE: f32 = 1.5;
 const EDGE_STROKE_HOVER: f32 = 3.5;
 const CORNER_RADIUS: f32 = 3.5;
 const CORNER_RADIUS_HOVER: f32 = 5.5;
+const PRESET_TOGGLE_SIZE: f32 = 20.0;
+const PRESET_TOGGLE_MARGIN: f32 = 3.0;
+const PRESET_TOGGLE_ICON_PAD: f32 = 4.0;
+const PRESET_TOGGLE_ICON_STROKE: f32 = 1.4;
 /// Hide faces that are too edge-on to the camera (they flare when orthographically projected).
 const FACE_CULL_DOT: f32 = 0.22;
 /// World-space origin for the X/Y/Z axis triad (front–left–bottom corner).
@@ -834,6 +838,110 @@ fn draw_face_label(ui: &mut Ui, face: &ProjectedFace) {
     );
 }
 
+fn view_preset_toggle_rect(pad_rect: Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            pad_rect.min.x + PRESET_TOGGLE_MARGIN,
+            pad_rect.max.y - PRESET_TOGGLE_SIZE - PRESET_TOGGLE_MARGIN,
+        ),
+        Vec2::splat(PRESET_TOGGLE_SIZE),
+    )
+}
+
+fn projection_toggle_icon_rect(button: Rect) -> Rect {
+    button.shrink(PRESET_TOGGLE_ICON_PAD)
+}
+
+fn icon_point(rect: Rect, u: f32, v: f32) -> Pos2 {
+    Pos2::new(
+        rect.min.x + rect.width() * u,
+        rect.min.y + rect.height() * v,
+    )
+}
+
+fn orthographic_icon_rect(rect: Rect) -> Rect {
+    rect.shrink(rect.width() * 0.22)
+}
+
+fn natural_icon_segments(rect: Rect) -> [(Pos2, Pos2); 4] {
+    let p = |u: f32, v: f32| icon_point(rect, u, v);
+    let bl = p(0.20, 0.78);
+    let br = p(0.80, 0.78);
+    let tl = p(0.30, 0.24);
+    let tr = p(0.70, 0.24);
+    [(bl, br), (br, tr), (tr, tl), (tl, bl)]
+}
+
+fn paint_icon_segments(painter: &Painter, segments: &[(Pos2, Pos2)], color: Color32) {
+    let stroke = Stroke::new(PRESET_TOGGLE_ICON_STROKE, color);
+    for &(a, b) in segments {
+        painter.line_segment([a, b], stroke);
+    }
+}
+
+/// Flat square — parallel projection has no vanishing point.
+fn paint_orthographic_icon(painter: &Painter, rect: Rect, color: Color32) {
+    painter.rect_stroke(
+        orthographic_icon_rect(rect),
+        1.0,
+        Stroke::new(PRESET_TOGGLE_ICON_STROKE, color),
+    );
+}
+
+/// Perspective trapezoid — converging edges.
+fn paint_natural_icon(painter: &Painter, rect: Rect, color: Color32) {
+    let segments = natural_icon_segments(rect);
+    paint_icon_segments(painter, &segments, color);
+}
+
+fn paint_projection_mode_icon(painter: &Painter, button: Rect, mode: ProjectionMode) {
+    let color = Color32::from_gray(210);
+    let icon_rect = projection_toggle_icon_rect(button);
+    match mode {
+        ProjectionMode::Orthographic => paint_orthographic_icon(painter, icon_rect, color),
+        ProjectionMode::Natural => paint_natural_icon(painter, icon_rect, color),
+    }
+}
+
+fn show_projection_mode_toggle(ui: &mut Ui, cam: &mut Camera, pad_rect: Rect) {
+    let rect = view_preset_toggle_rect(pad_rect);
+    let active = cam.projection_mode();
+    let target = active.opposite();
+    let response = ui.allocate_rect(rect, Sense::click());
+    let hovered = response.hovered();
+    let clicked = response.clicked();
+    let pressed = response.is_pointer_button_down_on();
+
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        let hint = match target {
+            ProjectionMode::Orthographic => "Orthographic projection",
+            ProjectionMode::Natural => "Natural (perspective) projection",
+        };
+        response.on_hover_text(hint);
+    }
+
+    let fill = if pressed {
+        Color32::from_gray(42)
+    } else if hovered {
+        Color32::from_gray(34)
+    } else {
+        Color32::from_rgba_unmultiplied(26, 28, 34, 220)
+    };
+    ui.painter()
+        .rect_filled(rect, 4.0, fill);
+    ui.painter().rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(1.0, Color32::from_gray(if hovered { 110 } else { 72 })),
+    );
+    paint_projection_mode_icon(ui.painter(), rect, target);
+
+    if clicked {
+        cam.set_projection_mode(target);
+    }
+}
+
 fn cube_rect_in_viewport(viewport: Rect) -> Rect {
     Rect::from_min_size(
         Pos2::new(
@@ -931,6 +1039,7 @@ fn show(ui: &mut Ui, cam: &mut Camera, screen_rect: Rect) {
     for face in &faces {
         draw_face_label(ui, face);
     }
+    show_projection_mode_toggle(ui, cam, pad_rect);
 }
 
 fn face_fill(view: StandardView) -> Color32 {
@@ -1140,6 +1249,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn projection_toggle_icons_fit_inside_button() {
+        let button = Rect::from_min_size(Pos2::ZERO, Vec2::splat(PRESET_TOGGLE_SIZE));
+        let icon = projection_toggle_icon_rect(button);
+        let stroke_pad = PRESET_TOGGLE_ICON_STROKE * 0.5 + 0.5;
+        let bounds = button.shrink(stroke_pad);
+        let square = orthographic_icon_rect(icon);
+        for corner in [square.left_top(), square.right_top(), square.right_bottom(), square.left_bottom()] {
+            assert!(bounds.contains(corner), "point {corner:?} outside {bounds:?}");
+        }
+        for &(a, b) in natural_icon_segments(icon).iter() {
+            assert!(bounds.contains(a), "point {a:?} outside {bounds:?}");
+            assert!(bounds.contains(b), "point {b:?} outside {bounds:?}");
+        }
+    }
+
+    #[test]
+    fn projection_mode_toggle_sits_in_hud_bottom_left() {
+        let vp = Rect::from_min_size(Pos2::new(0.0, 40.0), Vec2::new(800.0, 600.0));
+        let screen_rect = cube_rect_in_viewport(vp);
+        let pad_rect = screen_rect.expand(4.0);
+        let toggle = view_preset_toggle_rect(pad_rect);
+        assert!(pad_rect.contains(toggle.center()));
+        assert!(toggle.max.x < screen_rect.center().x);
+        assert!(toggle.max.y > screen_rect.center().y);
     }
 
     #[test]

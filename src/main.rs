@@ -775,7 +775,7 @@ impl App {
             }
         }
 
-        draw_ground(&painter, &project);
+        draw_ground(&painter, &project, viewport);
 
         for r in &self.state.doc.rects {
             draw_rect(&painter, &project, *r, col::RECT_LINE, true);
@@ -1038,12 +1038,65 @@ fn draw_rect(
     }
 }
 
-fn draw_ground(painter: &egui::Painter, project: &impl Fn(Vec3) -> Option<egui::Pos2>) {
+/// Liang–Barsky clip of a screen-space segment to an axis-aligned rectangle.
+fn clip_segment_to_rect(a: egui::Pos2, b: egui::Pos2, rect: egui::Rect) -> Option<(egui::Pos2, egui::Pos2)> {
+    let mut t0 = 0.0f32;
+    let mut t1 = 1.0f32;
+    let d = b - a;
+    let edges = [
+        (-d.x, a.x - rect.min.x),
+        (d.x, rect.max.x - a.x),
+        (-d.y, a.y - rect.min.y),
+        (d.y, rect.max.y - a.y),
+    ];
+    for (p, q) in edges {
+        if p.abs() < 1e-8 {
+            if q < 0.0 {
+                return None;
+            }
+        } else if p < 0.0 {
+            let r = q / p;
+            if r > t1 {
+                return None;
+            }
+            t0 = t0.max(r);
+        } else {
+            let r = q / p;
+            if r < t0 {
+                return None;
+            }
+            t1 = t1.min(r);
+        }
+    }
+    Some((a + d * t0, a + d * t1))
+}
+
+fn draw_clipped_world_segment(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    viewport: egui::Rect,
+    a: Vec3,
+    b: Vec3,
+    color: egui::Color32,
+    width: f32,
+) {
+    let (Some(pa), Some(pb)) = (project(a), project(b)) else {
+        return;
+    };
+    let Some((ca, cb)) = clip_segment_to_rect(pa, pb, viewport) else {
+        return;
+    };
+    painter.line_segment([ca, cb], egui::Stroke::new(width, color));
+}
+
+fn draw_ground(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    viewport: egui::Rect,
+) {
     let e = GRID_EXTENT;
     let line = |a: Vec3, b: Vec3, color: egui::Color32, w: f32| {
-        if let (Some(pa), Some(pb)) = (project(a), project(b)) {
-            painter.line_segment([pa, pb], egui::Stroke::new(w, color));
-        }
+        draw_clipped_world_segment(painter, project, viewport, a, b, color, w);
     };
 
     let mut t = -e;
@@ -1067,10 +1120,41 @@ fn draw_ground(painter: &egui::Painter, project: &impl Fn(Vec3) -> Option<egui::
 mod tests {
     use super::actions::CreatingRect;
     use super::{
-        col, should_commit_sketch_on_click, should_select_all_rect_value, GRID_EXTENT,
+        clip_segment_to_rect, col, should_commit_sketch_on_click, should_select_all_rect_value,
+        GRID_EXTENT,
     };
+    use eframe::egui::{self, Pos2, Rect, Vec2};
     use egui::Color32;
     use glam::Vec3;
+
+    #[test]
+    fn clip_segment_clamps_infinite_spike_to_viewport() {
+        let vp = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let (a, b) = clip_segment_to_rect(
+            Pos2::new(-12_000.0, 300.0),
+            Pos2::new(12_000.0, 300.0),
+            vp,
+        )
+        .expect("horizon spike should clip");
+        assert!((a.x - vp.min.x).abs() < 0.01);
+        assert!((b.x - vp.max.x).abs() < 0.01);
+        assert!((a.y - 300.0).abs() < 0.01);
+        assert!((b.y - 300.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn clip_segment_returns_none_when_fully_outside() {
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0));
+        assert!(clip_segment_to_rect(Pos2::new(-50.0, -20.0), Pos2::new(50.0, -10.0), vp).is_none());
+    }
+
+    #[test]
+    fn clip_segment_preserves_interior_segment() {
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0));
+        let (a, b) = clip_segment_to_rect(Pos2::new(10.0, 20.0), Pos2::new(80.0, 70.0), vp).unwrap();
+        assert_eq!(a, Pos2::new(10.0, 20.0));
+        assert_eq!(b, Pos2::new(80.0, 70.0));
+    }
 
     #[test]
     fn z_axis_color_matches_view_cube_blue() {

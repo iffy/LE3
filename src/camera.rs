@@ -50,6 +50,34 @@ impl StandardView {
 /// Default duration for animated view changes (seconds).
 pub const VIEW_TRANSITION_DURATION: f32 = 0.35;
 
+/// Startup orbit angles (matches [`Camera::default`]).
+pub const ISOMETRIC_YAW: f32 = 0.8;
+pub const ISOMETRIC_PITCH: f32 = 0.6;
+
+/// Viewport projection: parallel (orthographic) or perspective (natural).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionMode {
+    Orthographic,
+    Natural,
+}
+
+impl ProjectionMode {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "orthographic" | "ortho" => Some(Self::Orthographic),
+            "natural" | "perspective" | "persp" => Some(Self::Natural),
+            _ => None,
+        }
+    }
+
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Orthographic => Self::Natural,
+            Self::Natural => Self::Orthographic,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ViewTransition {
     from_yaw: f32,
@@ -73,8 +101,9 @@ pub struct Camera {
     pub pitch: f32,
     /// Distance from `target` to the eye.
     pub distance: f32,
-    /// Vertical field of view, radians.
+    /// Vertical field of view, radians (used for perspective and ortho framing).
     pub fov_y: f32,
+    pub projection: ProjectionMode,
     transition: Option<ViewTransition>,
 }
 
@@ -82,10 +111,11 @@ impl Default for Camera {
     fn default() -> Self {
         Camera {
             target: Vec3::ZERO,
-            yaw: 0.8,
-            pitch: 0.6,
+            yaw: ISOMETRIC_YAW,
+            pitch: ISOMETRIC_PITCH,
             distance: 400.0,
             fov_y: 45f32.to_radians(),
+            projection: ProjectionMode::Natural,
             transition: None,
         }
     }
@@ -117,6 +147,11 @@ impl Camera {
         self.target + self.distance * Vec3::new(cp * cy, cp * sy, sp)
     }
 
+    /// How head-on the ground plane (XY) is to the view. 1 = plan view, 0 = edge-on.
+    pub fn ground_plane_head_on(&self) -> f32 {
+        (self.target - self.eye()).normalize().z.abs()
+    }
+
     pub fn is_transitioning(&self) -> bool {
         self.transition.is_some()
     }
@@ -129,6 +164,24 @@ impl Camera {
     pub fn start_view_transition(&mut self, view: StandardView, duration: f32) {
         let (yaw, pitch) = view.yaw_pitch();
         self.start_transition_to_yaw_pitch(yaw, pitch, duration);
+    }
+
+    pub fn projection_mode(&self) -> ProjectionMode {
+        self.projection
+    }
+
+    pub fn set_projection_mode(&mut self, mode: ProjectionMode) {
+        self.projection = mode;
+    }
+
+    pub fn toggle_projection_mode(&mut self) {
+        self.projection = self.projection.opposite();
+    }
+
+    /// Half-width/height of the view frustum at the look-at target (world units).
+    pub fn viewport_half_extents(&self, aspect: f32) -> (f32, f32) {
+        let half_h = self.distance * (self.fov_y * 0.5).tan();
+        (half_h * aspect, half_h)
     }
 
     /// Convert an outward view direction (from `target` toward the eye) to yaw/pitch.
@@ -250,8 +303,8 @@ impl Camera {
         let forward = (self.target - self.eye()).normalize();
         let right = forward.cross(Vec3::Z).normalize();
         let up = right.cross(forward).normalize();
-        let world_per_px =
-            2.0 * self.distance * (self.fov_y * 0.5).tan() / viewport_height.max(1.0);
+        let half_h = self.viewport_half_extents(1.0).1;
+        let world_per_px = 2.0 * half_h / viewport_height.max(1.0);
         self.target += (-right * delta.x + up * delta.y) * world_per_px;
     }
 
@@ -306,7 +359,13 @@ impl Camera {
     /// Combined view-projection matrix for the given viewport rectangle.
     pub fn view_proj(&self, viewport: Rect) -> Mat4 {
         let aspect = (viewport.width() / viewport.height().max(1.0)).max(0.01);
-        let proj = Mat4::perspective_rh(self.fov_y, aspect, 0.1, 100_000.0);
+        let (half_w, half_h) = self.viewport_half_extents(aspect);
+        let proj = match self.projection {
+            ProjectionMode::Natural => Mat4::perspective_rh(self.fov_y, aspect, 0.1, 100_000.0),
+            ProjectionMode::Orthographic => {
+                Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, 0.1, 100_000.0)
+            }
+        };
         let view = Mat4::look_at_rh(self.eye(), self.target, Vec3::Z);
         proj * view
     }
@@ -459,6 +518,56 @@ mod tests {
         assert!(
             (cam.yaw - yaw_before).abs() > 0.05,
             "horizontal drag should change yaw away from the poles"
+        );
+    }
+
+    #[test]
+    fn ground_plane_head_on_is_zero_when_viewing_edge_on() {
+        let mut cam = Camera::default();
+        let (yaw, pitch) = StandardView::Front.yaw_pitch();
+        cam.yaw = yaw;
+        cam.pitch = pitch;
+        assert!(cam.ground_plane_head_on() < 0.05);
+    }
+
+    #[test]
+    fn ground_plane_head_on_is_one_from_top_view() {
+        let mut cam = Camera::default();
+        let (yaw, pitch) = StandardView::Top.yaw_pitch();
+        cam.yaw = yaw;
+        cam.pitch = pitch;
+        assert!(cam.ground_plane_head_on() > 0.95);
+    }
+
+    #[test]
+    fn default_projection_is_natural() {
+        assert_eq!(Camera::default().projection_mode(), ProjectionMode::Natural);
+    }
+
+    #[test]
+    fn toggle_projection_mode_swaps() {
+        let mut cam = Camera::default();
+        cam.toggle_projection_mode();
+        assert_eq!(cam.projection_mode(), ProjectionMode::Orthographic);
+        cam.toggle_projection_mode();
+        assert_eq!(cam.projection_mode(), ProjectionMode::Natural);
+    }
+
+    #[test]
+    fn orthographic_projection_preserves_parallel_xy_spacing() {
+        let mut cam = Camera::default();
+        cam.set_projection_mode(ProjectionMode::Orthographic);
+        let viewport = test_viewport();
+        let vp = cam.view_proj(viewport);
+        let a0 = cam.project(Vec3::new(0.0, 0.0, 0.0), viewport, &vp).unwrap();
+        let a1 = cam.project(Vec3::new(100.0, 0.0, 0.0), viewport, &vp).unwrap();
+        let b0 = cam.project(Vec3::new(0.0, 0.0, 80.0), viewport, &vp).unwrap();
+        let b1 = cam.project(Vec3::new(100.0, 0.0, 80.0), viewport, &vp).unwrap();
+        let dx_near = a1.x - a0.x;
+        let dx_far = b1.x - b0.x;
+        assert!(
+            (dx_near - dx_far).abs() < 0.5,
+            "ortho spacing should not shrink with depth: near={dx_near} far={dx_far}"
         );
     }
 

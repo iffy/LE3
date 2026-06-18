@@ -4,7 +4,7 @@
 //! via synthetic pointer/keyboard events and headless actions.
 
 use crate::actions::{Action, AppState, RectAxis, Tool};
-use crate::camera::StandardView;
+use crate::camera::{ProjectionMode, StandardView};
 use crate::view_cube::{CubeCornerId, CubeEdgeId};
 
 use eframe::egui::{self, Key, Modifiers, PointerButton};
@@ -32,6 +32,8 @@ pub enum Instruction {
     View(StandardView),
     ViewEdge(CubeEdgeId),
     ViewCorner(CubeCornerId),
+    ProjectionMode(ProjectionMode),
+    ToggleProjectionMode,
 
     // Synthetic input (viewport-local pixel coordinates)
     Move { x: f32, y: f32 },
@@ -97,6 +99,10 @@ impl Instruction {
             Instruction::ViewCorner(corner) => {
                 format!("view corner {}", corner_script_name(*corner))
             }
+            Instruction::ProjectionMode(mode) => {
+                format!("view {}", projection_mode_script_name(*mode))
+            }
+            Instruction::ToggleProjectionMode => "toggle_projection".to_string(),
             Instruction::Move { x, y } => format!("move {x} {y}"),
             Instruction::Click { x, y } => format!("click {x} {y}"),
             Instruction::MoveGround { x, y } => format!("move_ground {x} {y}"),
@@ -261,10 +267,17 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
                         .map(Instruction::ViewCorner)
                         .ok_or_else(|| err(&format!("unknown cube corner '{name}'")))
                 }
-                _ => StandardView::from_name(first)
-                    .map(Instruction::View)
+                _ => ProjectionMode::from_name(first)
+                    .map(Instruction::ProjectionMode)
+                    .or_else(|| {
+                        StandardView::from_name(first).map(Instruction::View)
+                    })
                     .ok_or_else(|| err(&format!("unknown view '{first}'"))),
             }
+        }
+
+        "toggle_projection" | "projection_toggle" | "toggle_view" | "view_toggle" => {
+            Ok(Instruction::ToggleProjectionMode)
         }
 
         "move" | "mousemove" => {
@@ -464,6 +477,13 @@ fn view_script_name(view: StandardView) -> &'static str {
         StandardView::Right => "right",
         StandardView::Top => "top",
         StandardView::Bottom => "bottom",
+    }
+}
+
+fn projection_mode_script_name(mode: ProjectionMode) -> &'static str {
+    match mode {
+        ProjectionMode::Orthographic => "orthographic",
+        ProjectionMode::Natural => "natural",
     }
 }
 
@@ -931,6 +951,14 @@ impl ScriptRunner {
                 self.waiting_view_transition = true;
                 StepResult::Wait
             }
+            Instruction::ProjectionMode(mode) => {
+                state.apply(Action::SetProjectionMode(mode));
+                StepResult::Continue
+            }
+            Instruction::ToggleProjectionMode => {
+                state.apply(Action::ToggleProjectionMode);
+                StepResult::Continue
+            }
 
             Instruction::Move { x, y } => {
                 let Some(vp) = viewport else {
@@ -1215,6 +1243,19 @@ mod tests {
                 Instruction::View(StandardView::Front),
                 Instruction::View(StandardView::Top),
                 Instruction::View(StandardView::Right),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_projection_mode_commands() {
+        let ins = parse("view orthographic\nview natural\ntoggle_projection").unwrap();
+        assert_eq!(
+            ins,
+            vec![
+                Instruction::ProjectionMode(ProjectionMode::Orthographic),
+                Instruction::ProjectionMode(ProjectionMode::Natural),
+                Instruction::ToggleProjectionMode,
             ]
         );
     }
