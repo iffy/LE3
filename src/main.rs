@@ -233,12 +233,6 @@ impl App {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| {
-            i.key_pressed(egui::Key::P) && (i.modifiers.command || i.modifiers.ctrl)
-        }) {
-            self.state.apply(Action::ToggleCommandPalette);
-        }
-
         if self.state.command_palette.open {
             return;
         }
@@ -299,7 +293,8 @@ impl App {
         let creating = self.state.creating_rect.is_some()
             || self.state.creating_line.is_some()
             || self.state.creating_plane.is_some();
-        let (enter_pressed, tab_pressed) = if creating {
+        let editing_committed_dim = self.state.editing_committed_dim.is_some();
+        let (enter_pressed, tab_pressed) = if creating || editing_committed_dim {
             (
                 ctx.input(|i| i.key_pressed(egui::Key::Enter)),
                 ctx.input(|i| i.key_pressed(egui::Key::Tab)),
@@ -331,6 +326,9 @@ impl App {
         }
         if self.state.creating_line.is_some() && enter_pressed {
             self.state.apply(Action::CommitLine);
+        }
+        if editing_committed_dim && enter_pressed {
+            self.state.apply(Action::CommitCommittedDim);
         }
 
         if let Some(cp) = &mut self.state.creating_plane {
@@ -1154,12 +1152,43 @@ fn pointer_over_committed_dim_label(
     layouts.iter().any(|l| l.label_rect.contains(pointer))
 }
 
+fn dim_input_layout_centered_on(label_rect: egui::Rect, text: &str) -> DimInputLayout {
+    let size = dim_input_size_for_text(text);
+    let pos = label_rect.center() - size * 0.5;
+    layout_at(pos, size)
+}
+
+fn handle_committed_dim_label_double_click(
+    ui: &egui::Ui,
+    layouts: &[CommittedDimLayout],
+    state: &mut AppState,
+) -> bool {
+    if state.tool != Tool::Select || state.editing_committed_dim.is_some() {
+        return false;
+    }
+    if !ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+        return false;
+    }
+    let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else {
+        return false;
+    };
+    let Some(hit) = layouts.iter().rev().find(|h| h.label_rect.contains(pos)) else {
+        return false;
+    };
+    state.apply(Action::BeginEditCommittedDim { target: hit.target });
+    true
+}
+
 fn handle_committed_dim_label_drag(
     ui: &egui::Ui,
     layouts: &[CommittedDimLayout],
     drag: &mut Option<DimLabelDrag>,
     state: &mut AppState,
 ) -> bool {
+    if state.tool != Tool::Select || state.editing_committed_dim.is_some() {
+        return false;
+    }
+
     let pointer = ui.input(|i| i.pointer.hover_pos());
     let primary_down = ui.input(|i| i.pointer.primary_down());
     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
@@ -1271,14 +1300,15 @@ impl App {
             build_committed_dim_layouts(&painter, &project, &view, &self.state.doc, session)
         });
         let pointer_screen = response.hover_pos().or(response.interact_pointer_pos());
-        let over_committed_dim_label = pointer_screen.is_some_and(|pp| {
-            committed_dim_layouts
-                .as_ref()
-                .is_some_and(|layouts| pointer_over_committed_dim_label(layouts, pp))
-        }) || self.dim_label_drag.is_some();
+        let layouts_slice = committed_dim_layouts.as_deref().unwrap_or(&[]);
+        let over_committed_dim_label = self.state.tool == Tool::Select
+            && (pointer_screen.is_some_and(|pp| {
+                pointer_over_committed_dim_label(layouts_slice, pp)
+            }) || self.dim_label_drag.is_some());
+        handle_committed_dim_label_double_click(ui, layouts_slice, &mut self.state);
         if handle_committed_dim_label_drag(
             ui,
-            committed_dim_layouts.as_deref().unwrap_or(&[]),
+            layouts_slice,
             &mut self.dim_label_drag,
             &mut self.state,
         ) {
@@ -1713,9 +1743,81 @@ impl App {
             }
             if let (Some(layouts), Some(view)) = (&committed_dim_layouts, planar_label_view) {
                 draw_committed_dim_layouts(&painter, layouts, &view, &project);
+                if let Some(edit) = &mut self.state.editing_committed_dim {
+                    if let Some(layout) = layouts.iter().find(|l| l.target == edit.target) {
+                        let ctx = ui.ctx();
+                        let id = egui::Id::new(("committed_dim", format!("{:?}", edit.target)));
+                        let input_layout =
+                            dim_input_layout_centered_on(layout.label_rect, &edit.text);
+                        egui::Area::new(egui::Id::new(("committed_dim_area", format!("{:?}", edit.target))))
+                            .fixed_pos(input_layout.pos)
+                            .order(egui::Order::Foreground)
+                            .show(ctx, |ui| {
+                                if show_sketch_dimension_field(
+                                    ui,
+                                    ctx,
+                                    id,
+                                    &mut edit.text,
+                                    &self.state.doc,
+                                    true,
+                                    &mut edit.pending_focus,
+                                    true,
+                                ) {}
+                            });
+                        if edit.pending_focus {
+                            ctx.memory_mut(|m| m.request_focus(id));
+                        }
+                        match edit.target {
+                            DimLabelTarget::RectWidth { index }
+                            | DimLabelTarget::RectHeight { index } => {
+                                if let Some(rect) = self.state.doc.rects.get(index) {
+                                    if let Some(corners) =
+                                        rect_world_corners(&self.state.doc, rect)
+                                    {
+                                        let edge = match edit.target {
+                                            DimLabelTarget::RectWidth { .. } => {
+                                                RectDimEdge::Width
+                                            }
+                                            DimLabelTarget::RectHeight { .. } => {
+                                                RectDimEdge::Height
+                                            }
+                                            _ => unreachable!(),
+                                        };
+                                        let (a, b) = rect_highlight_edge(corners, edge);
+                                        draw_world_segment(
+                                            &painter,
+                                            &project,
+                                            a,
+                                            b,
+                                            col::DIM_EDGE_HIGHLIGHT,
+                                            3.5,
+                                        );
+                                    }
+                                }
+                            }
+                            DimLabelTarget::LineLength { index } => {
+                                if let Some(line) = self.state.doc.lines.get(index) {
+                                    if let Some((a, b)) =
+                                        line_world_endpoints(&self.state.doc, line)
+                                    {
+                                        draw_world_segment(
+                                            &painter,
+                                            &project,
+                                            a,
+                                            b,
+                                            col::DIM_EDGE_HIGHLIGHT,
+                                            3.5,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else {
             self.dim_label_drag = None;
+            self.state.editing_committed_dim = None;
         }
         if let (Some(cr), Some(session)) =
             (&self.state.creating_rect, self.state.sketch_session)
@@ -2047,8 +2149,10 @@ impl App {
 
         let hint = match self.state.tool {
             Tool::Select => {
-                if self.state.sketch_session.is_some() {
-                    "Sketch mode — pick rectangle or line tool  •  Esc: exit sketch (cancels in-progress draw first)"
+                if self.state.editing_committed_dim.is_some() {
+                    "Edit dimension • Enter to commit • Esc to cancel"
+                } else if self.state.sketch_session.is_some() {
+                    "Sketch mode — double-click dimension to edit • drag labels to reposition • Esc: exit sketch"
                 } else {
                     "Right-drag: orbit  •  Shift+right-drag: pan  •  Wheel: zoom  •  s: sketch  •  p: plane"
                 }

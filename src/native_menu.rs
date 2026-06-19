@@ -23,6 +23,7 @@ pub enum MenuCommand {
     UndoLast,
     Clear,
     About,
+    ToggleCommandPalette,
     SetPaneVisible { pane: Pane, visible: bool },
 }
 
@@ -37,6 +38,7 @@ pub struct MenuIds {
     pub undo: MenuId,
     pub clear: MenuId,
     pub about: MenuId,
+    pub command_palette: MenuId,
     pub pane_checks: Vec<(Pane, MenuId)>,
 }
 
@@ -92,6 +94,9 @@ pub fn command_for_id(
     if ids.about == id {
         return Some(MenuCommand::About);
     }
+    if ids.command_palette == id {
+        return Some(MenuCommand::ToggleCommandPalette);
+    }
     for &(pane, ref check_id) in &ids.pane_checks {
         if check_id == id {
             return Some(MenuCommand::SetPaneVisible {
@@ -128,6 +133,7 @@ impl MenuCommand {
             MenuCommand::UndoLast => Some(Action::UndoLast),
             MenuCommand::Clear => Some(Action::Clear),
             MenuCommand::About => None,
+            MenuCommand::ToggleCommandPalette => Some(Action::ToggleCommandPalette),
             MenuCommand::SetPaneVisible { pane, visible } => {
                 Some(Action::SetPaneVisible { pane, visible })
             }
@@ -215,6 +221,12 @@ impl NativeMenu {
             Some(Accelerator::new(Some(primary), Code::KeyZ)),
         );
         let clear = MenuItem::with_id("clear", "Clear", true, None);
+        let command_palette = MenuItem::with_id(
+            "command_palette",
+            "Command Palette…",
+            true,
+            Some(Accelerator::new(Some(primary), Code::KeyP)),
+        );
         let about = MenuItem::with_id("about", "About LE3", true, None);
 
         let mut pane_checks = Vec::new();
@@ -253,6 +265,8 @@ impl NativeMenu {
             .map(|(_, item)| item as &dyn muda::IsMenuItem)
             .collect();
         panes_menu.append_items(&pane_item_refs)?;
+        view_menu.append(&command_palette)?;
+        view_menu.append(&PredefinedMenuItem::separator())?;
         view_menu.append(&panes_menu)?;
         help_menu.append(&about)?;
 
@@ -272,6 +286,7 @@ impl NativeMenu {
             undo: undo.id().clone(),
             clear: clear.id().clone(),
             about: about.id().clone(),
+            command_palette: command_palette.id().clone(),
             pane_checks: pane_ids,
         };
 
@@ -354,6 +369,7 @@ mod tests {
             undo: MenuId::new("undo"),
             clear: MenuId::new("clear"),
             about: MenuId::new("about"),
+            command_palette: MenuId::new("command_palette"),
             pane_checks: vec![(Pane::ViewCube, pane_menu_id.clone())],
         };
         (ids, pane_menu_id)
@@ -385,6 +401,19 @@ mod tests {
         assert_eq!(
             command_for_id(&ids.clear, &ids, |_| true),
             Some(MenuCommand::Clear)
+        );
+    }
+
+    #[test]
+    fn maps_command_palette_menu_item() {
+        let ids = ids_with_pane("view_cube").0;
+        assert_eq!(
+            command_for_id(&ids.command_palette, &ids, |_| true),
+            Some(MenuCommand::ToggleCommandPalette)
+        );
+        assert_eq!(
+            MenuCommand::ToggleCommandPalette.to_action(),
+            Some(Action::ToggleCommandPalette)
         );
     }
 

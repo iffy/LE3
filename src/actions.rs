@@ -25,7 +25,7 @@ use crate::parameters::{
     add_parameter, delete_parameter, recompute_document_geometry, set_parameter_expression,
     set_parameter_name, ParametersPaneState,
 };
-use crate::value::parse_positive_length_or_in_doc;
+use crate::value::{eval_length_mm_in_doc, format_length_display, parse_positive_length_or_in_doc};
 use eframe::egui;
 use glam::Vec3;
 
@@ -223,6 +223,8 @@ pub enum Action {
         target: DimLabelTarget,
         offset: f32,
     },
+    BeginEditCommittedDim { target: DimLabelTarget },
+    CommitCommittedDim,
     BeginConstructionPlane {
         reference: PlaneReference,
         parent: ConstructionPlaneParent,
@@ -412,6 +414,116 @@ pub enum DimLabelTarget {
     LineLength { index: usize },
 }
 
+impl DimLabelTarget {
+    pub fn matches_rect_axis(self, axis: RectAxis) -> bool {
+        matches!(
+            (self, axis),
+            (DimLabelTarget::RectWidth { .. }, RectAxis::Width)
+                | (DimLabelTarget::RectHeight { .. }, RectAxis::Height)
+        )
+    }
+
+    pub fn is_line_length(self) -> bool {
+        matches!(self, DimLabelTarget::LineLength { .. })
+    }
+}
+
+/// In-progress edit of a committed sketch dimension (Select tool).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditingCommittedDim {
+    pub target: DimLabelTarget,
+    pub text: String,
+    pub pending_focus: bool,
+}
+
+/// Expression text shown when editing a committed dimension.
+pub fn committed_dim_expression(doc: &Document, target: DimLabelTarget) -> Option<String> {
+    match target {
+        DimLabelTarget::RectWidth { index } => {
+            let rect = doc.rects.get(index)?;
+            if !rect.width_locked {
+                return None;
+            }
+            Some(
+                rect.width_expr
+                    .clone()
+                    .unwrap_or_else(|| format_length_display(rect.w)),
+            )
+        }
+        DimLabelTarget::RectHeight { index } => {
+            let rect = doc.rects.get(index)?;
+            if !rect.height_locked {
+                return None;
+            }
+            Some(
+                rect.height_expr
+                    .clone()
+                    .unwrap_or_else(|| format_length_display(rect.h)),
+            )
+        }
+        DimLabelTarget::LineLength { index } => {
+            let line = doc.lines.get(index)?;
+            if !line.length_locked {
+                return None;
+            }
+            Some(
+                line.length_expr
+                    .clone()
+                    .unwrap_or_else(|| format_length_display(line.length())),
+            )
+        }
+    }
+}
+
+fn apply_committed_dim_expression(
+    doc: &mut Document,
+    target: DimLabelTarget,
+    expression: &str,
+) -> Result<(), String> {
+    let trimmed = expression.trim();
+    if trimmed.is_empty() {
+        return Err("Dimension value cannot be empty".to_string());
+    }
+    let value = eval_length_mm_in_doc(trimmed, doc)
+        .ok_or_else(|| format!("Invalid dimension expression '{trimmed}'"))?;
+    if value <= 0.0 {
+        return Err(format!("Dimension expression '{trimmed}' must be positive"));
+    }
+    match target {
+        DimLabelTarget::RectWidth { index } => {
+            let rect = doc
+                .rects
+                .get_mut(index)
+                .ok_or_else(|| format!("Rectangle {index} not found"))?;
+            if !rect.width_locked {
+                return Err("Rectangle width is not dimensioned".to_string());
+            }
+            rect.width_expr = Some(trimmed.to_string());
+        }
+        DimLabelTarget::RectHeight { index } => {
+            let rect = doc
+                .rects
+                .get_mut(index)
+                .ok_or_else(|| format!("Rectangle {index} not found"))?;
+            if !rect.height_locked {
+                return Err("Rectangle height is not dimensioned".to_string());
+            }
+            rect.height_expr = Some(trimmed.to_string());
+        }
+        DimLabelTarget::LineLength { index } => {
+            let line = doc
+                .lines
+                .get_mut(index)
+                .ok_or_else(|| format!("Line {index} not found"))?;
+            if !line.length_locked {
+                return Err("Line length is not dimensioned".to_string());
+            }
+            line.length_expr = Some(trimmed.to_string());
+        }
+    }
+    recompute_document_geometry(doc)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RectAxis {
     Width,
@@ -484,6 +596,7 @@ pub struct AppState {
     pub parameters_pane: ParametersPaneState,
     pub command_palette: CommandPaletteState,
     pub element_visibility: ElementVisibility,
+    pub editing_committed_dim: Option<EditingCommittedDim>,
     pub status: String,
 }
 
@@ -502,6 +615,7 @@ impl Default for AppState {
             parameters_pane: ParametersPaneState::default(),
             command_palette: CommandPaletteState::default(),
             element_visibility: ElementVisibility::default(),
+            editing_committed_dim: None,
             status: String::new(),
         }
     }
@@ -651,6 +765,9 @@ impl AppState {
                 if self.creating_plane.is_some() && tool != Tool::ConstructionPlane {
                     self.creating_plane = None;
                 }
+                if tool != Tool::Select {
+                    self.editing_committed_dim = None;
+                }
                 self.tool = tool;
                 self.status = match tool {
                     Tool::Select => "Select tool".to_string(),
@@ -666,7 +783,9 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::CancelOperation => {
-                if self.creating_rect.take().is_some()
+                if self.editing_committed_dim.take().is_some() {
+                    self.status = "Cancelled".to_string();
+                } else if self.creating_rect.take().is_some()
                     || self.creating_line.take().is_some()
                     || self.creating_plane.take().is_some()
                 {
@@ -747,6 +866,12 @@ impl AppState {
                 }
             }
             Action::SetRectDimension { axis, value } => {
+                if let Some(edit) = &mut self.editing_committed_dim {
+                    if edit.target.matches_rect_axis(axis) {
+                        edit.text = value;
+                        return ActionResult::Ok;
+                    }
+                }
                 let Some(cr) = &mut self.creating_rect else {
                     return ActionResult::Err("No rectangle in progress".to_string());
                 };
@@ -756,6 +881,12 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::FocusRectDimension { axis } => {
+                if let Some(edit) = &mut self.editing_committed_dim {
+                    if edit.target.matches_rect_axis(axis) {
+                        edit.pending_focus = true;
+                        return ActionResult::Ok;
+                    }
+                }
                 let Some(cr) = &mut self.creating_rect else {
                     return ActionResult::Err("No rectangle in progress".to_string());
                 };
@@ -799,6 +930,12 @@ impl AppState {
                 }
             }
             Action::SetLineLength { value } => {
+                if let Some(edit) = &mut self.editing_committed_dim {
+                    if edit.target.is_line_length() {
+                        edit.text = value;
+                        return ActionResult::Ok;
+                    }
+                }
                 let Some(cl) = &mut self.creating_line else {
                     return ActionResult::Err("No line in progress".to_string());
                 };
@@ -840,11 +977,51 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::FocusLineLength => {
+                if let Some(edit) = &mut self.editing_committed_dim {
+                    if edit.target.is_line_length() {
+                        edit.pending_focus = true;
+                        return ActionResult::Ok;
+                    }
+                }
                 let Some(cl) = &mut self.creating_line else {
                     return ActionResult::Err("No line in progress".to_string());
                 };
                 cl.pending_focus = true;
                 ActionResult::Ok
+            }
+            Action::BeginEditCommittedDim { target } => {
+                if self.sketch_session.is_none() {
+                    return ActionResult::Err("Not in sketch mode".to_string());
+                }
+                if self.tool != Tool::Select {
+                    return ActionResult::Err("Select tool required to edit dimensions".to_string());
+                }
+                let Some(text) = committed_dim_expression(&self.doc, target) else {
+                    return ActionResult::Err("Dimension is not editable".to_string());
+                };
+                self.editing_committed_dim = Some(EditingCommittedDim {
+                    target,
+                    text,
+                    pending_focus: true,
+                });
+                self.status = "Edit dimension • Enter to commit • Esc to cancel".to_string();
+                ActionResult::Ok
+            }
+            Action::CommitCommittedDim => {
+                let Some(edit) = self.editing_committed_dim.take() else {
+                    return ActionResult::Err("No committed dimension being edited".to_string());
+                };
+                match apply_committed_dim_expression(&mut self.doc, edit.target, &edit.text) {
+                    Ok(()) => {
+                        self.status = "Updated dimension".to_string();
+                        ActionResult::Ok
+                    }
+                    Err(e) => {
+                        self.editing_committed_dim = Some(edit);
+                        self.status = e.clone();
+                        ActionResult::Err(e)
+                    }
+                }
             }
             Action::BeginConstructionPlane { reference, parent } => {
                 self.creating_plane = Some(CreatingConstructionPlane {
@@ -1126,6 +1303,7 @@ impl AppState {
         self.sketch_session = None;
         self.creating_rect = None;
         self.creating_line = None;
+        self.editing_committed_dim = None;
         self.cam.leave_sketch_mode();
         self.tool = Tool::Select;
     }
@@ -1558,6 +1736,65 @@ mod tests {
         state.doc.shape_order.push(ShapeKind::Rect);
         let target = dim_label_target_in_sketch(&state.doc, sketch, DimLabelAxis::Width);
         assert_eq!(target, Some(DimLabelTarget::RectWidth { index: 0 }));
+    }
+
+    #[test]
+    fn begin_edit_committed_dim_requires_select_tool() {
+        let mut state = AppState::default();
+        begin_default_sketch(&mut state);
+        state.apply(Action::SetTool(Tool::Rectangle));
+        let result = state.apply(Action::BeginEditCommittedDim {
+            target: DimLabelTarget::RectWidth { index: 0 },
+        });
+        assert!(matches!(result, ActionResult::Err(_)));
+        assert!(state.editing_committed_dim.is_none());
+    }
+
+    #[test]
+    fn commit_committed_dim_updates_rectangle_width() {
+        let mut state = AppState::default();
+        begin_default_sketch(&mut state);
+        state.creating_rect = Some(CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["10".to_string(), "5".to_string()],
+            focused: 0,
+            last_mouse: Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [true, true],
+            pending_focus: false,
+        });
+        state.apply(Action::CommitRectangle);
+        state.apply(Action::BeginEditCommittedDim {
+            target: DimLabelTarget::RectWidth { index: 0 },
+        });
+        state.apply(Action::SetRectDimension {
+            axis: RectAxis::Width,
+            value: "20mm".to_string(),
+        });
+        state.apply(Action::CommitCommittedDim);
+        assert!((state.doc.rects[0].w - 20.0).abs() < 1e-3);
+        assert_eq!(state.doc.rects[0].width_expr.as_deref(), Some("20mm"));
+        assert!(state.editing_committed_dim.is_none());
+    }
+
+    #[test]
+    fn cancel_operation_clears_committed_dim_edit_before_exiting_sketch() {
+        let mut state = AppState::default();
+        begin_default_sketch(&mut state);
+        state.creating_rect = Some(CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["10".to_string(), "5".to_string()],
+            focused: 0,
+            last_mouse: Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [true, true],
+            pending_focus: false,
+        });
+        state.apply(Action::CommitRectangle);
+        state.apply(Action::BeginEditCommittedDim {
+            target: DimLabelTarget::RectWidth { index: 0 },
+        });
+        state.apply(Action::CancelOperation);
+        assert!(state.editing_committed_dim.is_none());
+        assert!(state.sketch_session.is_some());
     }
 
     #[test]

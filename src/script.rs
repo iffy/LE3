@@ -37,6 +37,8 @@ pub enum Instruction {
     },
     SetDim { axis: RectAxis, value: String },
     SetDimLabelOffset { axis: DimLabelAxis, offset: f32 },
+    BeginEditCommittedDim { axis: DimLabelAxis },
+    CommitCommittedDim,
     SetLineLength { value: String },
     BeginEditConstructionPlane { index: usize },
     CommitConstructionPlane,
@@ -136,6 +138,15 @@ impl Instruction {
                 };
                 format!("set_dim_label_offset {name} {offset}")
             }
+            Instruction::BeginEditCommittedDim { axis } => {
+                let name = match axis {
+                    DimLabelAxis::Width => "width",
+                    DimLabelAxis::Height => "height",
+                    DimLabelAxis::Length => "length",
+                };
+                format!("edit_dim {name}")
+            }
+            Instruction::CommitCommittedDim => "commit_dim".to_string(),
             Instruction::BeginEditConstructionPlane { index } => format!("edit_plane {index}"),
             Instruction::CommitConstructionPlane => "commit_plane".to_string(),
             Instruction::SetPlaneOffset { value } => format!("set_dim offset {value}"),
@@ -469,6 +480,15 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
                 ))),
             }
         }
+
+        "edit_dim" | "editdim" => {
+            let axis_name = rest.split_whitespace().next().unwrap_or("");
+            let axis = DimLabelAxis::from_name(axis_name)
+                .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
+            Ok(Instruction::BeginEditCommittedDim { axis })
+        }
+
+        "commit_dim" | "commitdim" => Ok(Instruction::CommitCommittedDim),
 
         "set_dim_label_offset" | "setdimlabeloffset" | "dim_label_offset" => {
             let (axis_name, value) = rest
@@ -1264,6 +1284,20 @@ impl ScriptRunner {
                 }
                 StepResult::Continue
             }
+            Instruction::BeginEditCommittedDim { axis } => {
+                if let Some(session) = state.sketch_session {
+                    if let Some(target) =
+                        dim_label_target_in_sketch(&state.doc, session.sketch, axis)
+                    {
+                        let _ = state.apply(Action::BeginEditCommittedDim { target });
+                    }
+                }
+                StepResult::Continue
+            }
+            Instruction::CommitCommittedDim => {
+                let _ = state.apply(Action::CommitCommittedDim);
+                StepResult::Continue
+            }
             Instruction::SetLineLength { value } => {
                 let _ = state.apply(Action::SetLineLength { value });
                 StepResult::Continue
@@ -2041,6 +2075,52 @@ mod tests {
                     value: "45".to_string()
                 },
                 Instruction::FocusPlaneDim(PlaneDim::Angle),
+            ]
+        );
+    }
+
+    #[test]
+    fn script_edit_committed_dim_updates_rectangle_width() {
+        let mut state = AppState::default();
+        state.apply(crate::actions::Action::BeginSketch {
+            face: FaceId::ConstructionPlane(0),
+            viewport: None,
+        });
+        state.creating_rect = Some(crate::actions::CreatingRect {
+            origin: glam::Vec3::ZERO,
+            texts: ["10".to_string(), "5".to_string()],
+            focused: 0,
+            last_mouse: glam::Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [true, true],
+            pending_focus: false,
+        });
+        state.apply(crate::actions::Action::CommitRectangle);
+        let script = "edit_dim width\nset_dim width 25mm\ncommit_dim";
+        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        runner.verbose = false;
+        let mut synthetic = SyntheticInput::default();
+        while !runner.done {
+            runner.tick(
+                &mut state,
+                &mut synthetic,
+                None,
+                &egui::Context::default(),
+            );
+        }
+        assert!((state.doc.rects[0].w - 25.0).abs() < 1e-3);
+        assert_eq!(state.doc.rects[0].width_expr.as_deref(), Some("25mm"));
+    }
+
+    #[test]
+    fn parses_edit_dim_and_commit_dim() {
+        let ins = parse("edit_dim width\ncommit_dim").unwrap();
+        assert_eq!(
+            ins,
+            vec![
+                Instruction::BeginEditCommittedDim {
+                    axis: DimLabelAxis::Width
+                },
+                Instruction::CommitCommittedDim,
             ]
         );
     }
