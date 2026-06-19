@@ -8,7 +8,7 @@ use crate::actions::{
 };
 use crate::command_palette::{best_match, commands_for_state, PaletteOutcome};
 use crate::hierarchy::SceneElement;
-use crate::model::{FaceId, SketchId};
+use crate::model::{FaceId, RectEdge, SketchId};
 use crate::construction::PlaneDim;
 use crate::camera::{ProjectionMode, StandardView};
 use crate::view_cube::{CubeCornerId, CubeEdgeId};
@@ -35,6 +35,22 @@ pub enum Instruction {
         element: SceneElement,
         visible: Option<bool>,
     },
+    /// Click a tree row: replaces selection unless `additive` is true.
+    SelectSceneElement {
+        element: SceneElement,
+        additive: bool,
+    },
+    ClearSceneSelection,
+    SetShapeConstruction {
+        element: SceneElement,
+        construction: bool,
+    },
+    /// Set construction/substantial on draw op or all constructable selected targets.
+    ApplyConstruction {
+        construction: bool,
+    },
+    /// Toggle construction/substantial on draw op or each constructable selected target.
+    ToggleConstruction,
     SetDim { axis: RectAxis, value: String },
     SetDimLabelOffset { axis: DimLabelAxis, offset: f32 },
     BeginEditCommittedDim { axis: DimLabelAxis },
@@ -122,6 +138,38 @@ impl Instruction {
                 };
                 format!("element {kind} {index} {verb}")
             }
+            Instruction::SelectSceneElement { element, additive } => {
+                let tokens = element_script_tokens(*element);
+                let edge = tokens
+                    .edge
+                    .map(|edge| format!(" {}", edge.script_name()))
+                    .unwrap_or_default();
+                if *additive {
+                    format!("select {} {}{} add", tokens.kind, tokens.index, edge)
+                } else {
+                    format!("select {} {}{}", tokens.kind, tokens.index, edge)
+                }
+            }
+            Instruction::ClearSceneSelection => "clear_selection".to_string(),
+            Instruction::SetShapeConstruction { element, construction } => {
+                let tokens = element_script_tokens(*element);
+                let edge = tokens
+                    .edge
+                    .map(|edge| format!(" {}", edge.script_name()))
+                    .unwrap_or_default();
+                format!(
+                    "set_construction {} {}{} {}",
+                    tokens.kind,
+                    tokens.index,
+                    edge,
+                    if *construction { "true" } else { "false" }
+                )
+            }
+            Instruction::ApplyConstruction { construction } => format!(
+                "apply_construction {}",
+                if *construction { "true" } else { "false" }
+            ),
+            Instruction::ToggleConstruction => "toggle_construction".to_string(),
             Instruction::SetDim { axis, value } => {
                 let name = match axis {
                     RectAxis::Width => "width",
@@ -370,12 +418,63 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
             Ok(Instruction::SetElementVisible { element, visible })
         }
 
+        "select" | "select_scene" => {
+            let mut parts = rest.split_whitespace();
+            let kind = parts
+                .next()
+                .ok_or_else(|| err("select requires kind and index"))?;
+            let index = parts
+                .next()
+                .ok_or_else(|| err("select requires index"))?
+                .parse::<usize>()
+                .map_err(|_| err("select index must be an integer"))?;
+            let (element, additive) =
+                parse_scene_element_with_tail(kind, index, &mut parts, line_no)?;
+            Ok(Instruction::SelectSceneElement { element, additive })
+        }
+
+        "clear_selection" | "deselect" | "select_clear" => Ok(Instruction::ClearSceneSelection),
+
+        "set_construction" | "construction" => {
+            let mut parts = rest.split_whitespace();
+            let kind = parts
+                .next()
+                .ok_or_else(|| err("set_construction requires kind and index"))?;
+            let index = parts
+                .next()
+                .ok_or_else(|| err("set_construction requires index"))?
+                .parse::<usize>()
+                .map_err(|_| err("set_construction index must be an integer"))?;
+            let (element, tail) =
+                parse_scene_element_with_optional_edge(kind, index, &mut parts, line_no)?;
+            let value = tail.ok_or_else(|| ParseError {
+                line: line_no,
+                message: "set_construction requires true or false".to_string(),
+            })?;
+            let construction = parse_construction_value(value, line_no)?;
+            Ok(Instruction::SetShapeConstruction {
+                element,
+                construction,
+            })
+        }
+
+        "apply_construction" => {
+            let value = rest
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| err("apply_construction requires true or false"))?;
+            let construction = parse_construction_value(value, line_no)?;
+            Ok(Instruction::ApplyConstruction { construction })
+        }
+
+        "toggle_construction" => Ok(Instruction::ToggleConstruction),
+
         "pane" => {
             let mut parts = rest.split_whitespace();
             let name = parts.next().ok_or_else(|| err("pane requires a name"))?;
             let pane = Pane::from_name(name).ok_or_else(|| {
                 err(&format!(
-                    "unknown pane '{name}' (expected tree, parameters, or view_cube)"
+                    "unknown pane '{name}' (expected tree, context, parameters, or view_cube)"
                 ))
             })?;
             let visible = match parts.next().map(|s| s.to_ascii_lowercase()).as_deref() {
@@ -796,13 +895,122 @@ fn face_script_name(face: FaceId) -> String {
     }
 }
 
+struct ElementScriptTokens {
+    kind: &'static str,
+    index: usize,
+    edge: Option<RectEdge>,
+}
+
 fn element_script_parts(element: SceneElement) -> (&'static str, usize) {
+    let tokens = element_script_tokens(element);
+    (tokens.kind, tokens.index)
+}
+
+fn element_script_tokens(element: SceneElement) -> ElementScriptTokens {
     match element {
-        SceneElement::ConstructionPlane(i) => ("construction_plane", i),
-        SceneElement::Sketch(i) => ("sketch", i),
-        SceneElement::Rect(i) => ("rect", i),
-        SceneElement::Line(i) => ("line", i),
+        SceneElement::ConstructionPlane(i) => ElementScriptTokens {
+            kind: "construction_plane",
+            index: i,
+            edge: None,
+        },
+        SceneElement::Sketch(i) => ElementScriptTokens {
+            kind: "sketch",
+            index: i,
+            edge: None,
+        },
+        SceneElement::Rect(i) => ElementScriptTokens {
+            kind: "rect",
+            index: i,
+            edge: None,
+        },
+        SceneElement::Line(i) => ElementScriptTokens {
+            kind: "line",
+            index: i,
+            edge: None,
+        },
+        SceneElement::RectEdge(i, edge) => ElementScriptTokens {
+            kind: "rect",
+            index: i,
+            edge: Some(edge),
+        },
     }
+}
+
+fn parse_construction_value(value: &str, line_no: usize) -> Result<bool, ParseError> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Ok(true),
+        "false" | "off" | "no" | "0" => Ok(false),
+        other => Err(ParseError {
+            line: line_no,
+            message: format!(
+                "unknown construction value '{other}' (expected true or false)"
+            ),
+        }),
+    }
+}
+
+fn is_additive_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "add" | "additive" | "+"
+    )
+}
+
+fn parse_scene_element_with_optional_edge<'a, I>(
+    kind: &str,
+    index: usize,
+    parts: &mut I,
+    line_no: usize,
+) -> Result<(SceneElement, Option<&'a str>), ParseError>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let unknown_kind = || ParseError {
+        line: line_no,
+        message: format!("unknown element kind '{kind}'"),
+    };
+    let next = parts.next();
+    if let Some(token) = next {
+        if token.eq_ignore_ascii_case("edge") {
+            let edge_name = parts.next().ok_or_else(|| ParseError {
+                line: line_no,
+                message: "rectangle edge name required after 'edge'".to_string(),
+            })?;
+            let edge = RectEdge::from_name(edge_name).ok_or_else(|| ParseError {
+                line: line_no,
+                message: format!("unknown rectangle edge '{edge_name}'"),
+            })?;
+            return Ok((SceneElement::RectEdge(index, edge), parts.next()));
+        }
+        if matches!(kind.to_ascii_lowercase().as_str(), "rect" | "rectangle") {
+            if let Some(edge) = RectEdge::from_name(token) {
+                return Ok((SceneElement::RectEdge(index, edge), parts.next()));
+            }
+        }
+        if is_additive_token(token) {
+            let element = scene_element_from_script(kind, index).ok_or_else(unknown_kind)?;
+            return Ok((element, Some(token)));
+        }
+        let element = scene_element_from_script(kind, index).ok_or_else(unknown_kind)?;
+        return Ok((element, Some(token)));
+    }
+    let element = scene_element_from_script(kind, index).ok_or_else(unknown_kind)?;
+    Ok((element, None))
+}
+
+fn parse_scene_element_with_tail<'a, I>(
+    kind: &str,
+    index: usize,
+    parts: &mut I,
+    line_no: usize,
+) -> Result<(SceneElement, bool), ParseError>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let (element, tail) =
+        parse_scene_element_with_optional_edge(kind, index, parts, line_no)?;
+    let additive = tail.is_some_and(is_additive_token);
+    Ok((element, additive))
 }
 
 fn scene_element_from_script(kind: &str, index: usize) -> Option<SceneElement> {
@@ -1268,6 +1476,29 @@ impl ScriptRunner {
                     Some(v) => state.apply(Action::SetElementVisible { element, visible: v }),
                     None => state.apply(Action::ToggleElementVisibility(element)),
                 };
+                StepResult::Continue
+            }
+            Instruction::SelectSceneElement { element, additive } => {
+                state.apply(Action::ClickSceneElement { element, additive });
+                StepResult::Continue
+            }
+            Instruction::ClearSceneSelection => {
+                state.apply(Action::ClearSceneSelection);
+                StepResult::Continue
+            }
+            Instruction::SetShapeConstruction { element, construction } => {
+                let _ = state.apply(Action::SetShapeConstruction {
+                    element,
+                    construction,
+                });
+                StepResult::Continue
+            }
+            Instruction::ApplyConstruction { construction } => {
+                let _ = state.apply(Action::ApplyConstruction { construction });
+                StepResult::Continue
+            }
+            Instruction::ToggleConstruction => {
+                let _ = state.apply(Action::ToggleConstruction);
                 StepResult::Continue
             }
             Instruction::SetDim { axis, value } => {
@@ -1838,6 +2069,91 @@ mod tests {
     }
 
     #[test]
+    fn parses_context_pane_commands() {
+        let ins = parse("pane context show\npane context hide\npane context toggle").unwrap();
+        assert_eq!(
+            ins,
+            vec![
+                Instruction::SetPane {
+                    pane: Pane::Context,
+                    visible: Some(true),
+                },
+                Instruction::SetPane {
+                    pane: Pane::Context,
+                    visible: Some(false),
+                },
+                Instruction::SetPane {
+                    pane: Pane::Context,
+                    visible: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_apply_and_toggle_construction_commands() {
+        let ins = parse("apply_construction true\ntoggle_construction\napply_construction false")
+            .unwrap();
+        assert_eq!(
+            ins,
+            vec![
+                Instruction::ApplyConstruction { construction: true },
+                Instruction::ToggleConstruction,
+                Instruction::ApplyConstruction { construction: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_selection_and_construction_commands() {
+        let ins = parse(
+            "select rect 0 bottom\nselect line 1 add\nclear_selection\nset_construction rect 0 top true",
+        )
+        .unwrap();
+        assert_eq!(
+            ins,
+            vec![
+                Instruction::SelectSceneElement {
+                    element: SceneElement::RectEdge(0, RectEdge::Bottom),
+                    additive: false,
+                },
+                Instruction::SelectSceneElement {
+                    element: SceneElement::Line(1),
+                    additive: true,
+                },
+                Instruction::ClearSceneSelection,
+                Instruction::SetShapeConstruction {
+                    element: SceneElement::RectEdge(0, RectEdge::Top),
+                    construction: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn script_select_and_set_construction() {
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        state.doc.rects.push(crate::model::Rect::from_local_corners(
+            sketch, 0.0, 0.0, 10.0, 5.0,
+        ));
+        let script = "select rect 0 bottom\nset_construction rect 0 bottom true\nclear_selection";
+        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        runner.verbose = false;
+        let mut synthetic = SyntheticInput::default();
+        let ctx = egui::Context::default();
+        while !runner.done {
+            runner.tick(&mut state, &mut synthetic, None, &ctx);
+        }
+        assert!(!state.scene_selection.is_selected(SceneElement::RectEdge(
+            0,
+            RectEdge::Bottom
+        )));
+        assert!(state.doc.rects[0].edge_construction(RectEdge::Bottom));
+        assert!(!state.doc.rects[0].edge_construction(RectEdge::Top));
+    }
+
+    #[test]
     fn parses_parameters_pane_commands() {
         let ins = parse("pane parameters show\npane params hide\npane param toggle").unwrap();
         assert_eq!(
@@ -1908,6 +2224,7 @@ mod tests {
             focused: 0,
             user_edited: [false, false],
             pending_focus: false,
+            construction: false,
         });
 
         while !runner.done {
@@ -2093,6 +2410,7 @@ mod tests {
             last_mouse: glam::Vec3::new(10.0, 5.0, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         });
         state.apply(crate::actions::Action::CommitRectangle);
         let script = "edit_dim width\nset_dim width 25mm\ncommit_dim";
@@ -2152,6 +2470,7 @@ mod tests {
             focused: 0,
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         });
         state.apply(crate::actions::Action::CommitRectangle);
         let mut runner = ScriptRunner::new(parse("set_dim_label_offset width 60").unwrap());
@@ -2198,6 +2517,7 @@ mod tests {
             focused: 0,
             user_edited: [false, false],
             pending_focus: false,
+            construction: false,
         });
 
         while !runner.done {
@@ -2235,6 +2555,7 @@ mod tests {
             last_mouse: glam::Vec3::new(10.0, 10.0, 0.0),
             user_edited: false,
             pending_focus: false,
+            construction: false,
         });
 
         while !runner.done {

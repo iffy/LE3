@@ -15,11 +15,16 @@ use crate::face::{
     sketch_camera_target, sketch_frame, sketch_geometry_frame, sketch_label, sketch_view_up,
     world_to_local,
 };
+use crate::context::{
+    construction_targets_from_selection, set_construction_for_targets, set_edge_construction,
+    toggle_construction_for_targets,
+};
 use crate::hierarchy::SceneElement;
 use crate::hierarchy::ElementVisibility;
+use crate::selection::{click_scene_selection, SceneSelection};
 use crate::model::SketchId;
 use crate::view_cube::{self, CubeCornerId, CubeEdgeId};
-use crate::model::{ConstructionPlane, Document, FaceId, Line, Rect, ShapeKind};
+use crate::model::{ConstructionPlane, Document, FaceId, Line, Rect, RectEdge, ShapeKind};
 use crate::face::SketchFrame;
 use crate::parameters::{
     add_parameter, delete_parameter, recompute_document_geometry, set_parameter_expression,
@@ -81,6 +86,8 @@ pub struct CreatingRect {
     pub user_edited: [bool; 2],
     /// When true, the focused dimension input should claim keyboard focus.
     pub pending_focus: bool,
+    /// New rectangle edges are committed as construction geometry when true.
+    pub construction: bool,
 }
 
 impl CreatingRect {
@@ -119,6 +126,8 @@ pub struct CreatingLine {
     pub user_edited: bool,
     /// When true, the length input should claim keyboard focus.
     pub pending_focus: bool,
+    /// Committed line is construction geometry when true.
+    pub construction: bool,
 }
 
 impl CreatingLine {
@@ -272,6 +281,21 @@ pub enum Action {
     DeleteParameter { index: usize },
     SetCommandPaletteOpen { open: bool },
     ToggleCommandPalette,
+    ClickSceneElement {
+        element: SceneElement,
+        additive: bool,
+    },
+    ClearSceneSelection,
+    SetShapeConstruction {
+        element: SceneElement,
+        construction: bool,
+    },
+    /// Set construction/substantial on the active draw op or all constructable selected targets.
+    ApplyConstruction {
+        construction: bool,
+    },
+    /// Toggle construction/substantial on the active draw op or each constructable selected target.
+    ToggleConstruction,
 }
 
 /// A toggleable UI pane (SPEC §11.1).
@@ -283,11 +307,13 @@ pub enum Pane {
     Hierarchy,
     /// Named parameters and expressions.
     Parameters,
+    /// Properties for the current tree selection.
+    Context,
 }
 
 impl Pane {
     /// All panes, in menu order.
-    pub const ALL: &'static [Pane] = &[Pane::Hierarchy, Pane::Parameters, Pane::ViewCube];
+    pub const ALL: &'static [Pane] = &[Pane::Hierarchy, Pane::Context, Pane::Parameters, Pane::ViewCube];
 
     /// Human-readable label for menus.
     pub fn label(self) -> &'static str {
@@ -295,6 +321,7 @@ impl Pane {
             Pane::ViewCube => "Orientation Cube",
             Pane::Hierarchy => "Tree",
             Pane::Parameters => "Parameters",
+            Pane::Context => "Context",
         }
     }
 
@@ -304,6 +331,7 @@ impl Pane {
             Pane::ViewCube => "view_cube",
             Pane::Hierarchy => "hierarchy",
             Pane::Parameters => "parameters",
+            Pane::Context => "context",
         }
     }
 
@@ -312,6 +340,7 @@ impl Pane {
             "view_cube" | "viewcube" | "cube" | "hud" => Some(Pane::ViewCube),
             "hierarchy" | "tree" | "dag" => Some(Pane::Hierarchy),
             "parameters" | "params" | "param" => Some(Pane::Parameters),
+            "context" | "properties" | "props" => Some(Pane::Context),
             _ => None,
         }
     }
@@ -323,6 +352,7 @@ pub struct PaneVisibility {
     pub view_cube: bool,
     pub hierarchy: bool,
     pub parameters: bool,
+    pub context: bool,
 }
 
 impl Default for PaneVisibility {
@@ -331,6 +361,7 @@ impl Default for PaneVisibility {
             view_cube: true,
             hierarchy: true,
             parameters: true,
+            context: true,
         }
     }
 }
@@ -341,6 +372,7 @@ impl PaneVisibility {
             Pane::ViewCube => self.view_cube,
             Pane::Hierarchy => self.hierarchy,
             Pane::Parameters => self.parameters,
+            Pane::Context => self.context,
         }
     }
 
@@ -349,6 +381,7 @@ impl PaneVisibility {
             Pane::ViewCube => self.view_cube = visible,
             Pane::Hierarchy => self.hierarchy = visible,
             Pane::Parameters => self.parameters = visible,
+            Pane::Context => self.context = visible,
         }
     }
 
@@ -591,11 +624,14 @@ pub struct AppState {
     pub cam: Camera,
     pub creating_rect: Option<CreatingRect>,
     pub creating_line: Option<CreatingLine>,
+    /// Shared construction draw mode for rectangle and line tools.
+    pub draw_construction: bool,
     pub creating_plane: Option<CreatingConstructionPlane>,
     pub panes: PaneVisibility,
     pub parameters_pane: ParametersPaneState,
     pub command_palette: CommandPaletteState,
     pub element_visibility: ElementVisibility,
+    pub scene_selection: SceneSelection,
     pub editing_committed_dim: Option<EditingCommittedDim>,
     pub status: String,
 }
@@ -610,11 +646,13 @@ impl Default for AppState {
             cam: Camera::default(),
             creating_rect: None,
             creating_line: None,
+            draw_construction: false,
             creating_plane: None,
             panes: PaneVisibility::default(),
             parameters_pane: ParametersPaneState::default(),
             command_palette: CommandPaletteState::default(),
             element_visibility: ElementVisibility::default(),
+            scene_selection: SceneSelection::default(),
             editing_committed_dim: None,
             status: String::new(),
         }
@@ -625,12 +663,26 @@ fn pane_status(pane: Pane, visible: bool) -> String {
     format!("{} {}", pane.label(), if visible { "shown" } else { "hidden" })
 }
 
+fn draw_mode_status(tool: &str, construction: bool) -> String {
+    format!(
+        "{tool} draw mode: {}",
+        if construction {
+            "construction"
+        } else {
+            "substantial"
+        }
+    )
+}
+
 fn element_label(element: SceneElement) -> String {
     match element {
         SceneElement::ConstructionPlane(i) => format!("Construction plane {i}"),
         SceneElement::Sketch(i) => format!("Sketch {i}"),
         SceneElement::Rect(i) => format!("Rectangle {i}"),
         SceneElement::Line(i) => format!("Line {i}"),
+        SceneElement::RectEdge(i, edge) => {
+            format!("Rectangle {i} {} edge", edge.script_name())
+        }
     }
 }
 
@@ -644,6 +696,32 @@ pub enum ActionResult {
 }
 
 impl AppState {
+    /// Active or pending construction draw mode while the rectangle tool is selected.
+    pub fn rect_draw_construction_mode(&self) -> Option<bool> {
+        if self.tool != Tool::Rectangle {
+            return None;
+        }
+        Some(
+            self.creating_rect
+                .as_ref()
+                .map(|cr| cr.construction)
+                .unwrap_or(self.draw_construction),
+        )
+    }
+
+    /// Active or pending construction draw mode while the line tool is selected.
+    pub fn line_draw_construction_mode(&self) -> Option<bool> {
+        if self.tool != Tool::Line {
+            return None;
+        }
+        Some(
+            self.creating_line
+                .as_ref()
+                .map(|cl| cl.construction)
+                .unwrap_or(self.draw_construction),
+        )
+    }
+
     pub fn apply(&mut self, action: Action) -> ActionResult {
         match action {
             Action::NewDocument => {
@@ -655,6 +733,7 @@ impl AppState {
                 self.creating_line = None;
                 self.creating_plane = None;
                 self.element_visibility = ElementVisibility::default();
+                self.scene_selection.clear();
                 self.tool = Tool::Select;
                 self.status = "New document".to_string();
                 ActionResult::Ok
@@ -845,6 +924,11 @@ impl AppState {
                 rect.height_locked = cr.user_edited[1];
                 rect.width_expr = cr.user_edited[0].then(|| cr.texts[0].clone());
                 rect.height_expr = cr.user_edited[1].then(|| cr.texts[1].clone());
+                if cr.construction {
+                    for edge_index in 0..4 {
+                        rect.set_edge_construction(RectEdge::from_index(edge_index), true);
+                    }
+                }
                 if rect.w > 0.5 && rect.h > 0.5 {
                     self.doc.rects.push(rect);
                     self.doc.shape_order.push(ShapeKind::Rect);
@@ -910,6 +994,7 @@ impl AppState {
                 let mut line = Line::from_local_endpoints(session.sketch, u0, v0, u1, v1);
                 line.length_locked = cl.user_edited;
                 line.length_expr = cl.user_edited.then(|| cl.text.clone());
+                line.construction = cl.construction;
                 if line.length() > 0.5 {
                     self.doc.lines.push(line);
                     self.doc.shape_order.push(ShapeKind::Line);
@@ -1278,6 +1363,105 @@ impl AppState {
                 self.status = pane_status(pane, self.panes.is_visible(pane));
                 ActionResult::Ok
             }
+            Action::ClickSceneElement { element, additive } => {
+                click_scene_selection(&mut self.scene_selection, element, additive);
+                ActionResult::Ok
+            }
+            Action::ClearSceneSelection => {
+                self.scene_selection.clear();
+                ActionResult::Ok
+            }
+            Action::SetShapeConstruction {
+                element,
+                construction,
+            } => match set_edge_construction(&mut self.doc, element, construction) {
+                Ok(()) => {
+                    self.status = format!(
+                        "{} {}",
+                        element_label(element),
+                        if construction {
+                            "marked construction"
+                        } else {
+                            "marked solid"
+                        }
+                    );
+                    ActionResult::Ok
+                }
+                Err(e) => ActionResult::Err(e),
+            },
+            Action::ApplyConstruction { construction } => {
+                if let Some(cr) = &mut self.creating_rect {
+                    cr.construction = construction;
+                    self.draw_construction = construction;
+                    self.status = draw_mode_status("Rectangle", construction);
+                    return ActionResult::Ok;
+                }
+                if let Some(cl) = &mut self.creating_line {
+                    cl.construction = construction;
+                    self.draw_construction = construction;
+                    self.status = draw_mode_status("Line", construction);
+                    return ActionResult::Ok;
+                }
+                if self.tool == Tool::Rectangle {
+                    self.draw_construction = construction;
+                    self.status = draw_mode_status("Rectangle", construction);
+                    return ActionResult::Ok;
+                }
+                if self.tool == Tool::Line {
+                    self.draw_construction = construction;
+                    self.status = draw_mode_status("Line", construction);
+                    return ActionResult::Ok;
+                }
+                let targets = construction_targets_from_selection(&self.scene_selection);
+                match set_construction_for_targets(&mut self.doc, &targets, construction) {
+                    Ok(count) if count > 0 => {
+                        self.status = format!(
+                            "{count} item(s) marked {}",
+                            if construction {
+                                "construction"
+                            } else {
+                                "substantial"
+                            }
+                        );
+                        ActionResult::Ok
+                    }
+                    Ok(_) => ActionResult::Err("No constructable geometry selected".to_string()),
+                    Err(e) => ActionResult::Err(e),
+                }
+            }
+            Action::ToggleConstruction => {
+                if let Some(cr) = &mut self.creating_rect {
+                    cr.construction = !cr.construction;
+                    self.draw_construction = cr.construction;
+                    self.status = draw_mode_status("Rectangle", cr.construction);
+                    return ActionResult::Ok;
+                }
+                if let Some(cl) = &mut self.creating_line {
+                    cl.construction = !cl.construction;
+                    self.draw_construction = cl.construction;
+                    self.status = draw_mode_status("Line", cl.construction);
+                    return ActionResult::Ok;
+                }
+                if self.tool == Tool::Rectangle {
+                    self.draw_construction = !self.draw_construction;
+                    self.status = draw_mode_status("Rectangle", self.draw_construction);
+                    return ActionResult::Ok;
+                }
+                if self.tool == Tool::Line {
+                    self.draw_construction = !self.draw_construction;
+                    self.status = draw_mode_status("Line", self.draw_construction);
+                    return ActionResult::Ok;
+                }
+                let targets = construction_targets_from_selection(&self.scene_selection);
+                match toggle_construction_for_targets(&mut self.doc, &targets) {
+                    Ok(count) if count > 0 => {
+                        self.status = format!("Toggled construction on {count} item(s)");
+                        ActionResult::Ok
+                    }
+                    Ok(_) => ActionResult::Err("No constructable geometry selected".to_string()),
+                    Err(e) => ActionResult::Err(e),
+                }
+            }
             Action::SetElementVisible { element, visible } => {
                 self.element_visibility.set_visible(element, visible);
                 self.status = format!(
@@ -1617,6 +1801,7 @@ mod tests {
             last_mouse: Vec3::new(10.0, 5.0, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CommitRectangle);
         assert_eq!(state.doc.rects.len(), 1);
@@ -1639,6 +1824,7 @@ mod tests {
             last_mouse: Vec3::new(10.0, 5.0, 0.0),
             user_edited: [false, false],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CommitRectangle);
         let rect = &state.doc.rects[0];
@@ -1658,6 +1844,7 @@ mod tests {
             last_mouse: Vec3::new(100.0, 5.0, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CommitRectangle);
         let rect = &state.doc.rects[0];
@@ -1679,6 +1866,7 @@ mod tests {
             last_mouse: Vec3::new(100.0, 4.0, 0.0),
             user_edited: [true, false],
             pending_focus: false,
+            construction: false,
         };
         let frame = xy_frame();
         let end = cr.end_point(&frame, &doc);
@@ -1698,6 +1886,7 @@ mod tests {
             last_mouse: Vec3::new(100.0, 100.0, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CommitRectangle);
         let rect = &state.doc.rects[0];
@@ -1717,6 +1906,7 @@ mod tests {
             last_mouse: Vec3::new(10.0, 5.0, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CommitRectangle);
         state.apply(Action::SetDimLabelOffset {
@@ -1761,6 +1951,7 @@ mod tests {
             last_mouse: Vec3::new(10.0, 5.0, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CommitRectangle);
         state.apply(Action::BeginEditCommittedDim {
@@ -1787,6 +1978,7 @@ mod tests {
             last_mouse: Vec3::new(10.0, 5.0, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CommitRectangle);
         state.apply(Action::BeginEditCommittedDim {
@@ -1807,6 +1999,7 @@ mod tests {
             last_mouse: Vec3::new(10.0, 0.0, 0.0),
             user_edited: true,
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CommitLine);
         assert_eq!(state.doc.lines.len(), 1);
@@ -1824,6 +2017,7 @@ mod tests {
             last_mouse: Vec3::new(100.0, 100.0, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         };
         let frame = xy_frame();
         let doc = Document::default();
@@ -1840,6 +2034,7 @@ mod tests {
             last_mouse: Vec3::new(10.0, 10.0, 0.0),
             user_edited: true,
             pending_focus: false,
+            construction: false,
         };
         let frame = xy_frame();
         let doc = Document::default();
@@ -1877,6 +2072,7 @@ mod tests {
             last_mouse: Vec3::new(4.0, 6.0, 0.0),
             user_edited: true,
             pending_focus: false,
+            construction: false,
         };
         let frame = xy_frame();
         let doc = Document::default();
@@ -1895,6 +2091,7 @@ mod tests {
             last_mouse: Vec3::ZERO,
             user_edited: true,
             pending_focus: false,
+            construction: false,
         };
         let frame = xy_frame();
         let doc = Document::default();
@@ -1915,6 +2112,7 @@ mod tests {
             last_mouse: Vec3::new(10.0, 5.0, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CommitRectangle);
         assert_eq!(state.tool, Tool::Rectangle);
@@ -1959,6 +2157,7 @@ mod tests {
             last_mouse: Vec3::new(10.0, 5.0, 0.0),
             user_edited: [false, false],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::CancelOperation);
         assert!(state.sketch_session.is_some());
@@ -2200,6 +2399,190 @@ mod tests {
     }
 
     #[test]
+    fn context_pane_visible_by_default() {
+        let state = AppState::default();
+        assert!(state.panes.is_visible(Pane::Context));
+        assert_eq!(Pane::Context.label(), "Context");
+    }
+
+    #[test]
+    fn click_scene_element_selects_and_deselects() {
+        let mut state = AppState::default();
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::Rect(0),
+            additive: false,
+        });
+        assert!(state.scene_selection.is_selected(SceneElement::Rect(0)));
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::Rect(0),
+            additive: false,
+        });
+        assert!(state.scene_selection.is_empty());
+    }
+
+    #[test]
+    fn set_shape_construction_toggles_rectangle_edge() {
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0));
+        assert_eq!(
+            state.apply(Action::SetShapeConstruction {
+                element: SceneElement::RectEdge(0, RectEdge::Bottom),
+                construction: true,
+            }),
+            ActionResult::Ok
+        );
+        assert!(state.doc.rects[0].edge_construction(RectEdge::Bottom));
+        assert!(!state.doc.rects[0].edge_construction(RectEdge::Top));
+    }
+
+    #[test]
+    fn apply_construction_sets_all_selected_targets() {
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0));
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 2.0, 0.0));
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::RectEdge(0, RectEdge::Bottom),
+            additive: false,
+        });
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::Line(0),
+            additive: true,
+        });
+        assert_eq!(
+            state.apply(Action::ApplyConstruction { construction: true }),
+            ActionResult::Ok
+        );
+        assert!(state.doc.rects[0].edge_construction(RectEdge::Bottom));
+        assert!(state.doc.lines[0].construction);
+    }
+
+    #[test]
+    fn toggle_construction_flips_each_selected_target() {
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0));
+        state.doc.rects[0].set_edge_construction(RectEdge::Bottom, true);
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 2.0, 0.0));
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::RectEdge(0, RectEdge::Bottom),
+            additive: false,
+        });
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::Line(0),
+            additive: true,
+        });
+        assert_eq!(state.apply(Action::ToggleConstruction), ActionResult::Ok);
+        assert!(!state.doc.rects[0].edge_construction(RectEdge::Bottom));
+        assert!(state.doc.lines[0].construction);
+    }
+
+    #[test]
+    fn toggle_construction_rectangle_tool_before_drawing() {
+        let mut state = AppState::default();
+        state.apply(Action::SetTool(Tool::Rectangle));
+        assert_eq!(state.rect_draw_construction_mode(), Some(false));
+        assert_eq!(state.apply(Action::ToggleConstruction), ActionResult::Ok);
+        assert_eq!(state.rect_draw_construction_mode(), Some(true));
+        assert!(state.creating_rect.is_none());
+    }
+
+    #[test]
+    fn apply_construction_line_tool_before_drawing() {
+        let mut state = AppState::default();
+        state.apply(Action::SetTool(Tool::Line));
+        assert_eq!(
+            state.apply(Action::ApplyConstruction { construction: true }),
+            ActionResult::Ok
+        );
+        assert_eq!(state.line_draw_construction_mode(), Some(true));
+        assert!(state.creating_line.is_none());
+    }
+
+    #[test]
+    fn draw_construction_mode_persists_across_rectangle_and_line_tools() {
+        let mut state = AppState::default();
+        state.apply(Action::SetTool(Tool::Rectangle));
+        state.apply(Action::ToggleConstruction);
+        assert!(state.draw_construction);
+        state.apply(Action::SetTool(Tool::Line));
+        assert_eq!(state.line_draw_construction_mode(), Some(true));
+        state.apply(Action::SetTool(Tool::Rectangle));
+        assert_eq!(state.rect_draw_construction_mode(), Some(true));
+    }
+
+    #[test]
+    fn toggle_construction_while_drawing_rectangle() {
+        let mut state = AppState::default();
+        begin_default_sketch(&mut state);
+        state.creating_rect = Some(CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["".to_string(), "".to_string()],
+            focused: 0,
+            last_mouse: Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [false, false],
+            pending_focus: false,
+            construction: false,
+        });
+        assert_eq!(state.apply(Action::ToggleConstruction), ActionResult::Ok);
+        assert!(state.creating_rect.as_ref().unwrap().construction);
+    }
+
+    #[test]
+    fn pending_rectangle_draw_mode_applies_on_commit() {
+        let mut state = AppState::default();
+        begin_default_sketch(&mut state);
+        state.apply(Action::SetTool(Tool::Rectangle));
+        state.draw_construction = true;
+        state.creating_rect = Some(CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["10".to_string(), "5".to_string()],
+            focused: 0,
+            last_mouse: Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [true, true],
+            pending_focus: false,
+            construction: state.draw_construction,
+        });
+        state.apply(Action::CommitRectangle);
+        assert!(state.doc.rects[0].all_edges_construction());
+    }
+
+    #[test]
+    fn commit_rectangle_with_construction_draw_mode() {
+        let mut state = AppState::default();
+        begin_default_sketch(&mut state);
+        state.creating_rect = Some(CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["10".to_string(), "5".to_string()],
+            focused: 0,
+            last_mouse: Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [true, true],
+            pending_focus: false,
+            construction: true,
+        });
+        state.apply(Action::CommitRectangle);
+        let rect = &state.doc.rects[0];
+        assert!(rect.all_edges_construction());
+    }
+
+    #[test]
+    fn commit_line_with_construction_draw_mode() {
+        let mut state = AppState::default();
+        begin_default_sketch(&mut state);
+        state.creating_line = Some(CreatingLine {
+            origin: Vec3::ZERO,
+            text: "10".to_string(),
+            last_mouse: Vec3::new(10.0, 0.0, 0.0),
+            user_edited: true,
+            pending_focus: false,
+            construction: true,
+        });
+        state.apply(Action::CommitLine);
+        assert!(state.doc.lines[0].construction);
+    }
+
+    #[test]
     fn toggle_element_visibility() {
         let mut state = AppState::default();
         state.apply(Action::ToggleElementVisibility(SceneElement::Sketch(0)));
@@ -2216,6 +2599,7 @@ mod tests {
             last_mouse: Vec3::ZERO,
             user_edited: [false, false],
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::FocusRectDimension {
             axis: RectAxis::Height,
@@ -2234,6 +2618,7 @@ mod tests {
             last_mouse: Vec3::ZERO,
             user_edited: false,
             pending_focus: false,
+            construction: false,
         });
         state.apply(Action::FocusLineLength);
         assert!(state.creating_line.as_ref().unwrap().pending_focus);

@@ -204,7 +204,7 @@ pub fn open(path: &str) -> Result<Document> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::FaceId;
+    use crate::model::{FaceId, RectEdge};
 
     fn plane_sketch(doc: &mut Document) -> usize {
         doc.add_sketch(FaceId::ConstructionPlane(0))
@@ -299,6 +299,31 @@ mod tests {
 
         assert_eq!(loaded.rects, doc.rects);
         assert_eq!(loaded.shape_order, doc.shape_order);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn round_trips_rectangle_edge_construction_flags() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("le3_rect_edge_construction_test.le3");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(crate::model::FaceId::ConstructionPlane(0));
+        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0);
+        rect.set_edge_construction(RectEdge::Bottom, true);
+        rect.set_edge_construction(RectEdge::Top, true);
+        doc.rects.push(rect);
+        doc.shape_order.push(ShapeKind::Rect);
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert!(loaded.rects[0].edge_construction(RectEdge::Bottom));
+        assert!(!loaded.rects[0].edge_construction(RectEdge::Right));
+        assert!(loaded.rects[0].edge_construction(RectEdge::Top));
+        assert!(!loaded.rects[0].edge_construction(RectEdge::Left));
 
         std::fs::remove_file(&path).unwrap();
     }

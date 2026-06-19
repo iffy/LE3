@@ -50,12 +50,61 @@ pub struct Sketch {
     pub face: FaceId,
 }
 
+/// One edge of a rectangle (bottom → right → top → left, matching [`rect_edge_segments`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RectEdge {
+    Bottom,
+    Right,
+    Top,
+    Left,
+}
+
+impl RectEdge {
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            0 => RectEdge::Bottom,
+            1 => RectEdge::Right,
+            2 => RectEdge::Top,
+            _ => RectEdge::Left,
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            RectEdge::Bottom => 0,
+            RectEdge::Right => 1,
+            RectEdge::Top => 2,
+            RectEdge::Left => 3,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "bottom" | "b" | "0" => Some(RectEdge::Bottom),
+            "right" | "r" | "1" => Some(RectEdge::Right),
+            "top" | "t" | "2" => Some(RectEdge::Top),
+            "left" | "l" | "3" => Some(RectEdge::Left),
+            _ => None,
+        }
+    }
+
+    pub fn script_name(self) -> &'static str {
+        match self {
+            RectEdge::Bottom => "bottom",
+            RectEdge::Right => "right",
+            RectEdge::Top => "top",
+            RectEdge::Left => "left",
+        }
+    }
+}
+
 /// An axis-aligned rectangle in face-local coordinates (millimetres, per SPEC §5.3).
 ///
 /// Stored by its origin (`x`, `y`) and signed `w`/`h` extents in the local (u, v)
 /// frame of the sketch's host face. We normalise on creation so width/height are
 /// always positive, which keeps hit-testing simple.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Rect {
     pub sketch: SketchId,
     pub x: f32,
@@ -80,6 +129,9 @@ pub struct Rect {
     /// Expression text when [`height_locked`] is set.
     #[serde(default)]
     pub height_expr: Option<String>,
+    /// Per-edge construction flags (bottom, right, top, left).
+    #[serde(default)]
+    pub construction_edges: [bool; 4],
 }
 
 impl Rect {
@@ -97,7 +149,78 @@ impl Rect {
             height_dim_offset: None,
             width_expr: None,
             height_expr: None,
+            construction_edges: [false; 4],
         }
+    }
+
+    pub fn edge_construction(&self, edge: RectEdge) -> bool {
+        self.construction_edges[edge.index()]
+    }
+
+    pub fn set_edge_construction(&mut self, edge: RectEdge, construction: bool) {
+        self.construction_edges[edge.index()] = construction;
+    }
+
+    pub fn all_edges_construction(&self) -> bool {
+        self.construction_edges.iter().all(|&c| c)
+    }
+
+    /// True when some edges are construction and some are substantial.
+    pub fn has_mixed_edge_construction(&self) -> bool {
+        self.construction_edges.iter().any(|&c| c) && !self.all_edges_construction()
+    }
+}
+
+impl<'de> Deserialize<'de> for Rect {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawRect {
+            sketch: SketchId,
+            x: f32,
+            y: f32,
+            w: f32,
+            h: f32,
+            #[serde(default)]
+            width_locked: bool,
+            #[serde(default)]
+            height_locked: bool,
+            #[serde(default)]
+            width_dim_offset: Option<f32>,
+            #[serde(default)]
+            height_dim_offset: Option<f32>,
+            #[serde(default)]
+            width_expr: Option<String>,
+            #[serde(default)]
+            height_expr: Option<String>,
+            /// Legacy whole-shape flag; migrated to all edges when edges are unset.
+            #[serde(default)]
+            construction: bool,
+            #[serde(default)]
+            construction_edges: [bool; 4],
+        }
+
+        let raw = RawRect::deserialize(deserializer)?;
+        let mut construction_edges = raw.construction_edges;
+        if raw.construction && !construction_edges.iter().any(|&e| e) {
+            construction_edges = [true; 4];
+        }
+        Ok(Rect {
+            sketch: raw.sketch,
+            x: raw.x,
+            y: raw.y,
+            w: raw.w,
+            h: raw.h,
+            width_locked: raw.width_locked,
+            height_locked: raw.height_locked,
+            width_dim_offset: raw.width_dim_offset,
+            height_dim_offset: raw.height_dim_offset,
+            width_expr: raw.width_expr,
+            height_expr: raw.height_expr,
+            construction_edges,
+        })
     }
 }
 
@@ -118,6 +241,9 @@ pub struct Line {
     /// Expression text when [`length_locked`] is set.
     #[serde(default)]
     pub length_expr: Option<String>,
+    /// Reference geometry (dashed, construction color); not solid model geometry.
+    #[serde(default)]
+    pub construction: bool,
 }
 
 impl Line {
@@ -137,6 +263,7 @@ impl Line {
             length_locked: false,
             length_dim_offset: None,
             length_expr: None,
+            construction: false,
         }
     }
 
@@ -282,6 +409,45 @@ mod tests {
         assert_ne!(s0, s1);
         let on_plane: Vec<_> = doc.sketches_on_face(FaceId::ConstructionPlane(0)).collect();
         assert_eq!(on_plane, vec![0, 1]);
+    }
+
+    #[test]
+    fn rect_deserializes_legacy_whole_shape_construction_flag() {
+        let json = r#"{
+            "sketch": 0,
+            "x": 0.0,
+            "y": 0.0,
+            "w": 10.0,
+            "h": 5.0,
+            "construction": true
+        }"#;
+        let rect: Rect = serde_json::from_str(json).unwrap();
+        assert!(rect.all_edges_construction());
+    }
+
+    #[test]
+    fn rect_edge_construction_is_independent_per_edge() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0);
+        rect.set_edge_construction(RectEdge::Left, true);
+        assert!(rect.edge_construction(RectEdge::Left));
+        assert!(!rect.edge_construction(RectEdge::Right));
+    }
+
+    #[test]
+    fn rect_mixed_edge_construction_detected() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0);
+        assert!(!rect.has_mixed_edge_construction());
+        rect.set_edge_construction(RectEdge::Bottom, true);
+        assert!(rect.has_mixed_edge_construction());
+        for edge_index in 0..4 {
+            rect.set_edge_construction(RectEdge::from_index(edge_index), true);
+        }
+        assert!(!rect.has_mixed_edge_construction());
+        assert!(rect.all_edges_construction());
     }
 
     #[test]

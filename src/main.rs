@@ -13,6 +13,7 @@
 mod actions;
 mod camera;
 mod command_palette;
+mod context;
 mod construction;
 mod dimensions;
 mod expression_input;
@@ -22,6 +23,8 @@ mod parameters;
 mod model;
 mod native_menu;
 mod script;
+mod selection;
+mod shortcuts;
 mod stl;
 mod storage;
 mod theme;
@@ -38,7 +41,8 @@ use construction::{
     angle_from_axis_plane_hit, axis_angle_handle, axis_gizmo_hit, axis_normal,
     axis_offset_handle, draw_axis_plane_gizmo, draw_offset_gizmo, draw_quad_face_highlight,
     offset_from_normal_drag, offset_gizmo_hit, offset_handle, parent_from_pick_target,
-    plane_corners, preview_plane_edit_dependents, resolve_pick_target, AxisGizmoDrag,
+    plane_corners, preview_plane_edit_dependents, rect_edge_segments, resolve_pick_target,
+    scene_element_from_pick, AxisGizmoDrag,
     AxisGizmoHit, PlaneDim, PlaneReference, AXIS_GIZMO_HANDLE_HIT_RADIUS_PX, PLANE_DISPLAY_HALF,
 };
 use dimensions::{
@@ -52,7 +56,7 @@ use face::{
     sketch_geometry_frame, sketch_label, world_to_local,
 };
 use model::SketchId;
-use model::{FaceId, Line, Rect};
+use model::{FaceId, Line, Rect, RectEdge};
 use eframe::egui;
 use native_menu::{MenuCommand, NativeMenu};
 use glam::Vec3;
@@ -65,14 +69,43 @@ use expression_input::{
 };
 use value::{computed_length_in_doc, format_length_display, shows_computed_length_in_doc};
 
-fn main() -> eframe::Result<()> {
-    let script_opts = script::parse_args(std::env::args());
+/// macOS maximize must run after eframe shows the window (post-first-paint).
+fn uses_deferred_launch_maximize() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Frames to wait after startup before sending maximize on macOS.
+const MACOS_LAUNCH_MAXIMIZE_DELAY_FRAMES: u8 = 2;
+
+fn initial_launch_maximize_frames() -> u8 {
+    if uses_deferred_launch_maximize() {
+        MACOS_LAUNCH_MAXIMIZE_DELAY_FRAMES
+    } else {
+        0
+    }
+}
+
+fn tick_launch_maximize(frames_remaining: &mut u8, ctx: &egui::Context) {
+    if *frames_remaining == 0 {
+        return;
+    }
+    *frames_remaining -= 1;
+    if *frames_remaining == 0 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+    }
+}
+
+fn native_options() -> eframe::NativeOptions {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([960.0, 640.0])
+        .with_title("LE3")
+        .with_icon(std::sync::Arc::new(egui::IconData::default()));
+    if !uses_deferred_launch_maximize() {
+        viewport = viewport.with_maximized(true);
+    }
 
     let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 640.0])
-            .with_title("LE3")
-            .with_icon(std::sync::Arc::new(egui::IconData::default())),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
@@ -83,6 +116,12 @@ fn main() -> eframe::Result<()> {
             builder.with_default_menu(false);
         }));
     }
+    options
+}
+
+fn main() -> eframe::Result<()> {
+    let script_opts = script::parse_args(std::env::args());
+    let options = native_options();
 
     let script = script_opts
         .script_path
@@ -141,6 +180,7 @@ struct App {
     last_viewport: Option<egui::Rect>,
     native_menu: NativeMenu,
     dim_label_drag: Option<DimLabelDrag>,
+    launch_maximize_frames_remaining: u8,
 }
 
 impl App {
@@ -165,6 +205,7 @@ impl App {
             last_viewport: None,
             native_menu,
             dim_label_drag: None,
+            launch_maximize_frames_remaining: initial_launch_maximize_frames(),
         }
     }
 
@@ -286,6 +327,10 @@ impl App {
                     self.state.apply(Action::SetTool(Tool::ConstructionPlane));
                 }
             }
+
+            if ctx.input(|i| i.key_pressed(egui::Key::X)) {
+                self.state.apply(Action::ToggleConstruction);
+            }
         }
 
         if self.state.tool != Tool::Rectangle || self.state.sketch_session.is_none() {
@@ -359,6 +404,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        tick_launch_maximize(&mut self.launch_maximize_frames_remaining, ctx);
         theme::apply(ctx);
 
         let dt = ctx.input(|i| i.stable_dt);
@@ -378,21 +424,43 @@ impl eframe::App for App {
             .frame(theme::panel_frame())
             .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.state.tool, Tool::Select, "Select");
+                ui.selectable_value(
+                    &mut self.state.tool,
+                    Tool::Select,
+                    shortcuts::compact_label("Select", shortcuts::tool_shortcut(Tool::Select)),
+                );
                 if ui
-                    .selectable_label(self.state.tool == Tool::Sketch, "Sketch")
+                    .selectable_label(
+                        self.state.tool == Tool::Sketch,
+                        shortcuts::compact_label(
+                            "Sketch",
+                            shortcuts::tool_shortcut(Tool::Sketch),
+                        ),
+                    )
                     .clicked()
                 {
                     self.state.apply(Action::SetTool(Tool::Sketch));
                 }
                 if ui
-                    .selectable_label(self.state.tool == Tool::Rectangle, "Rectangle")
+                    .selectable_label(
+                        self.state.tool == Tool::Rectangle,
+                        shortcuts::compact_label(
+                            "Rectangle",
+                            shortcuts::tool_shortcut(Tool::Rectangle),
+                        ),
+                    )
                     .clicked()
                 {
                     self.state.apply(Action::SetTool(Tool::Rectangle));
                 }
                 if ui
-                    .selectable_label(self.state.tool == Tool::Line, "Line")
+                    .selectable_label(
+                        self.state.tool == Tool::Line,
+                        shortcuts::compact_label(
+                            "Line",
+                            shortcuts::tool_shortcut(Tool::Line),
+                        ),
+                    )
                     .clicked()
                 {
                     self.state.apply(Action::SetTool(Tool::Line));
@@ -400,7 +468,10 @@ impl eframe::App for App {
                 ui.selectable_value(
                     &mut self.state.tool,
                     Tool::ConstructionPlane,
-                    "Plane",
+                    shortcuts::compact_label(
+                        "Plane",
+                        shortcuts::tool_shortcut(Tool::ConstructionPlane),
+                    ),
                 );
                 if let Some(session) = self.state.sketch_session {
                     ui.separator();
@@ -410,7 +481,10 @@ impl eframe::App for App {
                 if ui.button("Clear").clicked() {
                     self.state.apply(Action::Clear);
                 }
-                if ui.button("Undo last").clicked() {
+                if ui
+                    .button(shortcuts::compact_label("Undo last", Some(shortcuts::UNDO)))
+                    .clicked()
+                {
                     self.state.apply(Action::UndoLast);
                 }
             });
@@ -450,6 +524,7 @@ impl eframe::App for App {
         if self.state.panes.is_visible(Pane::Hierarchy) {
             let mut edit_sketch: Option<SketchId> = None;
             let mut edit_plane: Option<usize> = None;
+            let mut click_element: Option<(SceneElement, bool)> = None;
             egui::SidePanel::left("tree")
                 .resizable(true)
                 .default_width(220.0)
@@ -462,16 +537,24 @@ impl eframe::App for App {
                         edit_plane = Some(index);
                     };
                     let mut noop_visibility = |_: SceneElement, _: bool| {};
+                    let mut queue_click = |element: SceneElement, additive: bool| {
+                        click_element = Some((element, additive));
+                    };
                     hierarchy::show_pane(
                         ui,
                         &self.state.doc,
                         self.state.sketch_session,
                         &mut self.state.element_visibility,
+                        &self.state.scene_selection,
                         &mut queue_edit_sketch,
                         &mut queue_edit_plane,
                         &mut noop_visibility,
+                        &mut queue_click,
                     );
                 });
+            if let Some((element, additive)) = click_element {
+                self.state.apply(Action::ClickSceneElement { element, additive });
+            }
             if let Some(sketch) = edit_sketch {
                 self.state.apply(Action::OpenSketch {
                     sketch,
@@ -491,6 +574,30 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     parameters::show_pane(ui, &mut self.state);
                 });
+        }
+
+        if self.state.panes.is_visible(Pane::Context) {
+            let context_input = context::ContextInput {
+                doc: &self.state.doc,
+                selection: &self.state.scene_selection,
+                draw_rect_construction: self.state.rect_draw_construction_mode(),
+                draw_line_construction: self.state.line_draw_construction_mode(),
+            };
+            let content = context::context_pane_content(&context_input);
+            let mut construction_change: Option<bool> = None;
+            egui::SidePanel::right("context")
+                .resizable(true)
+                .default_width(200.0)
+                .frame(theme::panel_frame())
+                .show(ctx, |ui| {
+                    context::show_pane(ui, &content, &mut |construction| {
+                        construction_change = Some(construction);
+                    });
+                });
+            if let Some(construction) = construction_change {
+                self.state
+                    .apply(Action::ApplyConstruction { construction });
+            }
         }
 
         egui::CentralPanel::default()
@@ -1403,6 +1510,34 @@ impl App {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
 
+        if self.state.tool == Tool::Select
+            && self.state.editing_committed_dim.is_none()
+            && !over_committed_dim_label
+            && self.dim_label_drag.is_none()
+        {
+            if let Some(pp) = pointer_screen {
+                let gp = cam.ground_point(pp, viewport, &vp);
+                if ui.input(|i| i.pointer.primary_pressed()) {
+                    if let Some(target) = resolve_pick_target(pp, &project, gp, &self.state.doc) {
+                        if let Some(element) = scene_element_from_pick(&target.kind) {
+                            let additive = ui.input(|i| i.modifiers.command);
+                            self.state
+                                .apply(Action::ClickSceneElement { element, additive });
+                        } else if !ui.input(|i| i.modifiers.command) {
+                            self.state.apply(Action::ClearSceneSelection);
+                        }
+                    } else if !ui.input(|i| i.modifiers.command) {
+                        self.state.apply(Action::ClearSceneSelection);
+                    }
+                } else if let Some(target) = resolve_pick_target(pp, &project, gp, &self.state.doc)
+                {
+                    if scene_element_from_pick(&target.kind).is_some() {
+                        target.draw_highlight(&painter, &project, &self.state.doc);
+                    }
+                }
+            }
+        }
+
         if self.state.tool == Tool::Sketch {
             if let Some(pp) = pointer_screen {
                 if ui.input(|i| i.pointer.primary_pressed()) {
@@ -1462,6 +1597,7 @@ impl App {
                             last_mouse: gp,
                             user_edited: [false, false],
                             pending_focus: true,
+                            construction: self.state.draw_construction,
                         });
                         self.state.status = "Move mouse • type to lock dim • Tab cycle • click/Enter commit • Esc cancel"
                             .to_string();
@@ -1546,6 +1682,7 @@ impl App {
                             last_mouse: gp,
                             user_edited: false,
                             pending_focus: true,
+                            construction: self.state.draw_construction,
                         });
                         self.state.status = "Move mouse • type to lock length • click/Enter commit • Esc cancel"
                             .to_string();
@@ -1790,16 +1927,20 @@ impl App {
             }
             let dim = sketch_session
                 .is_some_and(|s| !sketch_rect_is_active(doc, s, ri, r.sketch));
-            let color = sketch_color(col::RECT_LINE, dim);
-            draw_rect(&painter, &project, doc, r, color, true);
+            draw_rect_edges(&painter, &project, doc, r, dim);
         }
         for (li, line) in doc.lines.iter().enumerate() {
             if !visibility.effective_visible(doc, SceneElement::Line(li)) {
                 continue;
             }
             let dim = sketch_session.is_some_and(|s| line.sketch != s.sketch);
-            let color = sketch_color(col::LINE_STROKE, dim);
-            draw_line_segment(&painter, &project, doc, line, color, 2.0);
+            if line.construction {
+                let color = sketch_color(col::CONSTRUCTION, dim);
+                draw_construction_line_segment(&painter, &project, doc, line, color, 2.0);
+            } else {
+                let color = sketch_color(col::LINE_STROKE, dim);
+                draw_line_segment(&painter, &project, doc, line, color, 2.0);
+            }
         }
         for (i, plane) in doc.construction_planes.iter().enumerate() {
             if !visibility.effective_visible(doc, SceneElement::ConstructionPlane(i)) {
@@ -1815,6 +1956,12 @@ impl App {
             };
             draw_construction_plane(&painter, &project, plane, color, true);
         }
+        draw_scene_selection_highlights(
+            &painter,
+            &project,
+            doc,
+            &self.state.scene_selection,
+        );
         if let Some(session) = sketch_session {
             if let Some(face) = doc.sketch_face(session.sketch) {
                 if !matches!(face, FaceId::ConstructionPlane(_)) {
@@ -1927,10 +2074,22 @@ impl App {
                 let end = cr.end_point(&frame, &self.state.doc);
                 let (ou, ov) = world_to_local(&frame, cr.origin);
                 let (eu, ev) = world_to_local(&frame, end);
-                let preview = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
-                draw_rect(&painter, &project, &self.state.doc, &preview, col::PREVIEW, false);
+                let mut preview = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
+                if cr.construction {
+                    for edge_index in 0..4 {
+                        preview.set_edge_construction(RectEdge::from_index(edge_index), true);
+                    }
+                    draw_rect_edges(&painter, &project, &self.state.doc, &preview, false);
+                } else {
+                    draw_rect(&painter, &project, &self.state.doc, &preview, col::PREVIEW, false);
+                }
+                let anchor_color = if cr.construction {
+                    col::CONSTRUCTION
+                } else {
+                    col::PREVIEW
+                };
                 if let Some(sp) = project(cr.origin) {
-                    painter.circle_filled(sp, 3.5, col::PREVIEW);
+                    painter.circle_filled(sp, 3.5, anchor_color);
                 }
             }
         }
@@ -1939,11 +2098,29 @@ impl App {
         {
             if let Some(frame) = sketch_geometry_frame(&self.state.doc, session.sketch) {
                 let end = cl.end_point(&frame, &self.state.doc);
-                if let (Some(pa), Some(pb)) = (project(cl.origin), project(end)) {
+                let (u0, v0) = world_to_local(&frame, cl.origin);
+                let (u1, v1) = world_to_local(&frame, end);
+                let preview =
+                    Line::from_local_endpoints(session.sketch, u0, v0, u1, v1);
+                if cl.construction {
+                    draw_construction_line_segment(
+                        &painter,
+                        &project,
+                        &self.state.doc,
+                        &preview,
+                        col::CONSTRUCTION,
+                        2.0,
+                    );
+                } else if let (Some(pa), Some(pb)) = (project(cl.origin), project(end)) {
                     painter.line_segment([pa, pb], egui::Stroke::new(2.0, col::PREVIEW));
                 }
+                let anchor_color = if cl.construction {
+                    col::CONSTRUCTION
+                } else {
+                    col::PREVIEW
+                };
                 if let Some(sp) = project(cl.origin) {
-                    painter.circle_filled(sp, 3.5, col::PREVIEW);
+                    painter.circle_filled(sp, 3.5, anchor_color);
                 }
             }
         }
@@ -2319,7 +2496,7 @@ impl App {
                 } else if self.state.sketch_session.is_some() {
                     "Sketch mode — double-click dimension to edit • drag labels to reposition • Esc: exit sketch"
                 } else {
-                    "Right-drag: orbit  •  Shift+right-drag: pan  •  Wheel: zoom  •  s: sketch  •  p: plane"
+                    "Click lines/edges to select • ⌘/Ctrl+click multi-select • Right-drag: orbit  •  Wheel: zoom  •  s: sketch  •  p: plane"
                 }
             }
             Tool::Sketch => {
@@ -2409,6 +2586,118 @@ fn draw_world_segment(
 ) {
     if let (Some(pa), Some(pb)) = (project(a), project(b)) {
         painter.line_segment([pa, pb], egui::Stroke::new(width, color));
+    }
+}
+
+fn draw_world_segment_dashed(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    a: Vec3,
+    b: Vec3,
+    color: egui::Color32,
+    width: f32,
+) {
+    if let (Some(pa), Some(pb)) = (project(a), project(b)) {
+        painter.add(egui::Shape::dashed_line(
+            &[pa, pb],
+            egui::Stroke::new(width, color),
+            6.0,
+            4.0,
+        ));
+    }
+}
+
+fn draw_construction_line_segment(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    doc: &model::Document,
+    line: &Line,
+    color: egui::Color32,
+    width: f32,
+) {
+    let Some((a, b)) = line_world_endpoints(doc, line) else {
+        return;
+    };
+    draw_world_segment_dashed(painter, project, a, b, color, width);
+}
+
+fn draw_rect_edges(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    doc: &model::Document,
+    r: &Rect,
+    dim: bool,
+) {
+    let Some(corners) = rect_world_corners(doc, r) else {
+        return;
+    };
+    let solid_color = sketch_color(col::RECT_LINE, dim);
+    let construction_color = sketch_color(col::CONSTRUCTION, dim);
+    let all_construction = r.all_edges_construction();
+    let has_solid_edge = r.construction_edges.iter().any(|&c| !c);
+
+    if all_construction {
+        let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
+        if let Some(pts) = pts {
+            painter.add(egui::Shape::convex_polygon(
+                pts.clone(),
+                construction_color.gamma_multiply(0.18),
+                egui::Stroke::NONE,
+            ));
+        }
+    } else if has_solid_edge && r.has_mixed_edge_construction() {
+        let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
+        if let Some(pts) = pts {
+            painter.add(egui::Shape::convex_polygon(
+                pts,
+                solid_color.gamma_multiply(0.25),
+                egui::Stroke::NONE,
+            ));
+        }
+    } else if has_solid_edge {
+        draw_world_quad(painter, project, corners, solid_color, true);
+    }
+
+    for (edge_index, (a, b)) in rect_edge_segments(doc, r).into_iter().enumerate() {
+        let edge = RectEdge::from_index(edge_index);
+        if r.edge_construction(edge) {
+            draw_world_segment_dashed(painter, project, a, b, construction_color, 1.5);
+        } else {
+            draw_world_segment(painter, project, a, b, solid_color, 1.5);
+        }
+    }
+}
+
+fn draw_scene_selection_highlights(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    doc: &model::Document,
+    selection: &crate::selection::SceneSelection,
+) {
+    let color = col::DIM_EDGE_HIGHLIGHT;
+    for element in selection.iter() {
+        match element {
+            SceneElement::Line(index) => {
+                if let Some(line) = doc.lines.get(index) {
+                    draw_line_segment(painter, project, doc, line, color, 3.0);
+                }
+            }
+            SceneElement::RectEdge(index, edge) => {
+                if let Some(rect) = doc.rects.get(index) {
+                    let segments = rect_edge_segments(doc, rect);
+                    let (a, b) = segments[edge.index()];
+                    draw_world_segment(painter, project, a, b, color, 3.0);
+                }
+            }
+            SceneElement::Rect(index) => {
+                if let Some(rect) = doc.rects.get(index) {
+                    for (a, b) in rect_edge_segments(doc, rect) {
+                        draw_world_segment(painter, project, a, b, color, 3.0);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2695,13 +2984,47 @@ fn draw_ground(
 mod tests {
     use super::actions::CreatingRect;
     use super::{
-        clip_segment_to_rect, col, should_commit_sketch_on_click, should_select_all_rect_value,
-        GRID_EXTENT,
+        clip_segment_to_rect, col, initial_launch_maximize_frames, native_options,
+        should_commit_sketch_on_click, should_select_all_rect_value, tick_launch_maximize,
+        uses_deferred_launch_maximize, MACOS_LAUNCH_MAXIMIZE_DELAY_FRAMES, GRID_EXTENT,
     };
     use crate::face::SketchFrame;
     use eframe::egui::{self, Pos2, Rect, Vec2};
     use egui::Color32;
     use glam::Vec3;
+
+    #[test]
+    fn launch_maximize_strategy_matches_platform() {
+        if uses_deferred_launch_maximize() {
+            assert_eq!(native_options().viewport.maximized, None);
+        } else {
+            assert_eq!(native_options().viewport.maximized, Some(true));
+        }
+    }
+
+    #[test]
+    fn launch_maximize_waits_for_post_first_paint_on_macos() {
+        if uses_deferred_launch_maximize() {
+            assert_eq!(
+                initial_launch_maximize_frames(),
+                MACOS_LAUNCH_MAXIMIZE_DELAY_FRAMES
+            );
+        } else {
+            assert_eq!(initial_launch_maximize_frames(), 0);
+        }
+    }
+
+    #[test]
+    fn tick_launch_maximize_counts_down_to_zero() {
+        let ctx = egui::Context::default();
+        let mut frames = 2;
+        tick_launch_maximize(&mut frames, &ctx);
+        assert_eq!(frames, 1);
+        tick_launch_maximize(&mut frames, &ctx);
+        assert_eq!(frames, 0);
+        tick_launch_maximize(&mut frames, &ctx);
+        assert_eq!(frames, 0);
+    }
 
     #[test]
     fn clip_segment_clamps_infinite_spike_to_viewport() {
@@ -3012,6 +3335,7 @@ mod tests {
             last_mouse: Vec3::new(mouse.0, mouse.1, 0.0),
             user_edited: [true, true],
             pending_focus: false,
+            construction: false,
         }
     }
 

@@ -382,6 +382,11 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
 - **Tiled panes only** — avoid floating windows and modals. Use docking/splitting.
 - Core panes: 3D viewport, action-DAG/history graph, parameters, feature/constraint
   properties, component/assembly browser.
+- **Context pane:** shows the **union** of editable properties for everything currently
+  selected (or for the active draw tool — including before the first click — and for
+  in-progress draw operations). If selected items disagree on a property, the control
+  shows a mixed/indeterminate state; applying a new value sets that property on all
+  applicable targets. Draw-tool mode takes precedence over selection when both apply.
 - A standard **application menu bar** (File / Edit / View / Help) sits above the
   workspace. Menu items dispatch the shared action layer (§8) so menu, toolbar,
   shortcuts, and scripting stay in sync. The **View** menu contains a **Panes**
@@ -412,6 +417,7 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
   | **Shift + right-drag** | Pan the camera (slide the view target in the view plane) |
   | Mouse wheel | Zoom (dolly in/out) |
   | Left-drag (with an active draw tool) | Use the tool, e.g. draw a rectangle on the active plane |
+  | **X** | Toggle construction/substantial on the in-progress draw op, or on each constructable selected item |
   | Escape | Cancel the in-progress operation; if none, deactivate the current tool (back to *Select*) |
 
 - **Tooling model:** the viewport has an active **tool** (e.g. *Select*, *Rectangle*).

@@ -5,6 +5,7 @@
 
 use crate::actions::{Action, AppState, CommandPaletteState, Pane, Tool};
 use crate::camera::StandardView;
+use crate::shortcuts;
 use eframe::egui::{self, Key, ScrollArea, TextEdit};
 
 /// Stable command id for scripting and tests.
@@ -39,6 +40,8 @@ pub enum PaletteCommandId {
     HidePaneHierarchy,
     ShowPaneParameters,
     HidePaneParameters,
+    ShowPaneContext,
+    HidePaneContext,
     ShowPaneViewCube,
     HidePaneViewCube,
 }
@@ -130,6 +133,14 @@ impl PaletteCommand {
             }),
             PaletteCommandId::HidePaneParameters => PaletteOutcome::Action(Action::SetPaneVisible {
                 pane: Pane::Parameters,
+                visible: false,
+            }),
+            PaletteCommandId::ShowPaneContext => PaletteOutcome::Action(Action::SetPaneVisible {
+                pane: Pane::Context,
+                visible: true,
+            }),
+            PaletteCommandId::HidePaneContext => PaletteOutcome::Action(Action::SetPaneVisible {
+                pane: Pane::Context,
                 visible: false,
             }),
             PaletteCommandId::ShowPaneViewCube => PaletteOutcome::Action(Action::SetPaneVisible {
@@ -263,6 +274,19 @@ const PANE_COMMANDS: &[(Pane, PaletteCommand, PaletteCommand)] = &[
             PaletteCommandId::HidePaneParameters,
             "Hide Parameters Pane",
             "hide parameters pane params variables",
+        ),
+    ),
+    (
+        Pane::Context,
+        PaletteCommand::new(
+            PaletteCommandId::ShowPaneContext,
+            "Show Context Pane",
+            "show context pane properties selection",
+        ),
+        PaletteCommand::new(
+            PaletteCommandId::HidePaneContext,
+            "Hide Context Pane",
+            "hide context pane properties selection",
         ),
     ),
     (
@@ -416,9 +440,13 @@ pub fn show_palette(
                 .show(ui, |ui| {
                     for (index, (cmd, _score)) in matches.iter().enumerate() {
                         let selected = index == state.selected;
-                        if ui
-                            .selectable_label(selected, cmd.label)
-                            .clicked()
+                        if shortcuts::action_row(
+                            ui,
+                            selected,
+                            cmd.label,
+                            shortcuts::palette_command_shortcut(cmd.id),
+                        )
+                        .clicked()
                         {
                             state.selected = index;
                         }
@@ -527,6 +555,18 @@ mod tests {
         let cmds = commands_for_state(&AppState::default());
         let cmd = best_match("rect", &cmds).unwrap();
         assert_eq!(cmd.id, PaletteCommandId::ToolRectangle);
+    }
+
+    #[test]
+    fn palette_shortcuts_include_tools_and_commit() {
+        assert_eq!(
+            shortcuts::palette_command_shortcut(PaletteCommandId::ToolRectangle),
+            Some(shortcuts::ShortcutHint::plain("R"))
+        );
+        assert_eq!(
+            shortcuts::palette_command_shortcut(PaletteCommandId::CommitRectangle),
+            Some(shortcuts::ShortcutHint::plain("Enter"))
+        );
     }
 
     #[test]

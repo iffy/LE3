@@ -4,7 +4,8 @@
 pub const PANE_TITLE: &str = "Tree";
 
 use crate::actions::SketchSession;
-use crate::model::{ConstructionPlaneParent, Document, FaceId, SketchId};
+use crate::model::{ConstructionPlaneParent, Document, FaceId, RectEdge, SketchId};
+use crate::selection::SceneSelection;
 use eframe::egui;
 use std::collections::HashSet;
 
@@ -24,6 +25,7 @@ pub enum SceneElement {
     Sketch(SketchId),
     Rect(usize),
     Line(usize),
+    RectEdge(usize, RectEdge),
 }
 
 impl From<HierarchyNode> for SceneElement {
@@ -85,6 +87,9 @@ impl ElementVisibility {
             }),
             SceneElement::Line(index) => doc.lines.get(index).is_some_and(|line| {
                 self.effective_visible(doc, SceneElement::Sketch(line.sketch))
+            }),
+            SceneElement::RectEdge(index, _) => doc.rects.get(index).is_some_and(|rect| {
+                self.effective_visible(doc, SceneElement::Sketch(rect.sketch))
             }),
         }
     }
@@ -229,9 +234,11 @@ pub fn show_pane(
     doc: &Document,
     sketch_session: Option<SketchSession>,
     visibility: &mut ElementVisibility,
+    selection: &SceneSelection,
     on_edit_sketch: &mut impl FnMut(SketchId),
     on_edit_plane: &mut impl FnMut(usize),
     on_toggle_visibility: &mut impl FnMut(SceneElement, bool),
+    on_click_element: &mut impl FnMut(SceneElement, bool),
 ) {
     ui.heading(PANE_TITLE);
     ui.separator();
@@ -244,9 +251,11 @@ pub fn show_pane(
                 doc,
                 &entry,
                 visibility,
+                selection,
                 on_edit_sketch,
                 on_edit_plane,
                 on_toggle_visibility,
+                on_click_element,
                 0,
             );
         }
@@ -258,9 +267,11 @@ fn show_entry(
     doc: &Document,
     entry: &HierarchyEntry,
     visibility: &mut ElementVisibility,
+    selection: &SceneSelection,
     on_edit_sketch: &mut impl FnMut(SketchId),
     on_edit_plane: &mut impl FnMut(usize),
     on_toggle_visibility: &mut impl FnMut(SceneElement, bool),
+    on_click_element: &mut impl FnMut(SceneElement, bool),
     depth: usize,
 ) {
     let element = scene_element_for_node(entry.node);
@@ -280,11 +291,16 @@ fn show_entry(
         }
 
         let label = node_label(doc, entry.node);
-        let response = ui.selectable_label(false, label);
+        let selected = selection.is_selected(element)
+            || matches!(element, SceneElement::Rect(index) if selection.has_rect_edge_selected(index));
+        let response = ui.selectable_label(selected, label);
         match entry.node {
             HierarchyNode::Sketch(sketch) => {
                 if response.double_clicked() {
                     on_edit_sketch(sketch);
+                } else if response.clicked() {
+                    let additive = ui.input(|i| i.modifiers.command);
+                    on_click_element(element, additive);
                 }
                 response.context_menu(|ui| {
                     if ui.button("Edit sketch").clicked() {
@@ -294,6 +310,10 @@ fn show_entry(
                 });
             }
             HierarchyNode::ConstructionPlane(index) => {
+                if response.clicked() {
+                    let additive = ui.input(|i| i.modifiers.command);
+                    on_click_element(element, additive);
+                }
                 response.context_menu(|ui| {
                     if ui.button("Edit plane").clicked() {
                         on_edit_plane(index);
@@ -301,7 +321,12 @@ fn show_entry(
                     }
                 });
             }
-            _ => {}
+            HierarchyNode::Rect(_) | HierarchyNode::Line(_) => {
+                if response.clicked() {
+                    let additive = ui.input(|i| i.modifiers.command);
+                    on_click_element(element, additive);
+                }
+            }
         }
     });
 
@@ -311,9 +336,11 @@ fn show_entry(
             doc,
             child,
             visibility,
+            selection,
             on_edit_sketch,
             on_edit_plane,
             on_toggle_visibility,
+            on_click_element,
             depth + 1,
         );
     }

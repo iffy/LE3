@@ -4,12 +4,12 @@
 //! (and optionally an angle around an axis).
 
 use crate::face::{
-    line_world_endpoints, rect_center_world, rect_world_corners, sketch_frame,
-    sketch_geometry_frame, world_to_local, SketchFrame,
+    line_world_endpoints, rect_center_world, rect_world_corners, sketch_frame, SketchFrame,
 };
+use crate::hierarchy::SceneElement;
 use crate::model::{
     ConstructionPlane, ConstructionPlaneParent, Document, FaceId, Line, PlaneAnchor,
-    PlaneDefinition, Rect, SketchId,
+    PlaneDefinition, Rect, RectEdge, SketchId,
 };
 use crate::value::{eval_length_mm, parse_length_or};
 use eframe::egui;
@@ -439,8 +439,10 @@ pub fn plane_from_axis(
 /// Sketch that owns geometry used as a construction-plane reference, if any.
 pub fn sketch_from_pick_target(doc: &Document, kind: PickTargetKind) -> Option<SketchId> {
     match kind {
-        PickTargetKind::Line(line) => Some(line.sketch),
-        PickTargetKind::ShapeEdge { line, .. } => Some(line.sketch),
+        PickTargetKind::Line(index) => doc.lines.get(index).map(|line| line.sketch),
+        PickTargetKind::ShapeEdge { rect_index, .. } => {
+            doc.rects.get(rect_index).map(|rect| rect.sketch)
+        }
         PickTargetKind::Rect(rect) => Some(rect.sketch),
         PickTargetKind::ConstructionPlane(index) => doc.construction_planes.get(index).and_then(|plane| {
             match plane.parent {
@@ -845,10 +847,11 @@ pub fn draw_axis_plane_gizmo(
 #[derive(Clone, Debug, PartialEq)]
 pub enum PickTargetKind {
     /// A standalone sketch line segment.
-    Line(Line),
+    Line(usize),
     /// One edge of a rectangle (or other 2D shape).
     ShapeEdge {
-        line: Line,
+        rect_index: usize,
+        edge: RectEdge,
         a: Vec3,
         b: Vec3,
     },
@@ -1002,6 +1005,19 @@ impl PickTarget {
     }
 }
 
+/// Map a viewport pick to a scene-tree selection target, when selectable.
+pub fn scene_element_from_pick(kind: &PickTargetKind) -> Option<SceneElement> {
+    match kind {
+        PickTargetKind::Line(index) => Some(SceneElement::Line(*index)),
+        PickTargetKind::ShapeEdge {
+            rect_index,
+            edge,
+            ..
+        } => Some(SceneElement::RectEdge(*rect_index, *edge)),
+        _ => None,
+    }
+}
+
 /// Draw a hover highlight for a pickable target.
 pub fn draw_pick_highlight(
     painter: &egui::Painter,
@@ -1011,8 +1027,10 @@ pub fn draw_pick_highlight(
     color: egui::Color32,
 ) {
     match kind {
-        PickTargetKind::Line(line) => {
-            draw_line_highlight(painter, project, doc, &line, color);
+        PickTargetKind::Line(index) => {
+            if let Some(line) = doc.lines.get(index) {
+                draw_line_highlight(painter, project, doc, line, color);
+            }
         }
         PickTargetKind::ShapeEdge { a, b, .. } => {
             draw_segment_highlight(painter, project, a, b, color);
@@ -1225,23 +1243,22 @@ fn nearest_sketch_edge(
         }
     };
 
-    for line in &doc.lines {
+    for (li, line) in doc.lines.iter().enumerate() {
         let Some((a, b)) = line_world_endpoints(doc, line) else {
             continue;
         };
-        consider(PickTargetKind::Line(line.clone()), a, b, "Line");
+        consider(PickTargetKind::Line(li), a, b, "Line");
     }
 
-    for rect in &doc.rects {
-        let Some(frame) = sketch_geometry_frame(doc, rect.sketch) else {
-            continue;
-        };
-        for (a, b) in rect_edge_segments(doc, rect) {
-            let (au, av) = world_to_local(&frame, a);
-            let (bu, bv) = world_to_local(&frame, b);
-            let edge_line = Line::from_local_endpoints(rect.sketch, au, av, bu, bv);
+    for (ri, rect) in doc.rects.iter().enumerate() {
+        for (edge_index, (a, b)) in rect_edge_segments(doc, rect).into_iter().enumerate() {
             consider(
-                PickTargetKind::ShapeEdge { line: edge_line, a, b },
+                PickTargetKind::ShapeEdge {
+                    rect_index: ri,
+                    edge: RectEdge::from_index(edge_index),
+                    a,
+                    b,
+                },
                 a,
                 b,
                 "Rectangle edge",
@@ -1368,6 +1385,7 @@ fn rect_center_legacy(rect: &Rect) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::face::sketch_geometry_frame;
     use eframe::egui::Pos2;
 
     #[test]
@@ -1519,10 +1537,10 @@ mod tests {
 
     #[test]
     fn parent_from_line_pick_is_owning_sketch() {
-        let (doc, sketch) = doc_with_plane_sketch();
-        let line = Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0);
+        let (mut doc, sketch) = doc_with_plane_sketch();
+        doc.lines = vec![Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0)];
         assert_eq!(
-            parent_from_pick_target(&doc, PickTargetKind::Line(line)),
+            parent_from_pick_target(&doc, PickTargetKind::Line(0)),
             ConstructionPlaneParent::Sketch(sketch)
         );
     }
@@ -1591,34 +1609,51 @@ mod tests {
         let rect = &doc.rects[0];
         let frame = sketch_geometry_frame(&doc, sketch).unwrap();
         let (a, b) = rect_edge_segments(&doc, rect)[0];
-        let (au, av) = world_to_local(&frame, a);
-        let (bu, bv) = world_to_local(&frame, b);
-        let edge_line = Line::from_local_endpoints(sketch, au, av, bu, bv);
         let kind = PickTargetKind::ShapeEdge {
-            line: edge_line,
+            rect_index: 0,
+            edge: RectEdge::Bottom,
             a,
             b,
         };
 
         let PickTargetKind::ShapeEdge {
-            line,
             a: stored_a,
             b: stored_b,
+            ..
         } = kind
         else {
             panic!("expected shape edge");
         };
-        let (wa, wb) = line_world_endpoints(&doc, &line).unwrap();
-        assert!((wa - stored_a).length() < 1e-3);
-        assert!((wb - stored_b).length() < 1e-3);
-        let legacy_b = crate::face::local_to_world(
-            &frame,
-            stored_b.x,
-            stored_b.y,
-        );
+        assert!((stored_a - a).length() < 1e-3);
+        assert!((stored_b - b).length() < 1e-3);
+        let legacy_b = crate::face::local_to_world(&frame, stored_b.x, stored_b.y);
         assert!(
             (legacy_b - stored_b).length() > 0.1,
             "world xyz must not be treated as local uv on a tilted face"
+        );
+    }
+
+    #[test]
+    fn scene_element_from_line_and_rect_edge_picks() {
+        let (mut doc, sketch) = doc_with_plane_sketch();
+        doc.lines = vec![Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0)];
+        doc.rects = vec![Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0)];
+        assert_eq!(
+            scene_element_from_pick(&PickTargetKind::Line(0)),
+            Some(SceneElement::Line(0))
+        );
+        assert_eq!(
+            scene_element_from_pick(&PickTargetKind::ShapeEdge {
+                rect_index: 0,
+                edge: RectEdge::Right,
+                a: Vec3::ZERO,
+                b: Vec3::X,
+            }),
+            Some(SceneElement::RectEdge(0, RectEdge::Right))
+        );
+        assert_eq!(
+            scene_element_from_pick(&PickTargetKind::Ground(Vec3::ZERO)),
+            None
         );
     }
 
