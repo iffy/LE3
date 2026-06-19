@@ -19,6 +19,8 @@ mod construction;
 mod dimensions;
 mod expression_input;
 mod face;
+mod gpu_view_cube;
+mod gpu_viewport;
 mod hierarchy;
 mod names;
 mod parameters;
@@ -34,8 +36,9 @@ mod value;
 mod view_cube;
 
 use actions::{
-    constraint_is_circle_diameter, Action, AppState, CreatingCircle, CreatingLine, CreatingRect,
-    DimEditTarget, DimLabelTarget, Pane, RectAxis, SketchSession, Tool,
+    constraint_is_circle_diameter, Action, AppState, CreatingCircle, CreatingConstructionPlane,
+    CreatingLine, CreatingRect, DimEditTarget, DimLabelTarget, Pane, RectAxis, SketchSession,
+    Tool,
 };
 use constraints::{
     constraint_evaluated_length, constraint_segment_endpoints, distance_target_from_pick,
@@ -158,6 +161,7 @@ fn main() -> eframe::Result<()> {
                 )))
             })?;
             Ok(Box::new(App::new(
+                cc,
                 script,
                 script_opts.exit_on_complete,
                 native_menu,
@@ -196,10 +200,13 @@ struct App {
     native_menu: NativeMenu,
     dim_label_drag: Option<DimLabelDrag>,
     launch_maximize_frames_remaining: u8,
+    gpu_viewport: bool,
+    gpu_view_cube: bool,
 }
 
 impl App {
     fn new(
+        cc: &eframe::CreationContext<'_>,
         script: Option<ScriptRunner>,
         exit_on_script_complete: bool,
         native_menu: NativeMenu,
@@ -221,6 +228,8 @@ impl App {
             native_menu,
             dim_label_drag: None,
             launch_maximize_frames_remaining: initial_launch_maximize_frames(),
+            gpu_viewport: gpu_viewport::install(cc),
+            gpu_view_cube: gpu_view_cube::install(cc),
         }
     }
 
@@ -448,7 +457,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         tick_launch_maximize(&mut self.launch_maximize_frames_remaining, ctx);
         theme::apply(ctx);
 
@@ -683,10 +692,11 @@ impl eframe::App for App {
             }
         }
 
+        let render_state = frame.wgpu_render_state();
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
-                self.draw_viewport(ui);
+                self.draw_viewport(ui, render_state);
             });
     }
 }
@@ -748,8 +758,8 @@ mod col {
     pub const SKETCH_DIMMED: f32 = 0.28;
 }
 
-const GRID_EXTENT: f32 = 200.0;
-const GRID_STEP: f32 = 20.0;
+const GRID_EXTENT: f32 = gpu_viewport::GRID_EXTENT;
+const GRID_STEP: f32 = gpu_viewport::GRID_STEP;
 
 /// Screen-space height of a floating dimension input (frame + text field).
 const DIM_INPUT_HEIGHT: f32 = 26.0;
@@ -759,6 +769,122 @@ const DIM_INPUT_FRAME_H_PAD: f32 = 10.0;
 const DIM_INPUT_MIN_TEXT_WIDTH: f32 = 48.0;
 /// Approximate monospace glyph width at 13pt (used for layout sizing).
 const DIM_INPUT_CHAR_WIDTH: f32 = 7.8;
+
+fn build_gpu_dimension_labels(
+    ctx: &egui::Context,
+    layouts: &[CommittedDimLayout],
+    view: &PlanarLabelView,
+    project: &impl Fn(glam::Vec3) -> Option<egui::Pos2>,
+    skip_constraint: Option<DimLabelTarget>,
+) -> Vec<gpu_viewport::ViewportDimLabel> {
+    layouts
+        .iter()
+        .map(|layout| {
+            let (text_vertices, text_indices) = if skip_constraint == Some(layout.target) {
+                (Vec::new(), Vec::new())
+            } else {
+                gpu_viewport::build_planar_label_mesh(
+                    ctx,
+                    &layout.world_geom,
+                    view,
+                    &layout.label,
+                    col::DIM_ANNOTATION,
+                    project,
+                )
+            };
+            gpu_viewport::ViewportDimLabel {
+                world_geom: layout.world_geom,
+                text_vertices,
+                text_indices,
+            }
+        })
+        .collect()
+}
+
+fn build_viewport_scene_input<'a>(
+    doc: &'a model::Document,
+    cam: &'a camera::Camera,
+    viewport: egui::Rect,
+    sketch_session: Option<SketchSession>,
+    element_visibility: &'a hierarchy::ElementVisibility,
+    selection: &'a crate::selection::SceneSelection,
+    creating_rect: Option<&CreatingRect>,
+    creating_line: Option<&CreatingLine>,
+    creating_circle: Option<&CreatingCircle>,
+    creating_plane: Option<&CreatingConstructionPlane>,
+    dimension_labels: &'a [gpu_viewport::ViewportDimLabel],
+    dim_label_view: Option<PlanarLabelView>,
+) -> gpu_viewport::ViewportSceneInput<'a> {
+    let preview_rect = creating_rect.and_then(|cr| {
+        let session = sketch_session?;
+        let frame = sketch_geometry_frame(doc, session.sketch)?;
+        let end = cr.end_point(&frame, doc);
+        let (ou, ov) = world_to_local(&frame, cr.origin);
+        let (eu, ev) = world_to_local(&frame, end);
+        let mut preview = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
+        if cr.construction {
+            for edge_index in 0..4 {
+                preview.set_edge_construction(RectEdge::from_index(edge_index), true);
+            }
+        }
+        Some(preview)
+    });
+    let preview_line = creating_line.and_then(|cl| {
+        let session = sketch_session?;
+        let frame = sketch_geometry_frame(doc, session.sketch)?;
+        let end = cl.end_point(&frame, doc);
+        let (u0, v0) = world_to_local(&frame, cl.origin);
+        let (u1, v1) = world_to_local(&frame, end);
+        let mut preview = Line::from_local_endpoints(session.sketch, u0, v0, u1, v1);
+        preview.construction = cl.construction;
+        Some(preview)
+    });
+    let preview_circle = creating_circle.and_then(|cc| {
+        let session = sketch_session?;
+        let frame = sketch_geometry_frame(doc, session.sketch)?;
+        let (cu, cv) = world_to_local(&frame, cc.origin);
+        let r = cc.radius(&frame, doc);
+        let angle = cc.diameter_dim_angle(&frame);
+        let mut preview = Circle::from_local_center_radius(
+            session.sketch, cu, cv, r, angle,
+        );
+        preview.construction = cc.construction;
+        Some(preview)
+    });
+    let preview_plane = creating_plane.map(|cp| cp.preview_plane());
+    let active_sketch_face = sketch_session.and_then(|session| doc.sketch_face(session.sketch));
+    let active_sketch_face = active_sketch_face.filter(|face| !matches!(face, FaceId::ConstructionPlane(_)));
+
+    gpu_viewport::ViewportSceneInput {
+        doc,
+        cam,
+        viewport,
+        palette: gpu_viewport::ViewportPalette {
+            background: col::BG,
+            grid: col::GRID,
+            grid_axis: col::GRID_AXIS,
+            x_axis: col::X_AXIS,
+            y_axis: col::Y_AXIS,
+            z_axis: col::Z_AXIS,
+            rect_line: col::RECT_LINE,
+            line_stroke: col::LINE_STROKE,
+            preview: col::PREVIEW,
+            construction: col::CONSTRUCTION,
+            dim_edge_highlight: col::DIM_EDGE_HIGHLIGHT,
+        },
+        sketch_session,
+        selection,
+        element_visibility,
+        preview_rect,
+        preview_line,
+        preview_circle,
+        preview_plane,
+        active_sketch_face,
+        dimension_labels,
+        dim_label_view,
+        dim_annotation_color: col::DIM_ANNOTATION,
+    }
+}
 /// Expression fields grow with content up to this many characters.
 const DIM_INPUT_MAX_CHARS: usize = 20;
 
@@ -1627,14 +1753,17 @@ impl App {
         }
     }
 
-    fn draw_viewport(&mut self, ui: &mut egui::Ui) {
+    fn draw_viewport(
+        &mut self,
+        ui: &mut egui::Ui,
+        render_state: Option<&eframe::egui_wgpu::RenderState>,
+    ) {
         self.handle_in_progress_object_keyboard(ui);
 
         let (response, painter) =
             ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         let viewport = response.rect;
         self.last_viewport = Some(viewport);
-        painter.rect_filled(viewport, 0.0, col::BG);
 
         // Apply scripted right-drag as direct camera motion.
         self.synthetic.apply_pending_drag(viewport, |delta, modifiers, h| {
@@ -2211,80 +2340,128 @@ impl App {
             }
         }
 
-        draw_ground(
-            &painter,
-            &project,
-            viewport,
-            sketch_session.is_some(),
-        );
-
-        let visibility = &self.state.element_visibility;
         let doc = &self.state.doc;
-
-        for (ri, r) in doc.rects.iter().enumerate() {
-            if !visibility.effective_visible(doc, SceneElement::Rect(ri)) {
-                continue;
+        let editing_constraint = self.state.editing_committed_dim.as_ref().and_then(|edit| {
+            match &edit.target {
+                DimEditTarget::Constraint(id) => Some(*id),
+                DimEditTarget::New(_) => None,
             }
-            let dim = sketch_session
-                .is_some_and(|s| !sketch_rect_is_active(doc, s, ri, r.sketch));
-            draw_rect_edges(&painter, &project, doc, r, dim);
-        }
-        for (li, line) in doc.lines.iter().enumerate() {
-            if !visibility.effective_visible(doc, SceneElement::Line(li)) {
-                continue;
-            }
-            let dim = sketch_session.is_some_and(|s| line.sketch != s.sketch);
-            if line.construction {
-                let color = sketch_color(col::CONSTRUCTION, dim);
-                draw_construction_line_segment(&painter, &project, doc, line, color, 2.0);
-            } else {
-                let color = sketch_color(col::LINE_STROKE, dim);
-                draw_line_segment(&painter, &project, doc, line, color, 2.0);
-            }
-        }
-        for (ci, circle) in doc.circles.iter().enumerate() {
-            if !visibility.effective_visible(doc, SceneElement::Circle(ci)) {
-                continue;
-            }
-            let dim = sketch_session
-                .is_some_and(|s| !sketch_circle_is_active(doc, s, ci, circle.sketch));
-            draw_circle_edges(&painter, &project, doc, circle, dim);
-        }
-        for (i, plane) in doc.construction_planes.iter().enumerate() {
-            if !visibility.effective_visible(doc, SceneElement::ConstructionPlane(i)) {
-                continue;
-            }
-            let session_face =
-                sketch_session.and_then(|s| doc.sketch_face(s.sketch));
-            let active = session_face == Some(FaceId::ConstructionPlane(i));
-            let color = if active {
-                col::DIM_EDGE_HIGHLIGHT
-            } else {
-                sketch_color(col::CONSTRUCTION, sketch_session.is_some())
-            };
-            draw_construction_plane(&painter, &project, plane, color, true);
-        }
-        draw_scene_selection_highlights(
-            &painter,
-            &project,
-            doc,
-            &self.state.scene_selection,
-        );
-        if let Some(session) = sketch_session {
-            if let Some(face) = doc.sketch_face(session.sketch) {
-                if !matches!(face, FaceId::ConstructionPlane(_)) {
-                    draw_face_highlight(
-                        &painter,
+        });
+        let gpu_dim_labels = if self.gpu_viewport {
+            committed_dim_layouts
+                .as_ref()
+                .zip(planar_label_view)
+                .map(|(layouts, view)| {
+                    build_gpu_dimension_labels(
+                        ui.ctx(),
+                        layouts,
+                        &view,
                         &project,
-                        doc,
-                        face,
-                        col::DIM_EDGE_HIGHLIGHT,
-                    );
+                        editing_constraint,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let scene_input = build_viewport_scene_input(
+            doc,
+            &cam,
+            viewport,
+            sketch_session,
+            &self.state.element_visibility,
+            &self.state.scene_selection,
+            self.state.creating_rect.as_ref(),
+            self.state.creating_line.as_ref(),
+            self.state.creating_circle.as_ref(),
+            self.state.creating_plane.as_ref(),
+            &gpu_dim_labels,
+            planar_label_view,
+        );
+        let scene = gpu_viewport::ViewportScene::build(&scene_input);
+        let gpu_drawn =
+            self.gpu_viewport && gpu_viewport::paint(render_state, &painter, viewport, scene);
+
+        if !gpu_drawn {
+            painter.rect_filled(viewport, 0.0, col::BG);
+            draw_ground(
+                &painter,
+                &project,
+                viewport,
+                sketch_session.is_some(),
+            );
+
+            let visibility = &self.state.element_visibility;
+            for (ri, r) in doc.rects.iter().enumerate() {
+                if !visibility.effective_visible(doc, SceneElement::Rect(ri)) {
+                    continue;
+                }
+                let dim = sketch_session
+                    .is_some_and(|s| !sketch_rect_is_active(doc, s, ri, r.sketch));
+                draw_rect_edges(&painter, &project, doc, r, dim);
+            }
+            for (li, line) in doc.lines.iter().enumerate() {
+                if !visibility.effective_visible(doc, SceneElement::Line(li)) {
+                    continue;
+                }
+                let dim = sketch_session.is_some_and(|s| line.sketch != s.sketch);
+                if line.construction {
+                    let color = sketch_color(col::CONSTRUCTION, dim);
+                    draw_construction_line_segment(&painter, &project, doc, line, color, 2.0);
+                } else {
+                    let color = sketch_color(col::LINE_STROKE, dim);
+                    draw_line_segment(&painter, &project, doc, line, color, 2.0);
                 }
             }
+            for (ci, circle) in doc.circles.iter().enumerate() {
+                if !visibility.effective_visible(doc, SceneElement::Circle(ci)) {
+                    continue;
+                }
+                let dim = sketch_session
+                    .is_some_and(|s| !sketch_circle_is_active(doc, s, ci, circle.sketch));
+                draw_circle_edges(&painter, &project, doc, circle, dim);
+            }
+            for (i, plane) in doc.construction_planes.iter().enumerate() {
+                if !visibility.effective_visible(doc, SceneElement::ConstructionPlane(i)) {
+                    continue;
+                }
+                let session_face =
+                    sketch_session.and_then(|s| doc.sketch_face(s.sketch));
+                let active = session_face == Some(FaceId::ConstructionPlane(i));
+                let color = if active {
+                    col::DIM_EDGE_HIGHLIGHT
+                } else {
+                    sketch_color(col::CONSTRUCTION, sketch_session.is_some())
+                };
+                draw_construction_plane(&painter, &project, plane, color, true);
+            }
+            draw_scene_selection_highlights(
+                &painter,
+                &project,
+                doc,
+                &self.state.scene_selection,
+            );
+            if let Some(session) = sketch_session {
+                if let Some(face) = doc.sketch_face(session.sketch) {
+                    if !matches!(face, FaceId::ConstructionPlane(_)) {
+                        draw_face_highlight(
+                            &painter,
+                            &project,
+                            doc,
+                            face,
+                            col::DIM_EDGE_HIGHLIGHT,
+                        );
+                    }
+                }
+            }
+        }
+
+        if sketch_session.is_some() {
             let mut commit_committed_dim = false;
             if let (Some(layouts), Some(view)) = (&committed_dim_layouts, planar_label_view) {
-                draw_committed_dim_layouts(&painter, layouts, &view, &project);
+                if !gpu_drawn {
+                    draw_committed_dim_layouts(&painter, layouts, &view, &project);
+                }
                 if let Some(edit) = &mut self.state.editing_committed_dim {
                     let constraint_id = match &edit.target {
                         DimEditTarget::Constraint(id) => Some(*id),
@@ -2371,17 +2548,19 @@ impl App {
             (&self.state.creating_rect, self.state.sketch_session)
         {
             if let Some(frame) = sketch_geometry_frame(&self.state.doc, session.sketch) {
-                let end = cr.end_point(&frame, &self.state.doc);
-                let (ou, ov) = world_to_local(&frame, cr.origin);
-                let (eu, ev) = world_to_local(&frame, end);
-                let mut preview = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
-                if cr.construction {
-                    for edge_index in 0..4 {
-                        preview.set_edge_construction(RectEdge::from_index(edge_index), true);
+                if !gpu_drawn {
+                    let end = cr.end_point(&frame, &self.state.doc);
+                    let (ou, ov) = world_to_local(&frame, cr.origin);
+                    let (eu, ev) = world_to_local(&frame, end);
+                    let mut preview = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
+                    if cr.construction {
+                        for edge_index in 0..4 {
+                            preview.set_edge_construction(RectEdge::from_index(edge_index), true);
+                        }
+                        draw_rect_edges(&painter, &project, &self.state.doc, &preview, false);
+                    } else {
+                        draw_rect(&painter, &project, &self.state.doc, &preview, col::PREVIEW, false);
                     }
-                    draw_rect_edges(&painter, &project, &self.state.doc, &preview, false);
-                } else {
-                    draw_rect(&painter, &project, &self.state.doc, &preview, col::PREVIEW, false);
                 }
                 let anchor_color = if cr.construction {
                     col::CONSTRUCTION
@@ -2397,22 +2576,24 @@ impl App {
             (&self.state.creating_line, self.state.sketch_session)
         {
             if let Some(frame) = sketch_geometry_frame(&self.state.doc, session.sketch) {
-                let end = cl.end_point(&frame, &self.state.doc);
-                let (u0, v0) = world_to_local(&frame, cl.origin);
-                let (u1, v1) = world_to_local(&frame, end);
-                let preview =
-                    Line::from_local_endpoints(session.sketch, u0, v0, u1, v1);
-                if cl.construction {
-                    draw_construction_line_segment(
-                        &painter,
-                        &project,
-                        &self.state.doc,
-                        &preview,
-                        col::CONSTRUCTION,
-                        2.0,
-                    );
-                } else if let (Some(pa), Some(pb)) = (project(cl.origin), project(end)) {
-                    painter.line_segment([pa, pb], egui::Stroke::new(2.0, col::PREVIEW));
+                if !gpu_drawn {
+                    let end = cl.end_point(&frame, &self.state.doc);
+                    let (u0, v0) = world_to_local(&frame, cl.origin);
+                    let (u1, v1) = world_to_local(&frame, end);
+                    let preview =
+                        Line::from_local_endpoints(session.sketch, u0, v0, u1, v1);
+                    if cl.construction {
+                        draw_construction_line_segment(
+                            &painter,
+                            &project,
+                            &self.state.doc,
+                            &preview,
+                            col::CONSTRUCTION,
+                            2.0,
+                        );
+                    } else if let (Some(pa), Some(pb)) = (project(cl.origin), project(end)) {
+                        painter.line_segment([pa, pb], egui::Stroke::new(2.0, col::PREVIEW));
+                    }
                 }
                 let anchor_color = if cl.construction {
                     col::CONSTRUCTION
@@ -2428,28 +2609,30 @@ impl App {
             (&self.state.creating_circle, self.state.sketch_session)
         {
             if let Some(frame) = sketch_geometry_frame(&self.state.doc, session.sketch) {
-                let (cu, cv) = world_to_local(&frame, cc.origin);
-                let r = cc.radius(&frame, &self.state.doc);
-                let angle = cc.diameter_dim_angle(&frame);
-                let preview = Circle::from_local_center_radius(
-                    session.sketch,
-                    cu,
-                    cv,
-                    r,
-                    angle,
-                );
-                if cc.construction {
-                    draw_circle_edges(&painter, &project, &self.state.doc, &preview, false);
-                } else {
-                    draw_circle(
-                        &painter,
-                        &project,
-                        &self.state.doc,
-                        &preview,
-                        col::PREVIEW,
-                        false,
-                        1.5,
+                if !gpu_drawn {
+                    let (cu, cv) = world_to_local(&frame, cc.origin);
+                    let r = cc.radius(&frame, &self.state.doc);
+                    let angle = cc.diameter_dim_angle(&frame);
+                    let preview = Circle::from_local_center_radius(
+                        session.sketch,
+                        cu,
+                        cv,
+                        r,
+                        angle,
                     );
+                    if cc.construction {
+                        draw_circle_edges(&painter, &project, &self.state.doc, &preview, false);
+                    } else {
+                        draw_circle(
+                            &painter,
+                            &project,
+                            &self.state.doc,
+                            &preview,
+                            col::PREVIEW,
+                            false,
+                            1.5,
+                        );
+                    }
                 }
                 let anchor_color = if cc.construction {
                     col::CONSTRUCTION
@@ -2463,7 +2646,9 @@ impl App {
         }
         if let Some(cp) = &self.state.creating_plane {
             let preview = cp.preview_plane();
-            draw_construction_plane(&painter, &project, &preview, col::PREVIEW, false);
+            if !gpu_drawn {
+                draw_construction_plane(&painter, &project, &preview, col::PREVIEW, false);
+            }
             if let Some(edit_index) = cp.edit_index {
                 if let Some(dependent) =
                     preview_plane_edit_dependents(&self.state.doc, edit_index, &preview)
@@ -2904,7 +3089,13 @@ impl App {
         }
 
         if self.state.panes.is_visible(Pane::ViewCube) {
-            view_cube::show_hud(ui.ctx(), &mut self.state.cam, viewport);
+            view_cube::show_hud(
+                ui.ctx(),
+                &mut self.state.cam,
+                viewport,
+                render_state,
+                self.gpu_view_cube,
+            );
         }
 
         let hint = match self.state.tool {
@@ -3037,8 +3228,8 @@ fn draw_world_segment_dashed(
         painter.add(egui::Shape::dashed_line(
             &[pa, pb],
             egui::Stroke::new(width, color),
-            6.0,
-            4.0,
+            construction::CONSTRUCTION_DASH_LENGTH_PX,
+            construction::CONSTRUCTION_DASH_GAP_PX,
         ));
     }
 }

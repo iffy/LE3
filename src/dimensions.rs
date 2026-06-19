@@ -432,7 +432,7 @@ fn bilinear_quad(tl: Pos2, tr: Pos2, br: Pos2, bl: Pos2, u: f32, v: f32) -> Pos2
     tl.lerp(tr, u).lerp(bl.lerp(br, u), v)
 }
 
-fn planar_label_corners_world<Project>(
+pub fn planar_label_corners_world<Project>(
     world: &LinearDimensionWorldGeom,
     view: &PlanarLabelView,
     galley_size: Vec2,

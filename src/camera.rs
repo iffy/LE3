@@ -1,8 +1,8 @@
 //! Orbit camera and 3D→2D projection for the viewport.
 //!
-//! Until the wgpu/OCCT 3D pipeline lands (SPEC §1, §10), the viewport is drawn
-//! by projecting world-space geometry to screen with egui's 2D painter. This
-//! module owns the camera state and the project/unproject math.
+//! The viewport is rendered on the GPU via [`crate::gpu_viewport`] (depth-tested
+//! triangles and lines). This module owns the camera state and the project/unproject
+//! math used for picking and overlays. OCCT mesh rendering is still future work (SPEC §10).
 //!
 //! World convention: **Z is up, the ground plane is XY** (z = 0).
 
