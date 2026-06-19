@@ -238,12 +238,30 @@ pub fn sketch_view_up(
 
 pub fn rect_world_corners(doc: &Document, rect: &Rect) -> Option<[Vec3; 4]> {
     let frame = sketch_geometry_frame(doc, rect.sketch)?;
-    Some([
-        local_to_world(&frame, rect.x, rect.y),
-        local_to_world(&frame, rect.x + rect.w, rect.y),
-        local_to_world(&frame, rect.x + rect.w, rect.y + rect.h),
-        local_to_world(&frame, rect.x, rect.y + rect.h),
-    ])
+    Some(rect_world_corners_in_frame(&frame, rect))
+}
+
+pub fn rect_world_corners_in_frame(frame: &SketchFrame, rect: &Rect) -> [Vec3; 4] {
+    [
+        local_to_world(frame, rect.x, rect.y),
+        local_to_world(frame, rect.x + rect.w, rect.y),
+        local_to_world(frame, rect.x + rect.w, rect.y + rect.h),
+        local_to_world(frame, rect.x, rect.y + rect.h),
+    ]
+}
+
+/// Rectangle corners when the sketch frame is missing (legacy XY fallback).
+pub fn rect_world_corners_legacy(rect: &Rect) -> [Vec3; 4] {
+    [
+        Vec3::new(rect.x, rect.y, 0.0),
+        Vec3::new(rect.x + rect.w, rect.y, 0.0),
+        Vec3::new(rect.x + rect.w, rect.y + rect.h, 0.0),
+        Vec3::new(rect.x, rect.y + rect.h, 0.0),
+    ]
+}
+
+pub fn rect_world_corners_resolved(doc: &Document, rect: &Rect) -> [Vec3; 4] {
+    rect_world_corners(doc, rect).unwrap_or_else(|| rect_world_corners_legacy(rect))
 }
 
 pub fn line_world_endpoints(doc: &Document, line: &Line) -> Option<(Vec3, Vec3)> {

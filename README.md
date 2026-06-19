@@ -6,14 +6,20 @@ On-device parametric CAD. See [SPEC.md](SPEC.md) for the full design.
 
 Very early prototype. Currently implemented:
 
-- An egui GUI with a 3D viewport (orbit camera, projected with egui's painter).
-- A **Rectangle** tool: draw rectangles on the ground plane (XY, z = 0).
+- **GUI** with a **wgpu**-accelerated 3D viewport (orbit/pan/zoom, view cube, HUD bear).
+- **Sketch tools** on construction planes and face-hosted sketches: **rectangle**, **line**,
+  and **circle**.
+- **Construction geometry**: construction planes, per-edge construction flags, dashed
+  construction lines.
+- **Dimension constraints** on lines, rectangle edges, and circle diameters; draggable
+  dimension labels.
+- **Named parameters** with unit expressions (`mm`, `in`, arithmetic, parameter references).
+- **Elements tree**, **Context** pane, **Parameters** table, and **command palette**.
 - **Save / Open** documents as `.le3` files (SQLite, per SPEC §7).
-- **Instruction scripts** (SPEC §9.3): drive the live UI from a file — mouse,
-  keyboard, camera, document actions, and screenshots.
+- **Instruction scripts** (SPEC §9.3): drive the live UI from a `.le3script` file.
 
-Not yet implemented: the wgpu/OCCT 3D viewport, action DAG, parameters,
-constraints, Lua API, CLI subcommands, and everything else in the spec.
+Not yet implemented: OCCT B-rep kernel, action DAG, assemblies, Lua API, and the full CLI
+from SPEC §9 (script mode and `--help` work today).
 
 ## Run
 
@@ -21,52 +27,80 @@ constraints, Lua API, CLI subcommands, and everything else in the spec.
 cargo run
 ```
 
-- Select the **Rectangle** tool, **left-click** to fix the first corner, move the
-  mouse to size, type dimensions if needed, then **Enter** to commit.
+- Pick a face with the **Sketch** tool (or start on the default XY construction plane),
+  then draw with **Rectangle**, **Line**, or **Circle**.
+- Type dimensions while drawing; **Tab** cycles fields; **Enter** commits.
 - **Right-drag** to orbit; **Shift+right-drag** to pan; **mouse wheel** to zoom.
-- **Escape** cancels an in-progress draw; press again to return to the Select tool.
+- **Escape** cancels an in-progress draw; press again to exit sketch mode or return to
+  Select.
 - **Save / Save As…** writes a `.le3` SQLite file; **Open…** loads one back.
-- **Clear** removes all rectangles; **Undo last** drops the most recent.
-
-## Scripting
-
-The app can be driven programmatically with a human-readable instruction file
-(`.le3script`). This is intended for automation and visual-regression testing
-(SPEC §9.3).
+- **Clear** resets the document; **Undo last** removes the most recently committed shape.
 
 ```sh
-# Run a script and exit when it finishes
-cargo run -- --script examples/rectangle.le3script --exit
+cargo run -- --help    # usage and exit
+cargo test
+```
 
-# Same thing — positional script path also works
+## Script quickstart
+
+Scripts are plain-text `.le3script` files — one instruction per line. They drive the same
+actions and synthetic input as the GUI, which makes them useful for automation and
+regression tests.
+
+**Run a script and quit when it finishes:**
+
+```sh
+cargo run -- --script examples/rectangle.le3script --exit
+# same thing:
 cargo run -- examples/rectangle.le3script --exit
 ```
+
+**Minimal script** — open a sketch, draw an 80×50 mm rectangle, save a screenshot:
+
+```text
+new
+begin_sketch construction_plane 0
+tool rectangle
+click 480 320
+move 580 380
+set_dim width 80
+key tab
+set_dim height 50
+key enter
+exit_sketch
+wait 100ms
+screenshot rectangle_preview.png
+```
+
+Use `click_ground 50 25` / `move_ground …` for millimetre positions on the active sketch
+plane (XY on the default construction plane). Use `click 480 320` for pixel coordinates in
+the 3D viewport panel.
+
+More examples: [examples/rectangle.le3script](examples/rectangle.le3script),
+[examples/line.le3script](examples/line.le3script).
+
+The full instruction reference is below. The parser and runner live in `src/script.rs`; add
+new instructions there first (with tests), then document them here.
+
+## Scripting reference
 
 ### Format
 
 - One instruction per line.
 - Lines starting with `#` are comments; blank lines are ignored.
 - Instruction names are case-insensitive.
-- Many instructions accept aliases (for example `right_drag` and `orbit` are
-  equivalent).
-- Expressions in dimension and parameter values support units (`mm`, `in`, etc.)
-  and parameter names.
+- Many instructions accept aliases (for example `tool rect` and `tool rectangle`).
+- Expressions in dimension and parameter values support units (`mm`, `in`, etc.) and
+  parameter names.
 
 ### Coordinates
 
-- **Viewport** (`click`, `move`, `drag`, …): pixel coordinates relative to the
-  3D panel (below the toolbar).
-- **Ground** (`click_ground`, `move_ground`): millimetre positions on the active
-  sketch face's ground plane (XY when sketching on the default construction
-  plane).
-- **Camera** (`orbit`, `pan`, `wheel`): pixel deltas, same as mouse drag/scroll.
-
-### Examples
-
-- [examples/rectangle.le3script](examples/rectangle.le3script) — sketch on the
-  default plane, draw a rectangle with typed dimensions, screenshot.
-- [examples/line.le3script](examples/line.le3script) — draw a line with a typed
-  length, screenshot.
+- **Viewport** (`click`, `move`, `drag`, …): pixel coordinates relative to the 3D panel
+  (below the toolbar).
+- **Ground** (`click_ground`, `move_ground`): millimetre positions on the active sketch
+  face's plane (XY when sketching on the default construction plane).
+- **Camera** (`orbit`, `pan`, `wheel`): `orbit`/`pan` apply camera motion directly; `wheel`,
+  `zoom`, and `scroll` adjust zoom.
 
 ### Instruction reference
 
@@ -78,8 +112,8 @@ cargo run -- examples/rectangle.le3script --exit
 | `open path/to/doc.le3` | Open a document (no file dialog) |
 | `save` | Save to the current path |
 | `save path/to/doc.le3` | Save As to a path |
-| `clear` | Remove all geometry |
-| `undo` | Undo the last committed action |
+| `clear` | Reset the document (all geometry and sketches) |
+| `undo` | Undo the last committed shape |
 | `quit` / `exit` | Close the app when the script ends |
 
 #### Tools and sketching
@@ -99,8 +133,8 @@ cargo run -- examples/rectangle.le3script --exit
 
 #### Scene elements
 
-Element kinds: `construction_plane`, `sketch`, `rect`, `line`, `circle`,
-`constraint`. Indices are zero-based.
+Element kinds: `construction_plane`, `sketch`, `rect`, `line`, `circle`, `constraint`.
+Indices are zero-based.
 
 | Instruction | Description |
 |---|---|
@@ -120,8 +154,8 @@ Visibility and construction values accept `show`/`hide`/`toggle` (or `on`/`off`,
 
 #### Dimensions and constraints
 
-While drawing or editing, set dimensions with expressions. Use `focus_dim` to
-focus the corresponding input field.
+While drawing or editing, set dimensions with expressions. Use `focus_dim` to focus the
+corresponding input field.
 
 | Instruction | Description |
 |---|---|
@@ -157,8 +191,8 @@ View commands wait until animated transitions finish before advancing.
 
 | Instruction | Description |
 |---|---|
-| `orbit 10 5` | Orbit camera (also `right_drag`, `right_drag_rel`) |
-| `pan 10 5` | Pan camera (also `right_drag_shift`, `right_drag_pan`) |
+| `orbit 10 5` | Orbit camera (also `right_drag`) |
+| `pan 10 5` | Pan camera (also `right_drag_shift`) |
 | `wheel 120` | Mouse wheel zoom (also `zoom`, `scroll`) |
 | `view front` | Standard view (`front`, `back`, `left`, `right`, `top`, `bottom`; single-letter aliases work) |
 | `view edge front_top` | View from a view-cube edge (e.g. `front_bottom`, `right_top`, …) |
@@ -167,6 +201,9 @@ View commands wait until animated transitions finish before advancing.
 | `toggle_projection` | Toggle orthographic / natural |
 | `view_home` / `home` | Return to the stored home view |
 | `set_home_view` / `set_home` | Store the current camera as home |
+
+Synthetic right-drag variants (`right_drag_rel`, `right_drag_pan`) replay pointer input
+instead of applying camera actions directly.
 
 #### UI panes and command palette
 
@@ -195,8 +232,7 @@ Pane visibility accepts `show`, `hide`, or `toggle` (or `on`/`off`, `true`/`fals
 | `type 12.5` / `type "2in + 5mm"` | Type text into the focused field |
 
 Supported key names: `enter`, `tab`, `escape`/`esc`, `backspace`, `delete`/`del`,
-arrow keys (`left`, `right`, `up`, `down`), `space`, letters `a`–`z`, digits
-`0`–`9`.
+arrow keys (`left`, `right`, `up`, `down`), `space`, letters `a`–`z`, digits `0`–`9`.
 
 #### Sequencing and output
 
@@ -205,12 +241,3 @@ arrow keys (`left`, `right`, `up`, `down`), `space`, letters `a`–`z`, digits
 | `wait 5` | Wait 5 UI frames |
 | `wait 100ms` | Wait 100 milliseconds |
 | `screenshot path.png` | Capture the viewport to an image file |
-
-The authoritative parser and runner live in `src/script.rs`; new instructions
-should be added there first (with tests), then documented here.
-
-## Test
-
-```sh
-cargo test
-```

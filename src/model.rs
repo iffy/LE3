@@ -345,7 +345,7 @@ impl Circle {
 }
 
 /// Reference geometry a construction plane was built from (for later editing).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PlaneAnchor {
     Face {
         origin: glam::Vec3,
@@ -360,7 +360,7 @@ pub enum PlaneAnchor {
 }
 
 /// Editable offset/angle parameters that define a construction plane.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlaneDefinition {
     pub anchor: PlaneAnchor,
     pub offset_mm: f32,
@@ -374,7 +374,7 @@ impl PlaneDefinition {
 }
 
 /// Where a construction plane sits in the scene hierarchy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ConstructionPlaneParent {
     /// Datum plane (default XY, ground, global axes, etc.).
     #[default]
@@ -383,8 +383,8 @@ pub enum ConstructionPlaneParent {
     Sketch(SketchId),
 }
 
-/// A construction plane in world space (millimetres). Not exported to `.le3`.
-#[derive(Clone, Debug, PartialEq)]
+/// A construction plane in world space (millimetres).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConstructionPlane {
     pub origin: glam::Vec3,
     pub normal: glam::Vec3,
@@ -448,8 +448,6 @@ pub struct Document {
     pub lines: Vec<Line>,
     pub circles: Vec<Circle>,
     pub constraints: Vec<Constraint>,
-    /// Construction planes live in the document but are not written to `.le3`.
-    #[serde(skip)]
     pub construction_planes: Vec<ConstructionPlane>,
     pub shape_order: Vec<ShapeKind>,
 }

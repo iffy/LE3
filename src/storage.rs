@@ -9,13 +9,17 @@
 
 use crate::face::default_xy_plane;
 use crate::constraints::{migrate_legacy_dimensions, solve_document_constraints};
-use crate::model::{Circle, Constraint, Document, Line, Parameter, Rect, ShapeKind, Sketch};
+use crate::model::{
+    Circle, ConstructionPlane, Constraint, Document, FaceId, Line, Parameter, Rect, ShapeKind,
+    Sketch,
+};
 use crate::parameters::validate_document_parameters_no_cycles;
 use rusqlite::Connection;
 
 /// Bump when the on-disk schema changes; pair with a migration below.
 const SCHEMA_VERSION: i64 = 1;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CONSTRUCTION_PLANES_META_KEY: &str = "construction_planes";
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -64,8 +68,16 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
     )
     .map_err(|e| e.to_string())?;
 
+    let planes_payload =
+        serde_json::to_string(&doc.construction_planes).map_err(|e| e.to_string())?;
     tx.execute(
-        "DELETE FROM dag_nodes WHERE kind IN ('sketch', 'rectangle', 'line', 'circle', 'parameter', 'constraint')",
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![CONSTRUCTION_PLANES_META_KEY, planes_payload],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.execute(
+        "DELETE FROM dag_nodes WHERE kind IN ('sketch', 'rectangle', 'line', 'circle', 'parameter', 'constraint', 'construction_plane')",
         [],
     )
     .map_err(|e| e.to_string())?;
@@ -76,6 +88,7 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
     let mut circle_i = 0usize;
     let mut constraint_i = 0usize;
     let mut param_i = 0usize;
+    let mut plane_i = 1usize;
     for (id, kind) in doc.shape_order.iter().enumerate() {
         match kind {
             ShapeKind::Sketch => {
@@ -162,12 +175,66 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
                 .map_err(|e| e.to_string())?;
                 constraint_i += 1;
             }
-            ShapeKind::ConstructionPlane => {}
+            ShapeKind::ConstructionPlane => {
+                let plane = doc
+                    .construction_planes
+                    .get(plane_i)
+                    .ok_or_else(|| {
+                        "shape_order out of sync with construction_planes".to_string()
+                    })?;
+                let payload = serde_json::to_string(plane).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
+                     VALUES (?1, 0, 'construction_plane', ?2)",
+                    rusqlite::params![id as i64, payload],
+                )
+                .map_err(|e| e.to_string())?;
+                plane_i += 1;
+            }
         }
     }
 
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn load_construction_planes(
+    conn: &Connection,
+    dag_planes: Vec<ConstructionPlane>,
+) -> Result<Vec<ConstructionPlane>> {
+    if let Ok(payload) = conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        rusqlite::params![CONSTRUCTION_PLANES_META_KEY],
+        |row| row.get::<_, String>(0),
+    ) {
+        if let Ok(planes) = serde_json::from_str::<Vec<ConstructionPlane>>(&payload) {
+            if !planes.is_empty() {
+                return Ok(planes);
+            }
+        }
+    }
+    let mut planes = vec![default_xy_plane()];
+    planes.extend(dag_planes);
+    Ok(planes)
+}
+
+/// Ensure every sketch-hosted construction-plane index exists after load.
+fn ensure_construction_plane_indices(doc: &mut Document) {
+    if doc.construction_planes.is_empty() {
+        doc.construction_planes.push(default_xy_plane());
+    }
+    let max_index = doc
+        .sketches
+        .iter()
+        .filter_map(|sketch| match sketch.face {
+            FaceId::ConstructionPlane(index) => Some(index),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    while doc.construction_planes.len() <= max_index {
+        doc.construction_planes.push(default_xy_plane());
+    }
 }
 
 /// Open the document stored at `path`.
@@ -177,7 +244,7 @@ pub fn open(path: &str) -> Result<Document> {
     let mut stmt = conn
         .prepare(
             "SELECT kind, payload FROM dag_nodes
-             WHERE kind IN ('sketch', 'rectangle', 'line', 'circle', 'parameter', 'constraint')
+             WHERE kind IN ('sketch', 'rectangle', 'line', 'circle', 'parameter', 'constraint', 'construction_plane')
              ORDER BY id",
         )
         .map_err(|e| e.to_string())?;
@@ -192,6 +259,7 @@ pub fn open(path: &str) -> Result<Document> {
     let mut lines = Vec::new();
     let mut circles = Vec::new();
     let mut constraints = Vec::new();
+    let mut construction_planes = Vec::new();
     let mut shape_order = Vec::new();
     for row in rows {
         let (kind, payload) = row.map_err(|e| e.to_string())?;
@@ -227,9 +295,18 @@ pub fn open(path: &str) -> Result<Document> {
                 constraints.push(constraint);
                 shape_order.push(ShapeKind::Constraint);
             }
+            "construction_plane" => {
+                let plane: ConstructionPlane =
+                    serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+                construction_planes.push(plane);
+                shape_order.push(ShapeKind::ConstructionPlane);
+            }
             _ => {}
         }
     }
+
+    let construction_planes =
+        load_construction_planes(&conn, construction_planes).map_err(|e| e.to_string())?;
 
     let mut doc = Document {
         parameters,
@@ -238,12 +315,10 @@ pub fn open(path: &str) -> Result<Document> {
         lines,
         circles,
         constraints,
-        construction_planes: Vec::new(),
+        construction_planes,
         shape_order,
     };
-    if doc.construction_planes.is_empty() {
-        doc.construction_planes.push(default_xy_plane());
-    }
+    ensure_construction_plane_indices(&mut doc);
     migrate_legacy_dimensions(&mut doc);
     solve_document_constraints(&mut doc).map_err(|e| e.to_string())?;
     Ok(doc)
@@ -382,13 +457,60 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    fn element_world_anchors(doc: &Document) -> Vec<glam::Vec3> {
+        let mut anchors = Vec::new();
+        for plane in &doc.construction_planes {
+            anchors.push(plane.origin);
+        }
+        for rect in &doc.rects {
+            anchors.push(crate::face::rect_world_corners(doc, rect).unwrap()[0]);
+        }
+        for circle in &doc.circles {
+            anchors.push(crate::face::circle_world_center(doc, circle).unwrap());
+        }
+        for line in &doc.lines {
+            let (a, b) = crate::face::line_world_endpoints(doc, line).unwrap();
+            anchors.push(a);
+            anchors.push(b);
+        }
+        anchors
+    }
+
+    fn assert_world_anchors_match(before: &[glam::Vec3], after: &[glam::Vec3]) {
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "element world anchor count should match after reload"
+        );
+        for (a, b) in before.iter().zip(after) {
+            assert!(
+                (*a - *b).length() < 1e-3,
+                "world anchor {:?} should round-trip as {:?}",
+                a,
+                b
+            );
+        }
+    }
+
     #[test]
-    fn construction_planes_are_not_exported() {
+    fn world_positions_round_trip_through_save() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_construction_skip_test.le3");
+        let path = dir.join("le3_world_positions_test.le3");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
+        let offset_plane = crate::construction::plane_from_definition(
+            &crate::construction::definition_from_reference(
+                &crate::construction::PlaneReference::Face {
+                    origin: glam::Vec3::ZERO,
+                    normal: glam::Vec3::Z,
+                    label: "Ground".to_string(),
+                },
+                25.0,
+                0.0,
+            ),
+            crate::model::ConstructionPlaneParent::Root,
+        );
         let mut doc = Document {
             parameters: Vec::new(),
             sketches: Vec::new(),
@@ -396,24 +518,101 @@ mod tests {
             lines: vec![],
             circles: Vec::new(),
             constraints: Vec::new(),
-            construction_planes: vec![
-                default_xy_plane(),
-                crate::construction::plane_from_definition(
-                    &crate::construction::definition_from_reference(
-                        &crate::construction::PlaneReference::Face {
-                            origin: glam::Vec3::ZERO,
-                            normal: glam::Vec3::Z,
-                            label: "Ground".to_string(),
-                        },
-                        25.0,
-                        0.0,
-                    ),
-                    crate::model::ConstructionPlaneParent::Root,
-                ),
-            ],
+            construction_planes: vec![default_xy_plane(), offset_plane],
             shape_order: Vec::new(),
         };
-        let sketch = plane_sketch(&mut doc);
+
+        let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.circles.push(Circle::from_local_center_radius(
+            s0, 12.0, -8.0, 15.0, 0.4,
+        ));
+        doc.shape_order.push(ShapeKind::Circle);
+
+        let s1 = doc.add_sketch(FaceId::ConstructionPlane(1));
+        doc.rects
+            .push(Rect::from_local_corners(s1, 3.0, 4.0, 13.0, 14.0));
+        doc.lines.push(Line::from_local_endpoints(
+            s1, -2.0, 1.0, 8.0, 6.0,
+        ));
+        doc.shape_order.push(ShapeKind::Rect);
+        doc.shape_order.push(ShapeKind::Line);
+        doc.shape_order.push(ShapeKind::ConstructionPlane);
+
+        let s2 = doc.add_sketch(FaceId::Rect(0));
+        doc.rects
+            .push(Rect::from_local_corners(s2, 1.0, 2.0, 4.0, 5.0));
+        doc.shape_order.push(ShapeKind::Rect);
+
+        let before = element_world_anchors(&doc);
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        let after = element_world_anchors(&loaded);
+        assert_world_anchors_match(&before, &after);
+
+        let offset_rect = crate::face::rect_world_corners(&loaded, &loaded.rects[0]).unwrap();
+        assert!(
+            (offset_rect[0].z - 25.0).abs() < 1e-3,
+            "rectangle on offset plane should keep its world height"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn default_construction_plane_origin_round_trips() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("le3_plane0_origin_test.le3");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.construction_planes[0].origin.z = 30.0;
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
+        doc.shape_order.push(ShapeKind::Rect);
+
+        let before_origin = doc.construction_planes[0].origin;
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert!(
+            (loaded.construction_planes[0].origin - before_origin).length() < 1e-3,
+            "edited default plane origin should round-trip"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn construction_planes_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("le3_construction_plane_test.le3");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let offset_plane = crate::construction::plane_from_definition(
+            &crate::construction::definition_from_reference(
+                &crate::construction::PlaneReference::Face {
+                    origin: glam::Vec3::ZERO,
+                    normal: glam::Vec3::Z,
+                    label: "Ground".to_string(),
+                },
+                25.0,
+                0.0,
+            ),
+            crate::model::ConstructionPlaneParent::Root,
+        );
+        let mut doc = Document {
+            parameters: Vec::new(),
+            sketches: Vec::new(),
+            rects: Vec::new(),
+            lines: vec![],
+            circles: Vec::new(),
+            constraints: Vec::new(),
+            construction_planes: vec![default_xy_plane(), offset_plane.clone()],
+            shape_order: Vec::new(),
+        };
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(1));
         doc.rects
             .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
         doc.shape_order.push(ShapeKind::Rect);
@@ -422,9 +621,51 @@ mod tests {
         save(&path, &doc).unwrap();
         let loaded = open(&path).unwrap();
         assert_eq!(loaded.rects.len(), 1);
-        assert_eq!(loaded.construction_planes.len(), 1);
-        assert_eq!(loaded.construction_planes[0], default_xy_plane());
-        assert_eq!(loaded.shape_order, vec![ShapeKind::Sketch, ShapeKind::Rect]);
+        assert_eq!(loaded.construction_planes.len(), 2);
+        assert_eq!(loaded.construction_planes[1], offset_plane);
+        assert_eq!(
+            loaded.sketches[0].face,
+            FaceId::ConstructionPlane(1),
+            "rectangle sketch should stay on the offset plane"
+        );
+        let corners = crate::face::rect_world_corners(&loaded, &loaded.rects[0]).unwrap();
+        assert!(
+            (corners[0].z - 25.0).abs() < 1e-3,
+            "loaded rectangle should keep its offset-plane world position"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn legacy_files_without_planes_get_placeholder_indices() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("le3_legacy_plane_ref_test.le3");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let doc = Document {
+            parameters: Vec::new(),
+            sketches: vec![Sketch {
+                face: FaceId::ConstructionPlane(1),
+                name: None,
+            }],
+            rects: vec![Rect::from_local_corners(0, 0.0, 0.0, 10.0, 10.0)],
+            lines: vec![],
+            circles: Vec::new(),
+            constraints: Vec::new(),
+            construction_planes: vec![default_xy_plane()],
+            shape_order: vec![ShapeKind::Sketch, ShapeKind::Rect],
+        };
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert!(
+            loaded.construction_planes.len() >= 2,
+            "legacy sketch references to plane 1 should not crash on load"
+        );
+        assert!(
+            crate::face::rect_world_corners(&loaded, &loaded.rects[0]).is_some()
+        );
 
         std::fs::remove_file(&path).unwrap();
     }

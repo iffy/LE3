@@ -20,7 +20,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
+        id: cargo-cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # Default is false: a failed job does not update the cache, so repeated
+          # failures keep paying full dependency compile cost.
+          cache-on-failure: true
+          shared-key: ci
 
       - name: Install system dependencies
         run: |
@@ -31,6 +37,7 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libxkbcommon-dev \
+            libxkbcommon-x11-0 \
             libwayland-dev \
             libssl-dev \
             libvulkan-dev \
@@ -39,8 +46,15 @@ jobs:
             xvfb
 
       - name: cargo test
-        run: cargo test
+        run: |
+          if [[ "${{ steps.cargo-cache.outputs.cache-hit }}" == "true" ]]; then
+            echo "Cargo cache hit — dependency artifacts restored."
+          else
+            echo "Cargo cache miss — compiling dependencies (~2 min on a cold runner)."
+          fi
+          cargo test
 
+      # cargo test builds a test harness, not target/debug/le3 — needed for smoke/scripts.
       - name: cargo build
         run: cargo build
 

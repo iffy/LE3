@@ -142,6 +142,22 @@ struct ProjectedBearTriangle {
     color: Color32,
 }
 
+/// Vertex for GPU HUD bear rendering (view-cube basis, per-vertex color).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuBearVertex {
+    pub view_position: [f32; 3],
+    pub color: [f32; 4],
+}
+
+/// Indexed mesh for the HUD bear in view-cube space.
+pub struct BearGpuMesh {
+    pub vertices: Vec<GpuBearVertex>,
+    pub indices: Vec<u32>,
+    pub z_min: f32,
+    pub z_max: f32,
+}
+
 fn bear_world_normal(tri: &MeshTriangle, right: Vec3, up: Vec3, forward: Vec3) -> Vec3 {
     let mut normal = tri.normal;
     if transform_vertex(normal, right, up, forward).z >= 0.0 {
@@ -307,6 +323,77 @@ fn bear_triangle_visible(
     head_on >= BEAR_TRIANGLE_CULL_DOT
 }
 
+fn color32_to_rgba(c: Color32) -> [f32; 4] {
+    [
+        c.r() as f32 / 255.0,
+        c.g() as f32 / 255.0,
+        c.b() as f32 / 255.0,
+        c.a() as f32 / 255.0,
+    ]
+}
+
+fn wind_triangle_clockwise_view(
+    view_pts: [Vec3; 3],
+    screen_pts: [Pos2; 3],
+    zs: [f32; 3],
+) -> ([Vec3; 3], [f32; 3]) {
+    let a = screen_pts[1] - screen_pts[0];
+    let b = screen_pts[2] - screen_pts[0];
+    if a.x * b.y - a.y * b.x < 0.0 {
+        ([view_pts[0], view_pts[2], view_pts[1]], [zs[0], zs[2], zs[1]])
+    } else {
+        (view_pts, zs)
+    }
+}
+
+/// Build an indexed mesh for GPU bear rendering (same culling/shading as [`project_bear`]).
+pub fn build_bear_gpu_mesh(cam: &Camera, center: Pos2, scale: f32) -> BearGpuMesh {
+    let (right, up, forward) = view_cube_basis(cam);
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut z_min = f32::INFINITY;
+    let mut z_max = f32::NEG_INFINITY;
+
+    for tri in bear_mesh() {
+        let view_pts = tri.vertices.map(|v| transform_vertex(v, right, up, forward));
+        if !bear_triangle_visible(tri, right, up, forward) {
+            continue;
+        }
+
+        let screen_pts = view_pts.map(|v| project_to_hud(v, center, scale));
+        let zs = [view_pts[0].z, view_pts[1].z, view_pts[2].z];
+        let (screen_pts, zs) = wind_triangle_clockwise_with_z(screen_pts, zs);
+        if tri_screen_area(screen_pts) < 0.25 {
+            continue;
+        }
+
+        let (view_pts, _zs) = wind_triangle_clockwise_view(view_pts, screen_pts, zs);
+        let color = color32_to_rgba(shade_bear_color(bear_world_normal(tri, right, up, forward)));
+        let base = vertices.len() as u32;
+        for (vp, z) in view_pts.into_iter().zip(zs) {
+            z_min = z_min.min(z);
+            z_max = z_max.max(z);
+            vertices.push(GpuBearVertex {
+                view_position: vp.to_array(),
+                color,
+            });
+        }
+        indices.extend([base, base + 1, base + 2]);
+    }
+
+    if vertices.is_empty() {
+        z_min = 0.0;
+        z_max = 1.0;
+    }
+
+    BearGpuMesh {
+        vertices,
+        indices,
+        z_min,
+        z_max,
+    }
+}
+
 fn project_bear(cam: &Camera, center: Pos2, scale: f32) -> Vec<ProjectedBearTriangle> {
     let (right, up, forward) = view_cube_basis(cam);
 
@@ -332,11 +419,38 @@ fn project_bear(cam: &Camera, center: Pos2, scale: f32) -> Vec<ProjectedBearTria
     triangles
 }
 
-fn draw_bear(ui: &Ui, painter: &Painter, raster_rect: Rect, triangles: &[ProjectedBearTriangle]) {
+fn draw_bear(
+    ui: &Ui,
+    painter: &Painter,
+    raster_rect: Rect,
+    cam: &Camera,
+    center: Pos2,
+    scale: f32,
+    render_state: Option<&eframe::egui_wgpu::RenderState>,
+    gpu_bear: bool,
+) {
+    if gpu_bear {
+        if let Some(render_state) = render_state {
+            let mesh = build_bear_gpu_mesh(cam, center, scale);
+            if !mesh.indices.is_empty() {
+                let scene = crate::gpu_view_cube::BearGpuScene {
+                    mesh,
+                    rect: raster_rect,
+                    center,
+                    scale,
+                };
+                if crate::gpu_view_cube::paint(Some(render_state), painter, raster_rect, scene) {
+                    return;
+                }
+            }
+        }
+    }
+
+    let triangles = project_bear(cam, center, scale);
     if triangles.is_empty() {
         return;
     }
-    let image = rasterize_bear(triangles, raster_rect);
+    let image = rasterize_bear(&triangles, raster_rect);
     let ctx = ui.ctx();
     let bear_tex_storage = Id::new("view_cube_bear_raster");
 
@@ -1193,7 +1307,13 @@ fn cube_rect_in_viewport(viewport: Rect) -> Rect {
 }
 
 /// Show the view-cube HUD overlay in the top-right of `viewport`.
-pub fn show_hud(ctx: &egui::Context, cam: &mut Camera, viewport: Rect) {
+pub fn show_hud(
+    ctx: &egui::Context,
+    cam: &mut Camera,
+    viewport: Rect,
+    render_state: Option<&eframe::egui_wgpu::RenderState>,
+    gpu_bear: bool,
+) {
     let screen_rect = cube_rect_in_viewport(viewport);
     egui::Area::new(egui::Id::new("view_cube_hud"))
         .fixed_pos(screen_rect.min)
@@ -1201,19 +1321,24 @@ pub fn show_hud(ctx: &egui::Context, cam: &mut Camera, viewport: Rect) {
         .interactable(true)
         .constrain(false)
         .show(ctx, |ui| {
-            show(ui, cam, screen_rect);
+            show(ui, cam, screen_rect, render_state, gpu_bear);
         });
 }
 
 /// Draw and handle input for the view-cube HUD. All geometry uses screen coordinates.
-fn show(ui: &mut Ui, cam: &mut Camera, screen_rect: Rect) {
+fn show(
+    ui: &mut Ui,
+    cam: &mut Camera,
+    screen_rect: Rect,
+    render_state: Option<&eframe::egui_wgpu::RenderState>,
+    gpu_bear: bool,
+) {
     let center = screen_rect.center();
     let scale = CUBE_SIZE * 0.42;
 
     let faces = project_faces(cam, center, scale);
     let edges = project_edges(cam, center, scale);
     let corners = project_corners(cam, center, scale);
-    let bear_triangles = project_bear(cam, center, scale);
 
     let response = ui.allocate_rect(screen_rect, Sense::click_and_drag());
 
@@ -1266,7 +1391,16 @@ fn show(ui: &mut Ui, cam: &mut Camera, screen_rect: Rect) {
     draw_axes(ui, &axes);
 
     let painter = ui.painter();
-    draw_bear(ui, painter, screen_rect, &bear_triangles);
+    draw_bear(
+        ui,
+        painter,
+        screen_rect,
+        cam,
+        center,
+        scale,
+        render_state,
+        gpu_bear,
+    );
     if let Some(view) = hover_face {
         if let Some(face) = faces.iter().find(|f| f.view == view) {
             draw_hovered_face(painter, face);
@@ -1435,6 +1569,40 @@ mod tests {
         let center = Pos2::new(120.0, 120.0);
         let triangles = project_bear(&cam, center, 40.0);
         assert!(!triangles.is_empty(), "bear should have visible triangles");
+    }
+
+    #[test]
+    fn bear_gpu_mesh_matches_cpu_triangle_count() {
+        let cam = Camera::default();
+        let center = Pos2::new(120.0, 120.0);
+        let scale = 40.0;
+        let cpu = project_bear(&cam, center, scale);
+        let gpu = build_bear_gpu_mesh(&cam, center, scale);
+        assert_eq!(
+            gpu.indices.len() / 3,
+            cpu.len(),
+            "GPU mesh should include the same visible triangles as CPU projection"
+        );
+        assert!(!gpu.vertices.is_empty());
+        assert!(gpu.z_min <= gpu.z_max);
+    }
+
+    #[test]
+    fn bear_gpu_mesh_builds_for_many_orientations() {
+        let center = Pos2::new(60.0, 60.0);
+        let scale = CUBE_SIZE * 0.42;
+        for yaw in [0.0, 0.8, 2.2] {
+            for pitch in [-0.5, 0.0, 0.6] {
+                let mut cam = Camera::default();
+                cam.yaw = yaw;
+                cam.pitch = pitch;
+                let mesh = build_bear_gpu_mesh(&cam, center, scale);
+                assert!(
+                    mesh.indices.len() >= 3 * 20,
+                    "yaw={yaw} pitch={pitch}: expected a substantial bear mesh"
+                );
+            }
+        }
     }
 
     #[test]

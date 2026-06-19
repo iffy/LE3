@@ -216,6 +216,20 @@ pub fn uv_dir_to_world(u_axis: Vec3, v_axis: Vec3, du: f32, dv: f32) -> Vec3 {
     (u_axis * du + v_axis * dv).normalize_or_zero()
 }
 
+/// World axis for dimension arrow wings: perpendicular to the dimension line in the sketch plane.
+pub fn dimension_arrow_wing_world(along: Vec3, outward: Vec3) -> Vec3 {
+    let along = along.normalize_or_zero();
+    if along.length_squared() < 1e-8 {
+        return Vec3::ZERO;
+    }
+    let outward = outward.normalize_or_zero();
+    let plane_n = along.cross(outward);
+    if plane_n.length_squared() > 1e-8 {
+        return plane_n.cross(along).normalize_or_zero();
+    }
+    Vec3::ZERO
+}
+
 pub fn pixels_to_world_distance(
     project: &impl Fn(Vec3) -> Option<Pos2>,
     anchor: Vec3,
@@ -428,11 +442,11 @@ where
     (along, text_up)
 }
 
-fn bilinear_quad(tl: Pos2, tr: Pos2, br: Pos2, bl: Pos2, u: f32, v: f32) -> Pos2 {
+pub fn bilinear_quad_screen(tl: Pos2, tr: Pos2, br: Pos2, bl: Pos2, u: f32, v: f32) -> Pos2 {
     tl.lerp(tr, u).lerp(bl.lerp(br, u), v)
 }
 
-fn planar_label_corners_world<Project>(
+pub fn planar_label_corners_world<Project>(
     world: &LinearDimensionWorldGeom,
     view: &PlanarLabelView,
     galley_size: Vec2,
@@ -448,19 +462,21 @@ where
         pixels_to_world_distance(project, world.label_center, along_w, 1.0);
     let outward_per_px =
         pixels_to_world_distance(project, world.label_center, offset_outward, 1.0);
+    let text_up_per_px =
+        pixels_to_world_distance(project, world.label_center, text_up_w, 1.0);
     let anchor = world_label_anchor(world.label_center, offset_outward, half.y, outward_per_px);
     let top_left =
-        anchor - along_w * (half.x * along_per_px) + text_up_w * (half.y * outward_per_px);
+        anchor - along_w * (half.x * along_per_px) + text_up_w * (half.y * text_up_per_px);
     let size = galley_size;
     Some([
         top_left,
         top_left + along_w * (size.x * along_per_px),
-        top_left + along_w * (size.x * along_per_px) - text_up_w * (size.y * outward_per_px),
-        top_left - text_up_w * (size.y * outward_per_px),
+        top_left + along_w * (size.x * along_per_px) - text_up_w * (size.y * text_up_per_px),
+        top_left - text_up_w * (size.y * text_up_per_px),
     ])
 }
 
-fn planar_label_corners_screen<Project>(
+pub fn planar_label_corners_screen<Project>(
     corners_world: &[Vec3; 4],
     project: &Project,
 ) -> Option<[Pos2; 4]>
@@ -563,7 +579,7 @@ where
                 glyph_color = color;
             }
             mesh.vertices.push(Vertex {
-                pos: bilinear_quad(tl, tr, br, bl, u, v),
+                pos: bilinear_quad_screen(tl, tr, br, bl, u, v),
                 uv: (vertex.uv.to_vec2() * uv_norm).to_pos2(),
                 color: glyph_color,
             });
@@ -729,6 +745,31 @@ mod tests {
     fn circle_diameter_label_moves_outside_when_too_small() {
         let outward = circle_diameter_label_outward_px(30.0, 56.0, 14.0, None);
         assert!(outward > 15.0, "label should clear the circle, got {outward}");
+    }
+
+    #[test]
+    fn dimension_arrow_wings_are_in_sketch_plane_not_plane_normal() {
+        let along = Vec3::X;
+        let outward = Vec3::Y;
+        let plane_normal = Vec3::Z;
+        let wing = dimension_arrow_wing_world(along, outward);
+        assert!(
+            wing.dot(plane_normal).abs() < 1e-5,
+            "wings should lie in the sketch plane"
+        );
+        assert!(
+            wing.dot(along).abs() < 1e-5,
+            "wings should be perpendicular to the dimension line"
+        );
+        assert!(
+            (wing - outward).length() < 1e-4,
+            "wing axis should align with the in-plane outward direction"
+        );
+        let wrong = along.cross(outward);
+        assert!(
+            wing.dot(wrong).abs() < 1e-5,
+            "wing axis must not be the sketch-plane normal"
+        );
     }
 
     #[test]
