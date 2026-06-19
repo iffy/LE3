@@ -21,6 +21,7 @@ pub enum PaletteCommandId {
     ToolSketch,
     ToolRectangle,
     ToolLine,
+    ToolDimension,
     ToolPlane,
     ExitSketch,
     CommitRectangle,
@@ -86,6 +87,9 @@ impl PaletteCommand {
                 PaletteOutcome::Action(Action::SetTool(Tool::Rectangle))
             }
             PaletteCommandId::ToolLine => PaletteOutcome::Action(Action::SetTool(Tool::Line)),
+            PaletteCommandId::ToolDimension => {
+                PaletteOutcome::Action(Action::SetTool(Tool::Dimension))
+            }
             PaletteCommandId::ToolPlane => {
                 PaletteOutcome::Action(Action::SetTool(Tool::ConstructionPlane))
             }
@@ -335,6 +339,11 @@ const BASE_COMMANDS: &[PaletteCommand] = &[
         "rectangle tool rect draw",
     ),
     PaletteCommand::new(PaletteCommandId::ToolLine, "Line Tool", "line tool draw segment"),
+    PaletteCommand::new(
+        PaletteCommandId::ToolDimension,
+        "Dimension Tool",
+        "dimension tool distance constraint length",
+    ),
     PaletteCommand::new(
         PaletteCommandId::ToolPlane,
         "Construction Plane Tool",

@@ -1,6 +1,7 @@
 //! Document parameters: named length expressions that drive sketch dimensions.
 
 use crate::actions::{Action, ActionResult, AppState};
+use crate::constraints::{propagate_parameter_rename_to_constraints, solve_document_constraints};
 use crate::model::{Document, Parameter};
 use crate::value::{
     eval_length_mm_in_doc, eval_length_mm_with_params, expression_references_document_parameter,
@@ -160,57 +161,12 @@ pub fn propagate_parameter_rename(doc: &mut Document, old: &str, new: &str) {
             *expr = substitute_parameter_name(expr, old, new);
         }
     }
+    propagate_parameter_rename_to_constraints(doc, old, new);
 }
 
-/// Re-evaluate locked sketch dimensions from their stored expressions.
+/// Re-evaluate sketch constraints and apply solved geometry.
 pub fn recompute_document_geometry(doc: &mut Document) -> Result<(), String> {
-    for i in 0..doc.rects.len() {
-        if doc.rects[i].width_locked {
-            if let Some(expr) = doc.rects[i].width_expr.clone() {
-                let w = eval_length_mm_in_doc(&expr, doc)
-                    .ok_or_else(|| format!("Invalid width expression '{expr}'"))?;
-                if w <= 0.0 {
-                    return Err(format!("Width expression '{expr}' must be positive"));
-                }
-                doc.rects[i].w = w;
-            }
-        }
-        if doc.rects[i].height_locked {
-            if let Some(expr) = doc.rects[i].height_expr.clone() {
-                let h = eval_length_mm_in_doc(&expr, doc)
-                    .ok_or_else(|| format!("Invalid height expression '{expr}'"))?;
-                if h <= 0.0 {
-                    return Err(format!("Height expression '{expr}' must be positive"));
-                }
-                doc.rects[i].h = h;
-            }
-        }
-    }
-    for i in 0..doc.lines.len() {
-        if !doc.lines[i].length_locked {
-            continue;
-        }
-        let Some(expr) = doc.lines[i].length_expr.clone() else {
-            continue;
-        };
-        let len = eval_length_mm_in_doc(&expr, doc)
-            .ok_or_else(|| format!("Invalid length expression '{expr}'"))?;
-        if len <= 0.0 {
-            return Err(format!("Length expression '{expr}' must be positive"));
-        }
-        let du = doc.lines[i].x1 - doc.lines[i].x0;
-        let dv = doc.lines[i].y1 - doc.lines[i].y0;
-        let dist = (du * du + dv * dv).sqrt();
-        if dist < 1e-6 {
-            doc.lines[i].x1 = doc.lines[i].x0 + len;
-            doc.lines[i].y1 = doc.lines[i].y0;
-        } else {
-            let scale = len / dist;
-            doc.lines[i].x1 = doc.lines[i].x0 + du * scale;
-            doc.lines[i].y1 = doc.lines[i].y0 + dv * scale;
-        }
-    }
-    Ok(())
+    solve_document_constraints(doc)
 }
 
 pub fn validate_new_parameter_name(doc: &Document, name: &str, except: Option<usize>) -> Result<(), String> {
@@ -684,7 +640,8 @@ pub fn show_pane(ui: &mut egui::Ui, app: &mut AppState) {
 mod tests {
     use super::*;
     use crate::actions::{Action, ActionResult, AppState};
-    use crate::model::{Document, FaceId, ShapeKind};
+    use crate::constraints::add_distance_constraint;
+    use crate::model::{DistanceTarget, Document, FaceId, ShapeKind};
     use crate::Rect;
 
     fn doc_with_param_a() -> Document {
@@ -725,11 +682,16 @@ mod tests {
     fn parameter_value_change_recomputes_rectangle_width() {
         let mut doc = doc_with_param_a();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 5.0, 10.0);
-        rect.width_locked = true;
-        rect.width_expr = Some("A".to_string());
-        doc.rects.push(rect);
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 5.0, 10.0));
         doc.shape_order.push(ShapeKind::Rect);
+        add_distance_constraint(
+            &mut doc,
+            sketch,
+            DistanceTarget::RectWidth(0),
+            "A".to_string(),
+        )
+        .unwrap();
 
         set_parameter_expression(&mut doc, 0, "10mm".to_string()).unwrap();
         assert!((doc.rects[0].w - 10.0).abs() < 1e-3);
@@ -739,10 +701,16 @@ mod tests {
     fn rectangle_with_parameter_expression_evaluates_on_recompute() {
         let mut doc = doc_with_param_a();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 10.0);
-        rect.width_locked = true;
-        rect.width_expr = Some("A + 5in".to_string());
-        doc.rects.push(rect);
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 10.0));
+        doc.shape_order.push(ShapeKind::Rect);
+        add_distance_constraint(
+            &mut doc,
+            sketch,
+            DistanceTarget::RectWidth(0),
+            "A + 5in".to_string(),
+        )
+        .unwrap();
         recompute_document_geometry(&mut doc).unwrap();
         assert!((doc.rects[0].w - (5.0 + 5.0 * 25.4)).abs() < 1e-2);
     }
@@ -795,11 +763,16 @@ mod tests {
         let mut state = AppState::default();
         add_parameter(&mut state.doc, "A".to_string(), "5mm".to_string()).unwrap();
         let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 5.0, 10.0);
-        rect.width_locked = true;
-        rect.width_expr = Some("A".to_string());
-        state.doc.rects.push(rect);
+        state.doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 5.0, 10.0));
         state.doc.shape_order.push(ShapeKind::Rect);
+        add_distance_constraint(
+            &mut state.doc,
+            sketch,
+            DistanceTarget::RectWidth(0),
+            "A".to_string(),
+        )
+        .unwrap();
 
         assert_eq!(
             state.apply(Action::CommitParameterExpression {

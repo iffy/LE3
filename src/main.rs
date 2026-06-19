@@ -13,6 +13,7 @@
 mod actions;
 mod camera;
 mod command_palette;
+mod constraints;
 mod context;
 mod construction;
 mod dimensions;
@@ -32,8 +33,12 @@ mod value;
 mod view_cube;
 
 use actions::{
-    Action, AppState, CreatingLine, CreatingRect, DimLabelTarget, Pane, RectAxis, SketchSession,
-    Tool,
+    Action, AppState, CreatingLine, CreatingRect, DimEditTarget, DimLabelTarget, Pane, RectAxis,
+    SketchSession, Tool,
+};
+use constraints::{
+    constraint_evaluated_length, constraint_segment_endpoints, distance_target_from_pick,
+    distance_target_segment_endpoints,
 };
 use command_palette::{commands_for_state, filter_commands, show_palette, PaletteOutcome};
 use hierarchy::SceneElement;
@@ -56,7 +61,7 @@ use face::{
     sketch_geometry_frame, sketch_label, world_to_local,
 };
 use model::SketchId;
-use model::{FaceId, Line, Rect, RectEdge};
+use model::{ConstraintKind, DistanceTarget, FaceId, Line, Rect, RectEdge};
 use eframe::egui;
 use native_menu::{MenuCommand, NativeMenu};
 use glam::Vec3;
@@ -153,12 +158,14 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+const DIM_LABEL_DRAG_THRESHOLD_PX: f32 = 4.0;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DimLabelDrag {
     target: DimLabelTarget,
     outward: egui::Vec2,
     start_offset: f32,
-    start_screen: egui::Pos2,
+    anchor_screen: egui::Pos2,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -328,6 +335,16 @@ impl App {
                 }
             }
 
+            if self.state.creating_rect.is_none()
+                && self.state.creating_line.is_none()
+                && self.state.creating_plane.is_none()
+                && ctx.input(|i| i.key_pressed(egui::Key::D))
+            {
+                if self.state.tool != Tool::Dimension {
+                    self.state.apply(Action::SetTool(Tool::Dimension));
+                }
+            }
+
             if ctx.input(|i| i.key_pressed(egui::Key::X)) {
                 self.state.apply(Action::ToggleConstruction);
             }
@@ -341,6 +358,9 @@ impl App {
         }
         if self.state.tool != Tool::ConstructionPlane {
             self.state.creating_plane = None;
+        }
+        if !matches!(self.state.tool, Tool::Select | Tool::Dimension) {
+            self.state.editing_committed_dim = None;
         }
     }
 
@@ -464,6 +484,18 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.state.apply(Action::SetTool(Tool::Line));
+                }
+                if ui
+                    .selectable_label(
+                        self.state.tool == Tool::Dimension,
+                        shortcuts::compact_label(
+                            "Dimension",
+                            shortcuts::tool_shortcut(Tool::Dimension),
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.state.apply(Action::SetTool(Tool::Dimension));
                 }
                 ui.selectable_value(
                     &mut self.state.tool,
@@ -1168,80 +1200,51 @@ fn build_committed_dim_layouts(
         return Vec::new();
     };
     let mut layouts = Vec::new();
-    for (index, rect) in doc
-        .rects
+    for (index, constraint) in doc
+        .constraints
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.sketch == session.sketch)
+        .filter(|(_, c)| c.sketch == session.sketch)
     {
-        let Some(corners) = rect_world_corners(doc, rect) else {
+        let ConstraintKind::Distance { target } = constraint.kind;
+        let Some((a, b)) = constraint_segment_endpoints(doc, index) else {
             continue;
         };
-        let interior = corners.iter().fold(Vec3::ZERO, |acc, c| acc + *c) / 4.0;
-        let (iu, iv) = world_to_local(&frame, interior);
-        if rect.width_locked {
-            let (a, b) = rect_highlight_edge(corners, RectDimEdge::Width);
-            let (ua, va) = world_to_local(&frame, a);
-            let (ub, vb) = world_to_local(&frame, b);
-            let outward_uv = outward_perpendicular_uv(ua, va, ub, vb, iu, iv);
-            push_committed_dim_layout(
-                &mut layouts,
-                painter,
-                &project,
-                label_view,
-                &frame,
-                DimLabelTarget::RectWidth { index },
-                a,
-                b,
-                outward_uv,
-                effective_dim_offset(rect.width_dim_offset),
-                format_length_display(rect.w),
-            );
-        }
-        if rect.height_locked {
-            let (a, b) = rect_highlight_edge(corners, RectDimEdge::Height);
-            let (ua, va) = world_to_local(&frame, a);
-            let (ub, vb) = world_to_local(&frame, b);
-            let outward_uv = outward_perpendicular_uv(ua, va, ub, vb, iu, iv);
-            push_committed_dim_layout(
-                &mut layouts,
-                painter,
-                &project,
-                label_view,
-                &frame,
-                DimLabelTarget::RectHeight { index },
-                a,
-                b,
-                outward_uv,
-                effective_dim_offset(rect.height_dim_offset),
-                format_length_display(rect.h),
-            );
-        }
-    }
-    for (index, line) in doc
-        .lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.sketch == session.sketch && l.length_locked)
-    {
-        let Some((a, b)) = line_world_endpoints(doc, line) else {
-            continue;
+        let outward_uv = match target {
+            DistanceTarget::LineLength(_) => {
+                let (ua, va) = world_to_local(&frame, a);
+                let (ub, vb) = world_to_local(&frame, b);
+                preferred_outward_uv(ua, va, ub, vb)
+            }
+            DistanceTarget::RectWidth(i) | DistanceTarget::RectHeight(i) => {
+                let Some(rect) = doc.rects.get(i) else {
+                    continue;
+                };
+                let Some(corners) = rect_world_corners(doc, rect) else {
+                    continue;
+                };
+                let interior = corners.iter().fold(Vec3::ZERO, |acc, c| acc + *c) / 4.0;
+                let (iu, iv) = world_to_local(&frame, interior);
+                let (ua, va) = world_to_local(&frame, a);
+                let (ub, vb) = world_to_local(&frame, b);
+                outward_perpendicular_uv(ua, va, ub, vb, iu, iv)
+            }
         };
-        let (ua, va) = world_to_local(&frame, a);
-        let (ub, vb) = world_to_local(&frame, b);
-        let outward_uv = preferred_outward_uv(ua, va, ub, vb);
+        let label = constraint_evaluated_length(doc, index)
+            .map(format_length_display)
+            .unwrap_or_else(|| "?".to_string());
         push_committed_dim_layout(
             &mut layouts,
             painter,
             &project,
             label_view,
             &frame,
-            DimLabelTarget::LineLength { index },
+            index,
             a,
             b,
             outward_uv,
-            effective_dim_offset(line.length_dim_offset),
-            format_length_display(line.length()),
+            effective_dim_offset(constraint.dim_offset),
+            label,
         );
     }
     layouts
@@ -1285,7 +1288,7 @@ fn handle_committed_dim_label_double_click(
     layouts: &[CommittedDimLayout],
     state: &mut AppState,
 ) -> bool {
-    if state.tool != Tool::Select || state.editing_committed_dim.is_some() {
+    if !state.can_edit_sketch_dimensions() || state.editing_committed_dim.is_some() {
         return false;
     }
     if !ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
@@ -1307,7 +1310,7 @@ fn handle_committed_dim_label_drag(
     drag: &mut Option<DimLabelDrag>,
     state: &mut AppState,
 ) -> bool {
-    if state.tool != Tool::Select || state.editing_committed_dim.is_some() {
+    if !state.can_edit_sketch_dimensions() || state.editing_committed_dim.is_some() {
         return false;
     }
 
@@ -1315,34 +1318,42 @@ fn handle_committed_dim_label_drag(
     let primary_down = ui.input(|i| i.pointer.primary_down());
     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
     let primary_released = ui.input(|i| i.pointer.primary_released());
+    let double_clicked =
+        ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
 
     if let Some(active) = drag.as_ref() {
-        if primary_released {
+        if primary_released || double_clicked {
             *drag = None;
-            return true;
+            return !double_clicked;
         }
         if primary_down {
             if let Some(pos) = pointer {
-                let delta = (pos - active.start_screen).dot(active.outward);
-                let offset = effective_dim_offset(Some(active.start_offset + delta));
-                state.apply(Action::SetDimLabelOffset {
-                    target: active.target,
-                    offset,
-                });
+                let moved = (pos - active.anchor_screen).length();
+                if moved >= DIM_LABEL_DRAG_THRESHOLD_PX {
+                    let delta = (pos - active.anchor_screen).dot(active.outward);
+                    let offset = effective_dim_offset(Some(active.start_offset + delta));
+                    state.apply(Action::SetDimLabelOffset {
+                        target: active.target,
+                        offset,
+                    });
+                    return true;
+                }
             }
-            return true;
+            return layouts.iter().any(|layout| {
+                pointer.is_some_and(|pos| layout.label_rect.contains(pos))
+            });
         }
         *drag = None;
     }
 
-    if primary_pressed {
+    if primary_pressed && !double_clicked {
         if let Some(pos) = pointer {
             if let Some(hit) = layouts.iter().rev().find(|h| h.label_rect.contains(pos)) {
                 *drag = Some(DimLabelDrag {
                     target: hit.target,
                     outward: hit.outward,
                     start_offset: hit.offset,
-                    start_screen: pos,
+                    anchor_screen: pos,
                 });
                 return true;
             }
@@ -1494,11 +1505,13 @@ impl App {
         });
         let pointer_screen = response.hover_pos().or(response.interact_pointer_pos());
         let layouts_slice = committed_dim_layouts.as_deref().unwrap_or(&[]);
-        let over_committed_dim_label = self.state.tool == Tool::Select
+        let over_committed_dim_label = self.state.can_edit_sketch_dimensions()
             && (pointer_screen.is_some_and(|pp| {
                 pointer_over_committed_dim_label(layouts_slice, pp)
             }) || self.dim_label_drag.is_some());
-        handle_committed_dim_label_double_click(ui, layouts_slice, &mut self.state);
+        if handle_committed_dim_label_double_click(ui, layouts_slice, &mut self.state) {
+            self.dim_label_drag = None;
+        }
         if handle_committed_dim_label_drag(
             ui,
             layouts_slice,
@@ -1716,6 +1729,50 @@ impl App {
                     }
                     if commit_click {
                         self.state.apply(Action::CommitLine);
+                    }
+                }
+            }
+        }
+
+        if self.state.tool == Tool::Dimension {
+            if let (Some(session), Some(pp)) =
+                (self.state.sketch_session, pointer_screen)
+            {
+                if let Some(gp) =
+                    sketch_plane_point(&cam, viewport, &vp, &self.state.doc, session, pp)
+                {
+                    let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+                    if self.state.editing_committed_dim.is_none()
+                        && primary_pressed
+                        && !over_committed_dim_label
+                    {
+                        if let Some(target) =
+                            resolve_pick_target(pp, &project, Some(gp), &self.state.doc)
+                        {
+                            if let Some(distance_target) = distance_target_from_pick(
+                                &self.state.doc,
+                                session.sketch,
+                                &target.kind,
+                            ) {
+                                self.state.apply(Action::BeginDimensionEdit {
+                                    target: distance_target,
+                                });
+                            }
+                        }
+                    } else if self.state.editing_committed_dim.is_none() {
+                        if let Some(target) =
+                            resolve_pick_target(pp, &project, Some(gp), &self.state.doc)
+                        {
+                            if distance_target_from_pick(
+                                &self.state.doc,
+                                session.sketch,
+                                &target.kind,
+                            )
+                            .is_some()
+                            {
+                                target.draw_highlight(&painter, &project, &self.state.doc);
+                            }
+                        }
                     }
                 }
             }
@@ -1978,28 +2035,51 @@ impl App {
             if let (Some(layouts), Some(view)) = (&committed_dim_layouts, planar_label_view) {
                 draw_committed_dim_layouts(&painter, layouts, &view, &project);
                 if let Some(edit) = &mut self.state.editing_committed_dim {
-                    if let Some(layout) = layouts.iter().find(|l| l.target == edit.target) {
+                    let constraint_id = match &edit.target {
+                        DimEditTarget::Constraint(id) => Some(*id),
+                        DimEditTarget::New(_) => None,
+                    };
+                    let input_layout = if let Some(id) = constraint_id {
+                        layouts
+                            .iter()
+                            .find(|l| l.target == id)
+                            .map(|layout| {
+                                dim_input_layout_centered_on(layout.label_rect, &edit.text)
+                            })
+                    } else if let Some(target) = edit.target.distance_target(&self.state.doc) {
+                        distance_target_segment_endpoints(&self.state.doc, target).and_then(
+                            |(a, b)| {
+                                project(a).zip(project(b)).map(|(pa, pb)| {
+                                    line_dim_layout(pa, pb, &edit.text)
+                                })
+                            },
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(input_layout) = input_layout {
                         let ctx = ui.ctx();
                         let id = egui::Id::new(("committed_dim", format!("{:?}", edit.target)));
-                        let input_layout =
-                            dim_input_layout_centered_on(layout.label_rect, &edit.text);
                         let mut commit_dim = false;
-                        egui::Area::new(egui::Id::new(("committed_dim_area", format!("{:?}", edit.target))))
-                            .fixed_pos(input_layout.pos)
-                            .order(egui::Order::Foreground)
-                            .show(ctx, |ui| {
-                                let result = show_sketch_dimension_field(
-                                    ui,
-                                    ctx,
-                                    id,
-                                    &mut edit.text,
-                                    &self.state.doc,
-                                    true,
-                                    &mut edit.pending_focus,
-                                    true,
-                                );
-                                commit_dim = result.enter_commit;
-                            });
+                        egui::Area::new(egui::Id::new((
+                            "committed_dim_area",
+                            format!("{:?}", edit.target),
+                        )))
+                        .fixed_pos(input_layout.pos)
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            let result = show_sketch_dimension_field(
+                                ui,
+                                ctx,
+                                id,
+                                &mut edit.text,
+                                &self.state.doc,
+                                true,
+                                &mut edit.pending_focus,
+                                true,
+                            );
+                            commit_dim = result.enter_commit;
+                        });
                         let dim_focused = ctx.memory(|m| m.focused()) == Some(id);
                         if edit.pending_focus {
                             ctx.memory_mut(|m| m.request_focus(id));
@@ -2012,50 +2092,19 @@ impl App {
                         if commit_committed_dim && !commit_dim {
                             consume_sketch_dimension_enter(ui);
                         }
-                        match edit.target {
-                            DimLabelTarget::RectWidth { index }
-                            | DimLabelTarget::RectHeight { index } => {
-                                if let Some(rect) = self.state.doc.rects.get(index) {
-                                    if let Some(corners) =
-                                        rect_world_corners(&self.state.doc, rect)
-                                    {
-                                        let edge = match edit.target {
-                                            DimLabelTarget::RectWidth { .. } => {
-                                                RectDimEdge::Width
-                                            }
-                                            DimLabelTarget::RectHeight { .. } => {
-                                                RectDimEdge::Height
-                                            }
-                                            _ => unreachable!(),
-                                        };
-                                        let (a, b) = rect_highlight_edge(corners, edge);
-                                        draw_world_segment(
-                                            &painter,
-                                            &project,
-                                            a,
-                                            b,
-                                            col::DIM_EDGE_HIGHLIGHT,
-                                            3.5,
-                                        );
-                                    }
-                                }
-                            }
-                            DimLabelTarget::LineLength { index } => {
-                                if let Some(line) = self.state.doc.lines.get(index) {
-                                    if let Some((a, b)) =
-                                        line_world_endpoints(&self.state.doc, line)
-                                    {
-                                        draw_world_segment(
-                                            &painter,
-                                            &project,
-                                            a,
-                                            b,
-                                            col::DIM_EDGE_HIGHLIGHT,
-                                            3.5,
-                                        );
-                                    }
-                                }
-                            }
+                    }
+                    if let Some(target) = edit.target.distance_target(&self.state.doc) {
+                        if let Some((a, b)) =
+                            distance_target_segment_endpoints(&self.state.doc, target)
+                        {
+                            draw_world_segment(
+                                &painter,
+                                &project,
+                                a,
+                                b,
+                                col::DIM_EDGE_HIGHLIGHT,
+                                3.5,
+                            );
                         }
                     }
                 }
@@ -2494,7 +2543,7 @@ impl App {
                 if self.state.editing_committed_dim.is_some() {
                     "Edit dimension • Enter to commit • Esc to cancel"
                 } else if self.state.sketch_session.is_some() {
-                    "Sketch mode — double-click dimension to edit • drag labels to reposition • Esc: exit sketch"
+                    "Sketch mode — double-click a dimension label to edit • drag labels to reposition • Esc: exit sketch"
                 } else {
                     "Click lines/edges to select • ⌘/Ctrl+click multi-select • Right-drag: orbit  •  Wheel: zoom  •  s: sketch  •  p: plane"
                 }
@@ -2518,6 +2567,15 @@ impl App {
                     "l: line  •  Click a face to sketch on  •  Right-drag: orbit  • Shift+right-drag: pan  •  Wheel: zoom"
                 } else {
                     "l: line  •  Left-click to set start • move to aim • Right-drag: orbit  • Shift+right-drag: pan  •  Wheel: zoom"
+                }
+            }
+            Tool::Dimension => {
+                if self.state.editing_committed_dim.is_some() {
+                    "Edit dimension • Enter to commit • Esc to cancel"
+                } else if self.state.sketch_session.is_none() {
+                    "d: dimension  •  Open a sketch to add distance constraints"
+                } else {
+                    "d: dimension  •  Click a line segment • type length • Enter commit"
                 }
             }
             Tool::ConstructionPlane => {

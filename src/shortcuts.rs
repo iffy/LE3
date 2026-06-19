@@ -78,6 +78,7 @@ pub fn tool_shortcut(tool: Tool) -> Option<ShortcutHint> {
         Tool::Rectangle => Some(ShortcutHint::plain("R")),
         Tool::Line => Some(ShortcutHint::plain("L")),
         Tool::ConstructionPlane => Some(ShortcutHint::plain("P")),
+        Tool::Dimension => Some(ShortcutHint::plain("D")),
         Tool::Select => None,
     }
 }
@@ -97,6 +98,7 @@ pub fn palette_command_shortcut(id: PaletteCommandId) -> Option<ShortcutHint> {
         PaletteCommandId::ToolRectangle => tool_shortcut(Tool::Rectangle),
         PaletteCommandId::ToolLine => tool_shortcut(Tool::Line),
         PaletteCommandId::ToolPlane => tool_shortcut(Tool::ConstructionPlane),
+        PaletteCommandId::ToolDimension => tool_shortcut(Tool::Dimension),
         PaletteCommandId::CancelOperation => Some(CANCEL_OPERATION),
         PaletteCommandId::CommitRectangle
         | PaletteCommandId::CommitLine

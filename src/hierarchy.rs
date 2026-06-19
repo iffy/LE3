@@ -4,6 +4,7 @@
 pub const PANE_TITLE: &str = "Elements";
 
 use crate::actions::SketchSession;
+use crate::constraints::constraint_label;
 use crate::model::{ConstructionPlaneParent, Document, FaceId, RectEdge, ShapeKind, SketchId};
 use crate::selection::SceneSelection;
 use eframe::egui::{self, Color32, RichText};
@@ -16,6 +17,7 @@ pub enum HierarchyNode {
     Sketch(SketchId),
     Rect(usize),
     Line(usize),
+    Constraint(usize),
 }
 
 /// Identifies an element whose visibility can be toggled.
@@ -26,6 +28,7 @@ pub enum SceneElement {
     Rect(usize),
     Line(usize),
     RectEdge(usize, RectEdge),
+    Constraint(usize),
 }
 
 impl From<HierarchyNode> for SceneElement {
@@ -35,6 +38,7 @@ impl From<HierarchyNode> for SceneElement {
             HierarchyNode::Sketch(i) => SceneElement::Sketch(i),
             HierarchyNode::Rect(i) => SceneElement::Rect(i),
             HierarchyNode::Line(i) => SceneElement::Line(i),
+            HierarchyNode::Constraint(i) => SceneElement::Constraint(i),
         }
     }
 }
@@ -91,6 +95,9 @@ impl ElementVisibility {
             SceneElement::RectEdge(index, _) => doc.rects.get(index).is_some_and(|rect| {
                 self.effective_visible(doc, SceneElement::Sketch(rect.sketch))
             }),
+            SceneElement::Constraint(index) => doc.constraints.get(index).is_some_and(|c| {
+                self.effective_visible(doc, SceneElement::Sketch(c.sketch))
+            }),
         }
     }
 }
@@ -114,6 +121,7 @@ struct CreationRanks {
     sketches: HashMap<SketchId, usize>,
     rects: HashMap<usize, usize>,
     lines: HashMap<usize, usize>,
+    constraints: HashMap<usize, usize>,
     planes: HashMap<usize, usize>,
 }
 
@@ -123,6 +131,7 @@ fn build_creation_ranks(doc: &Document) -> CreationRanks {
     let mut sketch_n = 0usize;
     let mut rect_n = 0usize;
     let mut line_n = 0usize;
+    let mut constraint_n = 0usize;
     let mut plane_n = 1usize;
     for (rank, kind) in doc.shape_order.iter().enumerate() {
         match kind {
@@ -137,6 +146,10 @@ fn build_creation_ranks(doc: &Document) -> CreationRanks {
             ShapeKind::Line => {
                 ranks.lines.insert(line_n, rank);
                 line_n += 1;
+            }
+            ShapeKind::Constraint => {
+                ranks.constraints.insert(constraint_n, rank);
+                constraint_n += 1;
             }
             ShapeKind::ConstructionPlane => {
                 ranks.planes.insert(plane_n, rank);
@@ -154,6 +167,7 @@ fn creation_rank(ranks: &CreationRanks, node: HierarchyNode) -> usize {
         HierarchyNode::Sketch(i) => *ranks.sketches.get(&i).unwrap_or(&i),
         HierarchyNode::Rect(i) => *ranks.rects.get(&i).unwrap_or(&i),
         HierarchyNode::Line(i) => *ranks.lines.get(&i).unwrap_or(&i),
+        HierarchyNode::Constraint(i) => *ranks.constraints.get(&i).unwrap_or(&i),
     }
 }
 
@@ -254,6 +268,10 @@ fn parent_element(doc: &Document, element: SceneElement) -> Option<SceneElement>
             .get(index)
             .map(|line| SceneElement::Sketch(line.sketch)),
         SceneElement::RectEdge(index, _) => Some(SceneElement::Rect(index)),
+        SceneElement::Constraint(index) => doc
+            .constraints
+            .get(index)
+            .map(|c| SceneElement::Sketch(c.sketch)),
     }
 }
 
@@ -286,6 +304,11 @@ fn collect_descendants(doc: &Document, element: SceneElement, out: &mut HashSet<
                     out.insert(SceneElement::Line(li));
                 }
             }
+            for (ci, constraint) in doc.constraints.iter().enumerate() {
+                if constraint.sketch == sketch {
+                    out.insert(SceneElement::Constraint(ci));
+                }
+            }
             for (pi, plane) in doc.construction_planes.iter().enumerate() {
                 if matches!(plane.parent, ConstructionPlaneParent::Sketch(s) if s == sketch) {
                     out.insert(SceneElement::ConstructionPlane(pi));
@@ -299,7 +322,9 @@ fn collect_descendants(doc: &Document, element: SceneElement, out: &mut HashSet<
                 collect_descendants(doc, SceneElement::Sketch(sketch), out);
             }
         }
-        SceneElement::Line(_) | SceneElement::RectEdge(_, _) => {}
+        SceneElement::Line(_)
+        | SceneElement::RectEdge(_, _)
+        | SceneElement::Constraint(_) => {}
     }
 }
 
@@ -432,6 +457,14 @@ fn build_sketch_entry(
                 });
             }
         }
+        for (ci, constraint) in doc.constraints.iter().enumerate() {
+            if constraint.sketch == sketch {
+                children.push(HierarchyEntry {
+                    node: HierarchyNode::Constraint(ci),
+                    children: vec![],
+                });
+            }
+        }
     } else {
         for (ri, rect) in doc.rects.iter().enumerate() {
             if rect.sketch == sketch {
@@ -470,6 +503,7 @@ pub fn node_label(doc: &Document, node: HierarchyNode) -> String {
             let len = doc.lines[i].length();
             format!("Line {i} ({len:.1} mm)")
         }
+        HierarchyNode::Constraint(i) => constraint_label(doc, i),
     }
 }
 
@@ -575,7 +609,7 @@ fn show_row(
                     }
                 });
             }
-            HierarchyNode::Rect(_) | HierarchyNode::Line(_) => {
+            HierarchyNode::Rect(_) | HierarchyNode::Line(_) | HierarchyNode::Constraint(_) => {
                 if response.clicked() {
                     let additive = ui.input(|i| i.modifiers.command);
                     on_click_element(element, additive);
@@ -637,6 +671,25 @@ mod tests {
                 HierarchyNode::Line(0),
             ]
         );
+    }
+
+    #[test]
+    fn sketch_view_lists_constraints_for_active_sketch() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 5.0, 0.0));
+        doc.shape_order.push(ShapeKind::Line);
+        crate::constraints::add_distance_constraint(
+            &mut doc,
+            sketch,
+            crate::model::DistanceTarget::LineLength(0),
+            "5mm".to_string(),
+        )
+        .unwrap();
+        let list = build_element_list(&doc, Some(SketchSession { sketch }));
+        assert!(list.contains(&HierarchyNode::Constraint(0)));
+        assert!(!build_element_list(&doc, None).contains(&HierarchyNode::Constraint(0)));
     }
 
     #[test]

@@ -24,13 +24,19 @@ use crate::hierarchy::ElementVisibility;
 use crate::selection::{click_scene_selection, SceneSelection};
 use crate::model::SketchId;
 use crate::view_cube::{self, CubeCornerId, CubeEdgeId};
-use crate::model::{ConstructionPlane, Document, FaceId, Line, Rect, RectEdge, ShapeKind};
+use crate::constraints::{
+    add_distance_constraint, constraint_expression, default_distance_expression,
+    find_distance_constraint, set_constraint_dim_offset, set_constraint_expression, ConstraintId,
+};
+use crate::model::{
+    ConstructionPlane, DistanceTarget, Document, FaceId, Line, Rect, RectEdge, ShapeKind,
+};
 use crate::face::SketchFrame;
 use crate::parameters::{
     add_parameter, delete_parameter, recompute_document_geometry, set_parameter_expression,
     set_parameter_name, ParametersPaneState,
 };
-use crate::value::{eval_length_mm_in_doc, format_length_display, parse_positive_length_or_in_doc};
+use crate::value::parse_positive_length_or_in_doc;
 use eframe::egui;
 use glam::Vec3;
 
@@ -50,6 +56,8 @@ pub enum Tool {
     ConstructionPlane,
     /// Pick a face to enter sketch mode; line/rectangle tools draw on that face.
     Sketch,
+    /// Click a line segment to add or edit a distance constraint.
+    Dimension,
 }
 
 impl Tool {
@@ -62,12 +70,13 @@ impl Tool {
                 Some(Tool::ConstructionPlane)
             }
             "sketch" => Some(Tool::Sketch),
+            "dimension" | "dim" => Some(Tool::Dimension),
             _ => None,
         }
     }
 
-    pub fn is_sketch_draw_tool(self) -> bool {
-        matches!(self, Tool::Rectangle | Tool::Line)
+    pub fn is_sketch_edit_tool(self) -> bool {
+        matches!(self, Tool::Rectangle | Tool::Line | Tool::Dimension)
     }
 }
 
@@ -233,6 +242,7 @@ pub enum Action {
         offset: f32,
     },
     BeginEditCommittedDim { target: DimLabelTarget },
+    BeginDimensionEdit { target: DistanceTarget },
     CommitCommittedDim,
     BeginConstructionPlane {
         reference: PlaneReference,
@@ -414,147 +424,110 @@ pub fn dim_label_target_in_sketch(
     sketch: SketchId,
     axis: DimLabelAxis,
 ) -> Option<DimLabelTarget> {
-    match axis {
+    let target = match axis {
         DimLabelAxis::Width => doc
             .rects
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, r)| r.sketch == sketch && r.width_locked)
-            .map(|(index, _)| DimLabelTarget::RectWidth { index }),
+            .find(|(_, r)| r.sketch == sketch)
+            .map(|(index, _)| DistanceTarget::RectWidth(index)),
         DimLabelAxis::Height => doc
             .rects
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, r)| r.sketch == sketch && r.height_locked)
-            .map(|(index, _)| DimLabelTarget::RectHeight { index }),
+            .find(|(_, r)| r.sketch == sketch)
+            .map(|(index, _)| DistanceTarget::RectHeight(index)),
         DimLabelAxis::Length => doc
             .lines
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, l)| l.sketch == sketch && l.length_locked)
-            .map(|(index, _)| DimLabelTarget::LineLength { index }),
-    }
+            .find(|(_, l)| l.sketch == sketch)
+            .map(|(index, _)| DistanceTarget::LineLength(index)),
+    }?;
+    find_distance_constraint(doc, target)
 }
 
 /// A committed sketch dimension label the user can reposition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DimLabelTarget {
-    RectWidth { index: usize },
-    RectHeight { index: usize },
-    LineLength { index: usize },
-}
+pub type DimLabelTarget = ConstraintId;
 
-impl DimLabelTarget {
-    pub fn matches_rect_axis(self, axis: RectAxis) -> bool {
-        matches!(
-            (self, axis),
-            (DimLabelTarget::RectWidth { .. }, RectAxis::Width)
-                | (DimLabelTarget::RectHeight { .. }, RectAxis::Height)
+/// Whether a constraint edit applies to a rectangle axis.
+pub fn constraint_matches_rect_axis(doc: &Document, target: DimLabelTarget, axis: RectAxis) -> bool {
+    let Some(constraint) = doc.constraints.get(target) else {
+        return false;
+    };
+    matches!(
+        (&constraint.kind, axis),
+        (
+            crate::model::ConstraintKind::Distance {
+                target: DistanceTarget::RectWidth(_)
+            },
+            RectAxis::Width
+        ) | (
+            crate::model::ConstraintKind::Distance {
+                target: DistanceTarget::RectHeight(_)
+            },
+            RectAxis::Height
         )
-    }
+    )
+}
 
-    pub fn is_line_length(self) -> bool {
-        matches!(self, DimLabelTarget::LineLength { .. })
+pub fn constraint_is_line_length(doc: &Document, target: DimLabelTarget) -> bool {
+    doc.constraints.get(target).is_some_and(|c| {
+        matches!(
+            c.kind,
+            crate::model::ConstraintKind::Distance {
+                target: DistanceTarget::LineLength(_)
+            }
+        )
+    })
+}
+
+/// In-progress edit of a sketch dimension (Select or Dimension tool).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DimEditTarget {
+    Constraint(ConstraintId),
+    New(DistanceTarget),
+}
+
+impl DimEditTarget {
+    pub fn distance_target(&self, doc: &Document) -> Option<DistanceTarget> {
+        match self {
+            DimEditTarget::New(target) => Some(*target),
+            DimEditTarget::Constraint(id) => doc.constraints.get(*id).and_then(|c| match c.kind {
+                crate::model::ConstraintKind::Distance { target } => Some(target),
+            }),
+        }
     }
 }
 
-/// In-progress edit of a committed sketch dimension (Select tool).
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditingCommittedDim {
-    pub target: DimLabelTarget,
+    pub target: DimEditTarget,
     pub text: String,
     pub pending_focus: bool,
 }
 
 /// Expression text shown when editing a committed dimension.
 pub fn committed_dim_expression(doc: &Document, target: DimLabelTarget) -> Option<String> {
-    match target {
-        DimLabelTarget::RectWidth { index } => {
-            let rect = doc.rects.get(index)?;
-            if !rect.width_locked {
-                return None;
-            }
-            Some(
-                rect.width_expr
-                    .clone()
-                    .unwrap_or_else(|| format_length_display(rect.w)),
-            )
-        }
-        DimLabelTarget::RectHeight { index } => {
-            let rect = doc.rects.get(index)?;
-            if !rect.height_locked {
-                return None;
-            }
-            Some(
-                rect.height_expr
-                    .clone()
-                    .unwrap_or_else(|| format_length_display(rect.h)),
-            )
-        }
-        DimLabelTarget::LineLength { index } => {
-            let line = doc.lines.get(index)?;
-            if !line.length_locked {
-                return None;
-            }
-            Some(
-                line.length_expr
-                    .clone()
-                    .unwrap_or_else(|| format_length_display(line.length())),
-            )
-        }
-    }
+    constraint_expression(doc, target)
 }
 
 fn apply_committed_dim_expression(
     doc: &mut Document,
-    target: DimLabelTarget,
+    sketch: SketchId,
+    target: DimEditTarget,
     expression: &str,
 ) -> Result<(), String> {
-    let trimmed = expression.trim();
-    if trimmed.is_empty() {
-        return Err("Dimension value cannot be empty".to_string());
-    }
-    let value = eval_length_mm_in_doc(trimmed, doc)
-        .ok_or_else(|| format!("Invalid dimension expression '{trimmed}'"))?;
-    if value <= 0.0 {
-        return Err(format!("Dimension expression '{trimmed}' must be positive"));
-    }
     match target {
-        DimLabelTarget::RectWidth { index } => {
-            let rect = doc
-                .rects
-                .get_mut(index)
-                .ok_or_else(|| format!("Rectangle {index} not found"))?;
-            if !rect.width_locked {
-                return Err("Rectangle width is not dimensioned".to_string());
-            }
-            rect.width_expr = Some(trimmed.to_string());
-        }
-        DimLabelTarget::RectHeight { index } => {
-            let rect = doc
-                .rects
-                .get_mut(index)
-                .ok_or_else(|| format!("Rectangle {index} not found"))?;
-            if !rect.height_locked {
-                return Err("Rectangle height is not dimensioned".to_string());
-            }
-            rect.height_expr = Some(trimmed.to_string());
-        }
-        DimLabelTarget::LineLength { index } => {
-            let line = doc
-                .lines
-                .get_mut(index)
-                .ok_or_else(|| format!("Line {index} not found"))?;
-            if !line.length_locked {
-                return Err("Line length is not dimensioned".to_string());
-            }
-            line.length_expr = Some(trimmed.to_string());
+        DimEditTarget::Constraint(id) => set_constraint_expression(doc, id, expression.to_string()),
+        DimEditTarget::New(distance_target) => {
+            add_distance_constraint(doc, sketch, distance_target, expression.to_string())?;
+            Ok(())
         }
     }
-    recompute_document_geometry(doc)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -674,6 +647,14 @@ fn draw_mode_status(tool: &str, construction: bool) -> String {
     )
 }
 
+fn distance_target_status_label(target: DistanceTarget) -> String {
+    match target {
+        DistanceTarget::LineLength(i) => format!("line {i}"),
+        DistanceTarget::RectWidth(i) => format!("rectangle {i} width"),
+        DistanceTarget::RectHeight(i) => format!("rectangle {i} height"),
+    }
+}
+
 fn element_label(element: SceneElement) -> String {
     match element {
         SceneElement::ConstructionPlane(i) => format!("Construction plane {i}"),
@@ -683,6 +664,7 @@ fn element_label(element: SceneElement) -> String {
         SceneElement::RectEdge(i, edge) => {
             format!("Rectangle {i} {} edge", edge.script_name())
         }
+        SceneElement::Constraint(i) => format!("Constraint {i}"),
     }
 }
 
@@ -696,6 +678,13 @@ pub enum ActionResult {
 }
 
 impl AppState {
+    /// Whether committed sketch dimensions can be edited or repositioned.
+    pub fn can_edit_sketch_dimensions(&self) -> bool {
+        self.sketch_session.is_some()
+            && self.creating_rect.is_none()
+            && self.creating_line.is_none()
+    }
+
     /// Active or pending construction draw mode while the rectangle tool is selected.
     pub fn rect_draw_construction_mode(&self) -> Option<bool> {
         if self.tool != Tool::Rectangle {
@@ -803,6 +792,11 @@ impl AppState {
                         self.doc.lines.pop();
                         self.status = "Undid last line".to_string();
                     }
+                    Some(ShapeKind::Constraint) => {
+                        self.doc.constraints.pop();
+                        let _ = recompute_document_geometry(&mut self.doc);
+                        self.status = "Undid last constraint".to_string();
+                    }
                     Some(ShapeKind::Parameter) => {
                         self.doc.parameters.pop();
                         self.status = "Undid last parameter".to_string();
@@ -844,7 +838,7 @@ impl AppState {
                 if self.creating_plane.is_some() && tool != Tool::ConstructionPlane {
                     self.creating_plane = None;
                 }
-                if tool != Tool::Select {
+                if !matches!(tool, Tool::Select | Tool::Dimension) {
                     self.editing_committed_dim = None;
                 }
                 self.tool = tool;
@@ -857,6 +851,10 @@ impl AppState {
                     Tool::Rectangle => "Rectangle tool — click a face".to_string(),
                     Tool::Line if self.sketch_session.is_some() => "Line tool".to_string(),
                     Tool::Line => "Line tool — click a face".to_string(),
+                    Tool::Dimension if self.sketch_session.is_some() => {
+                        "Dimension tool — click a segment".to_string()
+                    }
+                    Tool::Dimension => "Dimension tool — open a sketch first".to_string(),
                     Tool::ConstructionPlane => "Construction plane tool".to_string(),
                 };
                 ActionResult::Ok
@@ -920,10 +918,6 @@ impl AppState {
                 let end = cr.end_point(&frame, &self.doc);
                 let (eu, ev) = world_to_local(&frame, end);
                 let mut rect = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
-                rect.width_locked = cr.user_edited[0];
-                rect.height_locked = cr.user_edited[1];
-                rect.width_expr = cr.user_edited[0].then(|| cr.texts[0].clone());
-                rect.height_expr = cr.user_edited[1].then(|| cr.texts[1].clone());
                 if cr.construction {
                     for edge_index in 0..4 {
                         rect.set_edge_construction(RectEdge::from_index(edge_index), true);
@@ -932,7 +926,33 @@ impl AppState {
                 if rect.w > 0.5 && rect.h > 0.5 {
                     self.doc.rects.push(rect);
                     self.doc.shape_order.push(ShapeKind::Rect);
-                    if let Err(e) = recompute_document_geometry(&mut self.doc) {
+                    let rect_index = self.doc.rects.len() - 1;
+                    let mut constraint_err = None;
+                    if cr.user_edited[0] {
+                        if let Err(e) = add_distance_constraint(
+                            &mut self.doc,
+                            session.sketch,
+                            DistanceTarget::RectWidth(rect_index),
+                            cr.texts[0].clone(),
+                        ) {
+                            constraint_err = Some(e);
+                        }
+                    }
+                    if constraint_err.is_none() && cr.user_edited[1] {
+                        if let Err(e) = add_distance_constraint(
+                            &mut self.doc,
+                            session.sketch,
+                            DistanceTarget::RectHeight(rect_index),
+                            cr.texts[1].clone(),
+                        ) {
+                            constraint_err = Some(e);
+                        }
+                    }
+                    if let Some(e) = constraint_err {
+                        while self.doc.shape_order.last() == Some(&ShapeKind::Constraint) {
+                            self.doc.shape_order.pop();
+                            self.doc.constraints.pop();
+                        }
                         self.doc.rects.pop();
                         self.doc.shape_order.pop();
                         self.creating_rect = Some(cr);
@@ -951,7 +971,17 @@ impl AppState {
             }
             Action::SetRectDimension { axis, value } => {
                 if let Some(edit) = &mut self.editing_committed_dim {
-                    if edit.target.matches_rect_axis(axis) {
+                    let matches = match &edit.target {
+                        DimEditTarget::Constraint(id) => {
+                            constraint_matches_rect_axis(&self.doc, *id, axis)
+                        }
+                        DimEditTarget::New(target) => matches!(
+                            (target, axis),
+                            (DistanceTarget::RectWidth(_), RectAxis::Width)
+                                | (DistanceTarget::RectHeight(_), RectAxis::Height)
+                        ),
+                    };
+                    if matches {
                         edit.text = value;
                         return ActionResult::Ok;
                     }
@@ -966,7 +996,17 @@ impl AppState {
             }
             Action::FocusRectDimension { axis } => {
                 if let Some(edit) = &mut self.editing_committed_dim {
-                    if edit.target.matches_rect_axis(axis) {
+                    let matches = match &edit.target {
+                        DimEditTarget::Constraint(id) => {
+                            constraint_matches_rect_axis(&self.doc, *id, axis)
+                        }
+                        DimEditTarget::New(target) => matches!(
+                            (target, axis),
+                            (DistanceTarget::RectWidth(_), RectAxis::Width)
+                                | (DistanceTarget::RectHeight(_), RectAxis::Height)
+                        ),
+                    };
+                    if matches {
                         edit.pending_focus = true;
                         return ActionResult::Ok;
                     }
@@ -992,18 +1032,24 @@ impl AppState {
                 let end = cl.end_point(&frame, &self.doc);
                 let (u1, v1) = world_to_local(&frame, end);
                 let mut line = Line::from_local_endpoints(session.sketch, u0, v0, u1, v1);
-                line.length_locked = cl.user_edited;
-                line.length_expr = cl.user_edited.then(|| cl.text.clone());
                 line.construction = cl.construction;
                 if line.length() > 0.5 {
                     self.doc.lines.push(line);
                     self.doc.shape_order.push(ShapeKind::Line);
-                    if let Err(e) = recompute_document_geometry(&mut self.doc) {
-                        self.doc.lines.pop();
-                        self.doc.shape_order.pop();
-                        self.creating_line = Some(cl);
-                        self.status = e.clone();
-                        return ActionResult::Err(e);
+                    let line_index = self.doc.lines.len() - 1;
+                    if cl.user_edited {
+                        if let Err(e) = add_distance_constraint(
+                            &mut self.doc,
+                            session.sketch,
+                            DistanceTarget::LineLength(line_index),
+                            cl.text.clone(),
+                        ) {
+                            self.doc.lines.pop();
+                            self.doc.shape_order.pop();
+                            self.creating_line = Some(cl);
+                            self.status = e.clone();
+                            return ActionResult::Err(e);
+                        }
                     }
                     let len = self.doc.lines.last().unwrap().length();
                     self.status = format!("Added line ({:.1} mm)", len);
@@ -1016,7 +1062,12 @@ impl AppState {
             }
             Action::SetLineLength { value } => {
                 if let Some(edit) = &mut self.editing_committed_dim {
-                    if edit.target.is_line_length() {
+                    let matches = match &edit.target {
+                        DimEditTarget::Constraint(id) => constraint_is_line_length(&self.doc, *id),
+                        DimEditTarget::New(DistanceTarget::LineLength(_)) => true,
+                        DimEditTarget::New(_) => false,
+                    };
+                    if matches {
                         edit.text = value;
                         return ActionResult::Ok;
                     }
@@ -1030,40 +1081,22 @@ impl AppState {
             }
             Action::SetDimLabelOffset { target, offset } => {
                 let offset = crate::dimensions::effective_dim_offset(Some(offset));
-                match target {
-                    DimLabelTarget::RectWidth { index } => {
-                        let Some(rect) = self.doc.rects.get_mut(index) else {
-                            return ActionResult::Err(format!("Rectangle {index} not found"));
-                        };
-                        if !rect.width_locked {
-                            return ActionResult::Err("Rectangle width is not dimensioned".to_string());
-                        }
-                        rect.width_dim_offset = Some(offset);
-                    }
-                    DimLabelTarget::RectHeight { index } => {
-                        let Some(rect) = self.doc.rects.get_mut(index) else {
-                            return ActionResult::Err(format!("Rectangle {index} not found"));
-                        };
-                        if !rect.height_locked {
-                            return ActionResult::Err("Rectangle height is not dimensioned".to_string());
-                        }
-                        rect.height_dim_offset = Some(offset);
-                    }
-                    DimLabelTarget::LineLength { index } => {
-                        let Some(line) = self.doc.lines.get_mut(index) else {
-                            return ActionResult::Err(format!("Line {index} not found"));
-                        };
-                        if !line.length_locked {
-                            return ActionResult::Err("Line length is not dimensioned".to_string());
-                        }
-                        line.length_dim_offset = Some(offset);
+                match set_constraint_dim_offset(&mut self.doc, target, offset) {
+                    Ok(()) => ActionResult::Ok,
+                    Err(e) => {
+                        self.status = e.clone();
+                        ActionResult::Err(e)
                     }
                 }
-                ActionResult::Ok
             }
             Action::FocusLineLength => {
                 if let Some(edit) = &mut self.editing_committed_dim {
-                    if edit.target.is_line_length() {
+                    let matches = match &edit.target {
+                        DimEditTarget::Constraint(id) => constraint_is_line_length(&self.doc, *id),
+                        DimEditTarget::New(DistanceTarget::LineLength(_)) => true,
+                        DimEditTarget::New(_) => false,
+                    };
+                    if matches {
                         edit.pending_focus = true;
                         return ActionResult::Ok;
                     }
@@ -1075,28 +1108,67 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::BeginEditCommittedDim { target } => {
-                if self.sketch_session.is_none() {
-                    return ActionResult::Err("Not in sketch mode".to_string());
-                }
-                if self.tool != Tool::Select {
-                    return ActionResult::Err("Select tool required to edit dimensions".to_string());
+                if !self.can_edit_sketch_dimensions() {
+                    return ActionResult::Err(
+                        "Open a sketch and finish the current draw operation to edit dimensions"
+                            .to_string(),
+                    );
                 }
                 let Some(text) = committed_dim_expression(&self.doc, target) else {
                     return ActionResult::Err("Dimension is not editable".to_string());
                 };
                 self.editing_committed_dim = Some(EditingCommittedDim {
-                    target,
+                    target: DimEditTarget::Constraint(target),
                     text,
                     pending_focus: true,
                 });
                 self.status = "Edit dimension • Enter to commit • Esc to cancel".to_string();
                 ActionResult::Ok
             }
+            Action::BeginDimensionEdit { target } => {
+                let Some(session) = self.sketch_session else {
+                    return ActionResult::Err("Not in sketch mode".to_string());
+                };
+                if self.tool != Tool::Dimension {
+                    return ActionResult::Err("Dimension tool required".to_string());
+                }
+                let edit_target = if let Some(id) = find_distance_constraint(&self.doc, target) {
+                    DimEditTarget::Constraint(id)
+                } else {
+                    DimEditTarget::New(target)
+                };
+                let text = match edit_target {
+                    DimEditTarget::Constraint(id) => committed_dim_expression(&self.doc, id)
+                        .unwrap_or_else(|| default_distance_expression(&self.doc, target)),
+                    DimEditTarget::New(_) => default_distance_expression(&self.doc, target),
+                };
+                self.editing_committed_dim = Some(EditingCommittedDim {
+                    target: edit_target,
+                    text,
+                    pending_focus: true,
+                });
+                self.status = format!(
+                    "Dimension {} • type length • Enter commit • Esc cancel",
+                    distance_target_status_label(target)
+                );
+                let _ = session;
+                ActionResult::Ok
+            }
             Action::CommitCommittedDim => {
+                let Some(session) = self.sketch_session else {
+                    return ActionResult::Err("Not in sketch mode".to_string());
+                };
                 let Some(edit) = self.editing_committed_dim.take() else {
                     return ActionResult::Err("No committed dimension being edited".to_string());
                 };
-                match apply_committed_dim_expression(&mut self.doc, edit.target, &edit.text) {
+                let target = edit.target.clone();
+                let text = edit.text.clone();
+                match apply_committed_dim_expression(
+                    &mut self.doc,
+                    session.sketch,
+                    target,
+                    &text,
+                ) {
                     Ok(()) => {
                         self.status = "Updated dimension".to_string();
                         ActionResult::Ok
@@ -1543,7 +1615,7 @@ impl AppState {
         self.sketch_session = Some(SketchSession { sketch });
         self.creating_rect = None;
         self.creating_line = None;
-        if !self.tool.is_sketch_draw_tool() {
+        if !self.tool.is_sketch_edit_tool() {
             self.tool = Tool::Select;
         }
         let name = sketch_label(&self.doc, sketch);
@@ -1846,6 +1918,7 @@ mod tests {
         assert_eq!(state.doc.rects.len(), 1);
         assert!((state.doc.rects[0].w - 10.0).abs() < 1e-4);
         assert!((state.doc.rects[0].h - 5.0).abs() < 1e-4);
+        assert_eq!(state.doc.constraints.len(), 2);
         assert!(state.doc.rects[0].width_locked);
         assert!(state.doc.rects[0].height_locked);
         assert_eq!(state.doc.rects[0].sketch, sketch);
@@ -1948,33 +2021,76 @@ mod tests {
             construction: false,
         });
         state.apply(Action::CommitRectangle);
+        let width_constraint = find_distance_constraint(
+            &state.doc,
+            DistanceTarget::RectWidth(0),
+        )
+        .unwrap();
         state.apply(Action::SetDimLabelOffset {
-            target: DimLabelTarget::RectWidth { index: 0 },
+            target: width_constraint,
             offset: 55.0,
         });
+        assert_eq!(state.doc.constraints[0].dim_offset, Some(55.0));
         assert_eq!(state.doc.rects[0].width_dim_offset, Some(55.0));
     }
 
     #[test]
-    fn dim_label_target_in_sketch_finds_locked_width() {
+    fn dim_label_target_in_sketch_finds_width_constraint() {
         let mut state = AppState::default();
         let sketch = begin_default_sketch(&mut state);
-        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0);
-        rect.width_locked = true;
-        state.doc.rects.push(rect);
+        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
         state.doc.shape_order.push(ShapeKind::Rect);
+        add_distance_constraint(
+            &mut state.doc,
+            sketch,
+            DistanceTarget::RectWidth(0),
+            "10mm".to_string(),
+        )
+        .unwrap();
         let target = dim_label_target_in_sketch(&state.doc, sketch, DimLabelAxis::Width);
-        assert_eq!(target, Some(DimLabelTarget::RectWidth { index: 0 }));
+        assert_eq!(target, Some(0));
     }
 
     #[test]
-    fn begin_edit_committed_dim_requires_select_tool() {
+    fn begin_edit_committed_dim_works_while_rectangle_tool_in_sketch() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
+        state.doc.shape_order.push(ShapeKind::Rect);
+        add_distance_constraint(
+            &mut state.doc,
+            sketch,
+            DistanceTarget::RectWidth(0),
+            "10mm".to_string(),
+        )
+        .unwrap();
+        state.apply(Action::SetTool(Tool::Rectangle));
+        let width_constraint = find_distance_constraint(
+            &state.doc,
+            DistanceTarget::RectWidth(0),
+        )
+        .unwrap();
+        let result = state.apply(Action::BeginEditCommittedDim {
+            target: width_constraint,
+        });
+        assert_eq!(result, ActionResult::Ok);
+        assert!(state.editing_committed_dim.is_some());
+    }
+
+    #[test]
+    fn begin_edit_committed_dim_blocked_while_drawing_rectangle() {
         let mut state = AppState::default();
         begin_default_sketch(&mut state);
-        state.apply(Action::SetTool(Tool::Rectangle));
-        let result = state.apply(Action::BeginEditCommittedDim {
-            target: DimLabelTarget::RectWidth { index: 0 },
+        state.creating_rect = Some(CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["".to_string(), "".to_string()],
+            focused: 0,
+            last_mouse: Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [false, false],
+            pending_focus: false,
+            construction: false,
         });
+        let result = state.apply(Action::BeginEditCommittedDim { target: 0 });
         assert!(matches!(result, ActionResult::Err(_)));
         assert!(state.editing_committed_dim.is_none());
     }
@@ -1993,8 +2109,13 @@ mod tests {
             construction: false,
         });
         state.apply(Action::CommitRectangle);
+        let width_constraint = find_distance_constraint(
+            &state.doc,
+            DistanceTarget::RectWidth(0),
+        )
+        .unwrap();
         state.apply(Action::BeginEditCommittedDim {
-            target: DimLabelTarget::RectWidth { index: 0 },
+            target: width_constraint,
         });
         state.apply(Action::SetRectDimension {
             axis: RectAxis::Width,
@@ -2002,7 +2123,7 @@ mod tests {
         });
         state.apply(Action::CommitCommittedDim);
         assert!((state.doc.rects[0].w - 20.0).abs() < 1e-3);
-        assert_eq!(state.doc.rects[0].width_expr.as_deref(), Some("20mm"));
+        assert_eq!(state.doc.constraints[0].expression, "20mm");
         assert!(state.editing_committed_dim.is_none());
     }
 
@@ -2020,8 +2141,13 @@ mod tests {
             construction: false,
         });
         state.apply(Action::CommitRectangle);
+        let width_constraint = find_distance_constraint(
+            &state.doc,
+            DistanceTarget::RectWidth(0),
+        )
+        .unwrap();
         state.apply(Action::BeginEditCommittedDim {
-            target: DimLabelTarget::RectWidth { index: 0 },
+            target: width_constraint,
         });
         state.apply(Action::CancelOperation);
         assert!(state.editing_committed_dim.is_none());
@@ -2043,8 +2169,28 @@ mod tests {
         state.apply(Action::CommitLine);
         assert_eq!(state.doc.lines.len(), 1);
         assert!((state.doc.lines[0].length() - 10.0).abs() < 1e-4);
+        assert_eq!(state.doc.constraints.len(), 1);
         assert!(state.doc.lines[0].length_locked);
         assert!(state.creating_line.is_none());
+    }
+
+    #[test]
+    fn dimension_tool_adds_distance_constraint_to_line() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state.doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 8.0, 0.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.apply(Action::SetTool(Tool::Dimension));
+        state.apply(Action::BeginDimensionEdit {
+            target: DistanceTarget::LineLength(0),
+        });
+        state.apply(Action::SetLineLength {
+            value: "12mm".to_string(),
+        });
+        state.apply(Action::CommitCommittedDim);
+        assert_eq!(state.doc.constraints.len(), 1);
+        assert!((state.doc.lines[0].length() - 12.0).abs() < 1e-3);
     }
 
     #[test]

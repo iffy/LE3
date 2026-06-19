@@ -7,8 +7,9 @@ use crate::actions::{
     dim_label_target_in_sketch, Action, AppState, DimLabelAxis, Pane, RectAxis, Tool,
 };
 use crate::command_palette::{best_match, commands_for_state, PaletteOutcome};
+use crate::constraints::add_distance_constraint;
 use crate::hierarchy::SceneElement;
-use crate::model::{FaceId, RectEdge, SketchId};
+use crate::model::{DistanceTarget, FaceId, RectEdge, SketchId};
 use crate::construction::PlaneDim;
 use crate::camera::{ProjectionMode, StandardView};
 use crate::view_cube::{CubeCornerId, CubeEdgeId};
@@ -55,6 +56,10 @@ pub enum Instruction {
     SetDimLabelOffset { axis: DimLabelAxis, offset: f32 },
     BeginEditCommittedDim { axis: DimLabelAxis },
     CommitCommittedDim,
+    AddDistanceConstraint {
+        target: DistanceTarget,
+        expression: String,
+    },
     SetLineLength { value: String },
     BeginEditConstructionPlane { index: usize },
     CommitConstructionPlane,
@@ -126,6 +131,7 @@ impl Instruction {
             Instruction::Tool(Tool::Line) => "tool line".to_string(),
             Instruction::Tool(Tool::ConstructionPlane) => "tool plane".to_string(),
             Instruction::Tool(Tool::Sketch) => "tool sketch".to_string(),
+            Instruction::Tool(Tool::Dimension) => "tool dimension".to_string(),
             Instruction::BeginSketch { face } => format!("begin_sketch {}", face_script_name(*face)),
             Instruction::OpenSketch { sketch } => format!("open_sketch {sketch}"),
             Instruction::ExitSketch => "exit_sketch".to_string(),
@@ -195,6 +201,14 @@ impl Instruction {
                 format!("edit_dim {name}")
             }
             Instruction::CommitCommittedDim => "commit_dim".to_string(),
+            Instruction::AddDistanceConstraint { target, expression } => {
+                let target_name = match target {
+                    DistanceTarget::LineLength(i) => format!("line {i}"),
+                    DistanceTarget::RectWidth(i) => format!("rect {i} width"),
+                    DistanceTarget::RectHeight(i) => format!("rect {i} height"),
+                };
+                format!("add_constraint {target_name} {expression}")
+            }
             Instruction::BeginEditConstructionPlane { index } => format!("edit_plane {index}"),
             Instruction::CommitConstructionPlane => "commit_plane".to_string(),
             Instruction::SetPlaneOffset { value } => format!("set_dim offset {value}"),
@@ -349,9 +363,53 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
             let name = rest.split_whitespace().next().unwrap_or("");
             Tool::from_name(name).map(Instruction::Tool).ok_or_else(|| {
                 err(&format!(
-                    "unknown tool '{name}' (expected select, sketch, rectangle, line, or plane)"
+                    "unknown tool '{name}' (expected select, sketch, rectangle, line, dimension, or plane)"
                 ))
             })
+        }
+
+        "add_constraint" | "addconstraint" | "constraint" => {
+            let mut parts = rest.split_whitespace();
+            let kind = parts
+                .next()
+                .ok_or_else(|| err("add_constraint requires target kind and index"))?;
+            let index = parts
+                .next()
+                .ok_or_else(|| err("add_constraint requires target index"))?
+                .parse::<usize>()
+                .map_err(|_| err("add_constraint index must be an integer"))?;
+            let target = match kind.to_ascii_lowercase().as_str() {
+                "line" | "segment" => DistanceTarget::LineLength(index),
+                "rect" | "rectangle" => {
+                    let dim = parts
+                        .next()
+                        .ok_or_else(|| err("add_constraint rect requires width or height"))?;
+                    let expression = parts.collect::<Vec<_>>().join(" ");
+                    if expression.is_empty() {
+                        return Err(err("add_constraint requires expression"));
+                    }
+                    let target = match dim.to_ascii_lowercase().as_str() {
+                        "width" | "w" => DistanceTarget::RectWidth(index),
+                        "height" | "h" => DistanceTarget::RectHeight(index),
+                        other => {
+                            return Err(err(&format!(
+                                "unknown rectangle dimension '{other}' (expected width or height)"
+                            )));
+                        }
+                    };
+                    return Ok(Instruction::AddDistanceConstraint { target, expression });
+                }
+                other => {
+                    return Err(err(&format!(
+                        "unknown constraint target '{other}' (expected line or rect)"
+                    )));
+                }
+            };
+            let expression = parts.collect::<Vec<_>>().join(" ");
+            if expression.is_empty() {
+                return Err(err("add_constraint requires expression"));
+            }
+            Ok(Instruction::AddDistanceConstraint { target, expression })
         }
 
         "begin_sketch" | "beginsketch" => {
@@ -932,6 +990,11 @@ fn element_script_tokens(element: SceneElement) -> ElementScriptTokens {
             kind: "rect",
             index: i,
             edge: Some(edge),
+        },
+        SceneElement::Constraint(i) => ElementScriptTokens {
+            kind: "constraint",
+            index: i,
+            edge: None,
         },
     }
 }
@@ -1527,6 +1590,17 @@ impl ScriptRunner {
             }
             Instruction::CommitCommittedDim => {
                 let _ = state.apply(Action::CommitCommittedDim);
+                StepResult::Continue
+            }
+            Instruction::AddDistanceConstraint { target, expression } => {
+                if let Some(session) = state.sketch_session {
+                    let _ = add_distance_constraint(
+                        &mut state.doc,
+                        session.sketch,
+                        target,
+                        expression,
+                    );
+                }
                 StepResult::Continue
             }
             Instruction::SetLineLength { value } => {

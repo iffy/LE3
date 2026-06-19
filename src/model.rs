@@ -324,6 +324,33 @@ pub struct ConstructionPlane {
     pub definition: PlaneDefinition,
 }
 
+/// Geometry a distance constraint applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistanceTarget {
+    LineLength(usize),
+    RectWidth(usize),
+    RectHeight(usize),
+}
+
+/// Kind of sketch constraint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintKind {
+    Distance { target: DistanceTarget },
+}
+
+/// A sketch constraint (distance is the first supported kind).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Constraint {
+    pub sketch: SketchId,
+    pub kind: ConstraintKind,
+    pub expression: String,
+    /// User-placed offset from the measured segment to the dimension line (px).
+    #[serde(default)]
+    pub dim_offset: Option<f32>,
+}
+
 /// Which sketch primitive was created, in chronological order (for undo).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeKind {
@@ -331,16 +358,18 @@ pub enum ShapeKind {
     Rect,
     Line,
     Parameter,
+    Constraint,
     ConstructionPlane,
 }
 
-/// The whole document: sketches, sketch primitives, and construction planes.
+/// The whole document: sketches, sketch primitives, constraints, and construction planes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub parameters: Vec<Parameter>,
     pub sketches: Vec<Sketch>,
     pub rects: Vec<Rect>,
     pub lines: Vec<Line>,
+    pub constraints: Vec<Constraint>,
     /// Construction planes live in the document but are not written to `.le3`.
     #[serde(skip)]
     pub construction_planes: Vec<ConstructionPlane>,
@@ -354,6 +383,7 @@ impl Default for Document {
             sketches: Vec::new(),
             rects: Vec::new(),
             lines: Vec::new(),
+            constraints: Vec::new(),
             construction_planes: vec![default_xy_plane()],
             shape_order: Vec::new(),
         }

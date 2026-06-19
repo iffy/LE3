@@ -8,7 +8,8 @@
 //! `dag_nodes` shape.
 
 use crate::face::default_xy_plane;
-use crate::model::{Document, Line, Parameter, Rect, ShapeKind, Sketch};
+use crate::constraints::{migrate_legacy_dimensions, solve_document_constraints};
+use crate::model::{Constraint, Document, Line, Parameter, Rect, ShapeKind, Sketch};
 use crate::parameters::validate_document_parameters_no_cycles;
 use rusqlite::Connection;
 
@@ -64,7 +65,7 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
     .map_err(|e| e.to_string())?;
 
     tx.execute(
-        "DELETE FROM dag_nodes WHERE kind IN ('sketch', 'rectangle', 'line', 'parameter')",
+        "DELETE FROM dag_nodes WHERE kind IN ('sketch', 'rectangle', 'line', 'parameter', 'constraint')",
         [],
     )
     .map_err(|e| e.to_string())?;
@@ -72,6 +73,7 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
     let mut sketch_i = 0usize;
     let mut rect_i = 0usize;
     let mut line_i = 0usize;
+    let mut constraint_i = 0usize;
     let mut param_i = 0usize;
     for (id, kind) in doc.shape_order.iter().enumerate() {
         match kind {
@@ -131,6 +133,20 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
                 .map_err(|e| e.to_string())?;
                 param_i += 1;
             }
+            ShapeKind::Constraint => {
+                let constraint = doc
+                    .constraints
+                    .get(constraint_i)
+                    .ok_or_else(|| "shape_order out of sync with constraints".to_string())?;
+                let payload = serde_json::to_string(constraint).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
+                     VALUES (?1, 0, 'constraint', ?2)",
+                    rusqlite::params![id as i64, payload],
+                )
+                .map_err(|e| e.to_string())?;
+                constraint_i += 1;
+            }
             ShapeKind::ConstructionPlane => {}
         }
     }
@@ -146,7 +162,7 @@ pub fn open(path: &str) -> Result<Document> {
     let mut stmt = conn
         .prepare(
             "SELECT kind, payload FROM dag_nodes
-             WHERE kind IN ('sketch', 'rectangle', 'line', 'parameter')
+             WHERE kind IN ('sketch', 'rectangle', 'line', 'parameter', 'constraint')
              ORDER BY id",
         )
         .map_err(|e| e.to_string())?;
@@ -159,6 +175,7 @@ pub fn open(path: &str) -> Result<Document> {
     let mut sketches = Vec::new();
     let mut rects = Vec::new();
     let mut lines = Vec::new();
+    let mut constraints = Vec::new();
     let mut shape_order = Vec::new();
     for row in rows {
         let (kind, payload) = row.map_err(|e| e.to_string())?;
@@ -183,6 +200,12 @@ pub fn open(path: &str) -> Result<Document> {
                 parameters.push(param);
                 shape_order.push(ShapeKind::Parameter);
             }
+            "constraint" => {
+                let constraint: Constraint =
+                    serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+                constraints.push(constraint);
+                shape_order.push(ShapeKind::Constraint);
+            }
             _ => {}
         }
     }
@@ -192,12 +215,15 @@ pub fn open(path: &str) -> Result<Document> {
         sketches,
         rects,
         lines,
+        constraints,
         construction_planes: Vec::new(),
         shape_order,
     };
     if doc.construction_planes.is_empty() {
         doc.construction_planes.push(default_xy_plane());
     }
+    migrate_legacy_dimensions(&mut doc);
+    solve_document_constraints(&mut doc).map_err(|e| e.to_string())?;
     Ok(doc)
 }
 
@@ -222,6 +248,7 @@ mod tests {
             sketches: Vec::new(),
             rects: Vec::new(),
             lines: vec![],
+            constraints: Vec::new(),
             construction_planes: vec![default_xy_plane()],
             shape_order: Vec::new(),
         };
@@ -254,6 +281,7 @@ mod tests {
             sketches: Vec::new(),
             rects: Vec::new(),
             lines: vec![],
+            constraints: Vec::new(),
             construction_planes: vec![default_xy_plane()],
             shape_order: Vec::new(),
         };
@@ -284,6 +312,7 @@ mod tests {
             sketches: Vec::new(),
             rects: Vec::new(),
             lines: vec![],
+            constraints: Vec::new(),
             construction_planes: vec![default_xy_plane()],
             shape_order: Vec::new(),
         };
@@ -340,6 +369,7 @@ mod tests {
             sketches: Vec::new(),
             rects: Vec::new(),
             lines: vec![],
+            constraints: Vec::new(),
             construction_planes: vec![
                 default_xy_plane(),
                 crate::construction::plane_from_definition(
@@ -385,6 +415,7 @@ mod tests {
             sketches: Vec::new(),
             rects: Vec::new(),
             lines: Vec::new(),
+            constraints: Vec::new(),
             construction_planes: vec![default_xy_plane()],
             shape_order: Vec::new(),
         };
