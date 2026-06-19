@@ -458,6 +458,29 @@ pub enum DistanceTarget {
     RectWidth(usize),
     RectHeight(usize),
     CircleDiameter(usize),
+    LineLineDistance {
+        line_a: ConstraintLine,
+        line_b: ConstraintLine,
+    },
+    PointPointDistance {
+        a: ConstraintPoint,
+        b: ConstraintPoint,
+    },
+    PointLineDistance {
+        point: ConstraintPoint,
+        line: ConstraintLine,
+    },
+}
+
+/// Target for the dimension tool (distance or angle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DimensionTarget {
+    Distance(DistanceTarget),
+    Angle {
+        line_a: ConstraintLine,
+        line_b: ConstraintLine,
+    },
 }
 
 /// Kind of sketch constraint.
@@ -483,6 +506,10 @@ pub enum ConstraintKind {
     },
     Horizontal { line: ConstraintLine },
     Vertical { line: ConstraintLine },
+    Angle {
+        line_a: ConstraintLine,
+        line_b: ConstraintLine,
+    },
 }
 
 /// Point or line reference for coincident constraints.

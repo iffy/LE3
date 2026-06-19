@@ -265,6 +265,100 @@ pub fn parse_positive_length_or_in_doc(text: &str, doc: &Document, fallback: f32
     if v > 0.0 { v } else { fallback }
 }
 
+/// Evaluate an angle expression to radians, or `None` if parsing fails.
+/// Bare numbers are interpreted as degrees; suffixes `deg` and `rad` are supported.
+pub fn eval_angle_rad(text: &str) -> Option<f32> {
+    eval_angle_rad_with_params(text, &[])
+}
+
+/// Evaluate an angle expression using document parameters (length-valued parameters).
+pub fn eval_angle_rad_in_doc(text: &str, doc: &Document) -> Option<f32> {
+    let params: Vec<(&str, &str)> = doc
+        .parameters
+        .iter()
+        .map(|p| (p.name.as_str(), p.expression.as_str()))
+        .collect();
+    eval_angle_rad_with_params(text, &params)
+}
+
+fn eval_angle_rad_with_params(text: &str, params: &[(&str, &str)]) -> Option<f32> {
+    let mut visiting = Vec::new();
+    eval_angle_rad_inner(text.trim(), params, &mut visiting)
+}
+
+fn eval_angle_rad_inner(text: &str, params: &[(&str, &str)], visiting: &mut Vec<String>) -> Option<f32> {
+    let mut p = AngleParser::new(text, Some(params), visiting);
+    let value = p.parse_expr().ok()?;
+    p.skip_ws();
+    if p.at_end() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Format an angle in radians for dimension labels (degrees by default).
+pub fn format_angle_display(rad: f32) -> String {
+    let deg = rad.to_degrees();
+    if deg.abs() < 0.05 {
+        "0 deg".to_string()
+    } else {
+        format!("{deg:.1} deg", deg = deg)
+    }
+}
+
+/// Evaluated angle for display above a dimension field.
+pub fn computed_angle_in_doc(text: &str, doc: &Document) -> Option<f32> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    eval_angle_rad_in_doc(t, doc).or_else(|| eval_angle_rad(t))
+}
+
+/// Whether to show a computed value above an angle dimension field.
+pub fn shows_computed_angle(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains(['+', '*', '/', '(', ')']) {
+        return true;
+    }
+    if t.chars().skip(1).any(|c| c == '-') {
+        return true;
+    }
+    has_angle_unit_suffix(t)
+}
+
+pub fn shows_computed_angle_in_doc(text: &str, doc: &Document) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if shows_computed_angle(t) {
+        return true;
+    }
+    if is_valid_parameter_name(t) {
+        return eval_angle_rad_in_doc(t, doc).is_some();
+    }
+    computed_angle_in_doc(t, doc).is_some()
+}
+
+fn has_angle_unit_suffix(text: &str) -> bool {
+    const UNITS: &[&str] = &["deg", "rad"];
+    let lower: String = text
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    UNITS.iter().any(|unit| {
+        lower.ends_with(unit)
+            && lower
+                .strip_suffix(unit)
+                .is_some_and(|prefix| prefix.chars().last().is_some_and(|c| c.is_ascii_digit()))
+    })
+}
+
 fn has_length_unit_suffix(text: &str) -> bool {
     const UNITS: &[&str] = &["mm", "cm", "ft", "in", "m"];
     let lower: String = text
@@ -500,6 +594,215 @@ impl<'a> Parser<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AngleUnit {
+    Deg,
+    Rad,
+}
+
+impl AngleUnit {
+    fn to_rad(self) -> f32 {
+        match self {
+            AngleUnit::Deg => std::f32::consts::PI / 180.0,
+            AngleUnit::Rad => 1.0,
+        }
+    }
+}
+
+struct AngleParser<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    params: Option<&'a [(&'a str, &'a str)]>,
+    visiting: &'a mut Vec<String>,
+}
+
+impl<'a> AngleParser<'a> {
+    fn new(input: &'a str, params: Option<&'a [(&'a str, &'a str)]>, visiting: &'a mut Vec<String>) -> Self {
+        Self {
+            chars: input.chars().peekable(),
+            params,
+            visiting,
+        }
+    }
+
+    fn at_end(&mut self) -> bool {
+        self.skip_ws();
+        self.chars.peek().is_none()
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.chars.peek(), Some(' ' | '\t')) {
+            self.chars.next();
+        }
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        self.chars.next()
+    }
+
+    fn peek(&mut self) -> Option<char> {
+        self.chars.peek().copied()
+    }
+
+    fn parse_expr(&mut self) -> Result<f32, ()> {
+        self.parse_add_sub()
+    }
+
+    fn parse_add_sub(&mut self) -> Result<f32, ()> {
+        let mut acc = self.parse_mul_div()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('+') => {
+                    self.bump();
+                    acc += self.parse_mul_div()?;
+                }
+                Some('-') => {
+                    self.bump();
+                    acc -= self.parse_mul_div()?;
+                }
+                _ => break,
+            }
+        }
+        Ok(acc)
+    }
+
+    fn parse_mul_div(&mut self) -> Result<f32, ()> {
+        let mut acc = self.parse_unary()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('*') => {
+                    self.bump();
+                    acc *= self.parse_unary()?;
+                }
+                Some('/') => {
+                    self.bump();
+                    let rhs = self.parse_unary()?;
+                    if rhs.abs() < f32::EPSILON {
+                        return Err(());
+                    }
+                    acc /= rhs;
+                }
+                _ => break,
+            }
+        }
+        Ok(acc)
+    }
+
+    fn parse_unary(&mut self) -> Result<f32, ()> {
+        self.skip_ws();
+        match self.peek() {
+            Some('-') => {
+                self.bump();
+                Ok(-self.parse_unary()?)
+            }
+            Some('+') => {
+                self.bump();
+                self.parse_unary()
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<f32, ()> {
+        self.skip_ws();
+        if self.peek() == Some('(') {
+            self.bump();
+            let v = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() != Some(')') {
+                return Err(());
+            }
+            self.bump();
+            return Ok(v);
+        }
+        if let Some(name) = self.try_parse_identifier() {
+            return self.resolve_identifier(name);
+        }
+        self.parse_quantity()
+    }
+
+    fn try_parse_identifier(&mut self) -> Option<String> {
+        self.skip_ws();
+        let rest: String = self.chars.clone().collect();
+        let (ident, len) = identifier_at(&rest, 0)?;
+        for _ in 0..len {
+            self.bump();
+        }
+        Some(ident.to_string())
+    }
+
+    fn resolve_identifier(&mut self, name: String) -> Result<f32, ()> {
+        let Some(params) = self.params else {
+            return Err(());
+        };
+        if self.visiting.iter().any(|v| v == &name) {
+            return Err(());
+        }
+        let expression = params
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, expr)| *expr)
+            .ok_or(())?;
+        self.visiting.push(name);
+        let value = eval_length_mm_inner(expression, params, self.visiting).ok_or(())?;
+        self.visiting.pop();
+        Ok(value.to_radians())
+    }
+
+    fn parse_quantity(&mut self) -> Result<f32, ()> {
+        self.skip_ws();
+        let n = self.parse_number()?;
+        let unit = self.parse_unit()?;
+        Ok(n * unit.to_rad())
+    }
+
+    fn parse_number(&mut self) -> Result<f32, ()> {
+        self.skip_ws();
+        let mut s = String::new();
+        let mut saw_digit = false;
+        let mut saw_dot = false;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                saw_digit = true;
+                s.push(c);
+                self.bump();
+            } else if c == '.' && !saw_dot {
+                saw_dot = true;
+                s.push(c);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        if !saw_digit {
+            return Err(());
+        }
+        s.parse::<f32>().map_err(|_| ())
+    }
+
+    fn parse_unit(&mut self) -> Result<AngleUnit, ()> {
+        self.skip_ws();
+        let rest: String = self.chars.clone().collect();
+        let lower: String = rest
+            .chars()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        for (suffix, unit, len) in [("deg", AngleUnit::Deg, 3), ("rad", AngleUnit::Rad, 3)] {
+            if lower.starts_with(suffix) {
+                let next = lower.as_bytes().get(len).copied();
+                if next.is_none_or(|b| !b.is_ascii_alphabetic()) {
+                    for _ in 0..len {
+                        self.bump();
+                    }
+                    return Ok(unit);
+                }
+            }
+        }
+        Ok(AngleUnit::Deg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +846,26 @@ mod tests {
         assert!(eval_length_mm("abc").is_none());
         assert!(eval_length_mm("12x").is_none());
         assert!(eval_length_mm("2in +").is_none());
+    }
+
+    #[test]
+    fn bare_angle_number_is_degrees() {
+        assert!((eval_angle_rad("90").unwrap() - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert!((eval_angle_rad("45deg").unwrap() - std::f32::consts::FRAC_PI_4).abs() < 1e-4);
+        assert!((eval_angle_rad("1.5708rad").unwrap() - 1.5708).abs() < 1e-4);
+    }
+
+    #[test]
+    fn angle_expression_arithmetic() {
+        let v = eval_angle_rad("45deg + 45").unwrap();
+        assert!((v - std::f32::consts::FRAC_PI_2).abs() < 1e-3, "got {v}");
+    }
+
+    #[test]
+    fn invalid_angle_expressions_return_none() {
+        assert!(eval_angle_rad("").is_none());
+        assert!(eval_angle_rad("abc").is_none());
+        assert!(eval_angle_rad("45 +").is_none());
     }
 
     #[test]

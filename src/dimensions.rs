@@ -616,6 +616,151 @@ pub fn linear_dimension_label_layout(
     (angle, rect)
 }
 
+pub const ARC_RADIUS: f32 = 24.0;
+pub const ARC_ARROW_LENGTH: f32 = 6.0;
+pub const ARC_ARROW_WING: f32 = 3.5;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArcDimensionWorldGeom {
+    pub center: Vec3,
+    pub start: Vec3,
+    pub end: Vec3,
+    pub label_center: Vec3,
+    pub plane_normal: Vec3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArcDimensionGeom {
+    pub center: Pos2,
+    pub start: Pos2,
+    pub end: Pos2,
+    pub label_center: Pos2,
+    pub start_tangent: Vec2,
+    pub end_tangent: Vec2,
+}
+
+pub fn arc_dimension_world_geom(
+    center: Vec3,
+    dir_a: Vec3,
+    dir_b: Vec3,
+    plane_normal: Vec3,
+    radius_world: f32,
+    label_outset_world: f32,
+) -> Option<ArcDimensionWorldGeom> {
+    let dir_a = dir_a.normalize_or_zero();
+    let dir_b = dir_b.normalize_or_zero();
+    let plane_n = plane_normal.normalize_or_zero();
+    if dir_a.length_squared() < 1e-8 || dir_b.length_squared() < 1e-8 || plane_n.length_squared() < 1e-8 {
+        return None;
+    }
+    let start = center + dir_a * radius_world;
+    let end = center + dir_b * radius_world;
+    let mid_dir = (dir_a + dir_b).normalize_or_zero();
+    let label_center = if mid_dir.length_squared() < 1e-8 {
+        center + plane_n * label_outset_world
+    } else {
+        center + mid_dir * (radius_world + label_outset_world)
+    };
+    Some(ArcDimensionWorldGeom {
+        center,
+        start,
+        end,
+        label_center,
+        plane_normal: plane_n,
+    })
+}
+
+pub fn project_arc_dimension_geom(
+    world: &ArcDimensionWorldGeom,
+    project: &impl Fn(Vec3) -> Option<Pos2>,
+) -> Option<ArcDimensionGeom> {
+    let center = project(world.center)?;
+    let start = project(world.start)?;
+    let end = project(world.end)?;
+    let label_center = project(world.label_center)?;
+    let start_tangent = {
+        let step = pixels_to_world_distance(project, world.start, world.plane_normal, 1.0);
+        let tip = project(world.start + world.plane_normal * step)?;
+        (tip - start).normalized()
+    };
+    let end_tangent = {
+        let step = pixels_to_world_distance(project, world.end, world.plane_normal, 1.0);
+        let tip = project(world.end + world.plane_normal * step)?;
+        (tip - end).normalized()
+    };
+    Some(ArcDimensionGeom {
+        center,
+        start,
+        end,
+        label_center,
+        start_tangent,
+        end_tangent,
+    })
+}
+
+fn draw_arc_arrowhead(painter: &Painter, tip: Pos2, tangent: Vec2, color: Color32) {
+    if tangent.length_sq() < 1e-4 {
+        return;
+    }
+    let t = tangent.normalized();
+    let side = Vec2::new(-t.y, t.x);
+    let base = tip - t * ARC_ARROW_LENGTH;
+    let stroke = Stroke::new(LINE_WIDTH, color);
+    painter.line_segment([tip, base + side * ARC_ARROW_WING], stroke);
+    painter.line_segment([tip, base - side * ARC_ARROW_WING], stroke);
+}
+
+pub fn draw_arc_dimension(
+    painter: &Painter,
+    geom: &ArcDimensionGeom,
+    label: &str,
+    color: Color32,
+) -> Rect {
+    let stroke = Stroke::new(LINE_WIDTH, color);
+    let center = geom.center;
+    let start_vec = geom.start - center;
+    let end_vec = geom.end - center;
+    let radius = start_vec.length().max(end_vec.length());
+    if radius < 1e-3 {
+        return Rect::NOTHING;
+    }
+    let start_angle = start_vec.y.atan2(start_vec.x);
+    let mut end_angle = end_vec.y.atan2(end_vec.x);
+    let mut sweep = end_angle - start_angle;
+    while sweep <= 0.0 {
+        sweep += std::f32::consts::TAU;
+    }
+    while sweep > std::f32::consts::PI {
+        sweep -= std::f32::consts::TAU;
+        end_angle = start_angle + sweep;
+    }
+    let segments = ((sweep / std::f32::consts::PI).abs() * 24.0).ceil().max(4.0) as usize;
+    let mut prev = geom.start;
+    for i in 1..=segments {
+        let t = i as f32 / segments as f32;
+        let angle = start_angle + sweep * t;
+        let next = center + Vec2::new(angle.cos(), angle.sin()) * radius;
+        painter.line_segment([prev, next], stroke);
+        prev = next;
+    }
+    draw_arc_arrowhead(painter, geom.start, geom.start_tangent, color);
+    draw_arc_arrowhead(painter, geom.end, geom.end_tangent, color);
+
+    let galley = painter.layout_no_wrap(
+        label.to_string(),
+        FontId::proportional(LABEL_FONT_SIZE),
+        color,
+    );
+    let galley_size = galley.size();
+    let half = galley_size * 0.5;
+    let pos = geom.label_center - half;
+    painter.add(
+        TextShape::new(pos, galley, color)
+            .with_override_text_color(color),
+    );
+    Rect::from_center_size(geom.label_center, galley_size).expand(LABEL_HIT_PAD)
+}
+
 pub fn draw_linear_dimension<Project>(
     painter: &Painter,
     geom: &LinearDimensionGeom,
@@ -668,6 +813,36 @@ mod tests {
         assert!(
             outward.dot(mid - interior) > 0.0,
             "extension lines should point away from the shape interior"
+        );
+    }
+
+    #[test]
+    fn arc_dimension_sweep_is_acute() {
+        let center = Pos2::new(100.0, 100.0);
+        let start = Pos2::new(124.0, 100.0);
+        let end = Pos2::new(100.0, 124.0);
+        let geom = ArcDimensionGeom {
+            center,
+            start,
+            end,
+            label_center: Pos2::new(112.0, 112.0),
+            start_tangent: Vec2::new(0.0, 1.0),
+            end_tangent: Vec2::new(-1.0, 0.0),
+        };
+        let start_vec = geom.start - center;
+        let end_vec = geom.end - center;
+        let start_angle = start_vec.y.atan2(start_vec.x);
+        let end_angle = end_vec.y.atan2(end_vec.x);
+        let mut sweep = end_angle - start_angle;
+        while sweep <= 0.0 {
+            sweep += std::f32::consts::TAU;
+        }
+        while sweep > std::f32::consts::PI {
+            sweep -= std::f32::consts::TAU;
+        }
+        assert!(
+            sweep > 0.0 && sweep <= std::f32::consts::FRAC_PI_2 + 0.01,
+            "sweep={sweep}"
         );
     }
 

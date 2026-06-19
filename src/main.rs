@@ -69,13 +69,14 @@ use construction::{
 };
 use document_health::{health_tint_color, DocumentHealth, HealthStatus};
 use document_lifecycle::{circle_alive, constraint_alive, line_alive, rect_alive};
+use constraints::{angle_constraint_display_dirs, constraint_evaluated_angle};
 use dimensions::{
-    circle_diameter_dimension_world_geom, circle_diameter_label_outward_px,
-    draw_linear_dimension, effective_circle_diameter_label_offset, effective_dim_offset,
-    planar_dimension_label_layout, PlanarLabelView, linear_dimension_world_geom,
+    arc_dimension_world_geom, circle_diameter_dimension_world_geom, circle_diameter_label_outward_px,
+    draw_arc_dimension, draw_linear_dimension, effective_circle_diameter_label_offset,
+    effective_dim_offset, planar_dimension_label_layout, PlanarLabelView, linear_dimension_world_geom,
     outward_perpendicular_uv, pixels_to_world_distance, preferred_outward_uv,
-    project_linear_dimension_geom, uv_dir_to_world, EXTENSION_OVERSHOOT, LABEL_FONT_SIZE,
-    LABEL_OUTSET,
+    project_arc_dimension_geom, project_linear_dimension_geom, uv_dir_to_world, ARC_RADIUS,
+    EXTENSION_OVERSHOOT, LABEL_FONT_SIZE, LABEL_OUTSET,
 };
 use face::{
     circle_world_diameter_endpoints, circle_world_perimeter,
@@ -229,6 +230,7 @@ struct CommittedDimLayout {
     target: DimLabelTarget,
     geom: dimensions::LinearDimensionGeom,
     world_geom: dimensions::LinearDimensionWorldGeom,
+    arc_geom: Option<dimensions::ArcDimensionGeom>,
     label: String,
     label_rect: egui::Rect,
     outward: egui::Vec2,
@@ -1458,6 +1460,17 @@ fn should_commit_sketch_on_enter(
     field_enter_commit || (enter_pressed && !dim_field_focused)
 }
 
+fn angle_expression_field_errors(text: &str, doc: &model::Document) -> Vec<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return vec!["Expression cannot be empty".to_string()];
+    }
+    if crate::value::eval_angle_rad_in_doc(t, doc).is_none() {
+        return vec![format!("Invalid angle expression '{t}'")];
+    }
+    Vec::new()
+}
+
 /// Show a sketch dimension field; selects all text when it gains focus so typing replaces the value.
 fn show_sketch_dimension_field(
     ui: &mut egui::Ui,
@@ -1468,11 +1481,20 @@ fn show_sketch_dimension_field(
     is_focus_target: bool,
     pending_focus: &mut bool,
     user_edited: bool,
+    angle: bool,
 ) -> SketchDimFieldResult {
     let has_focus = ctx.memory(|m| m.focused()) == Some(id);
-    let field_errors = length_expression_field_errors(text, doc, None);
+    let field_errors = if angle {
+        angle_expression_field_errors(text, doc)
+    } else {
+        length_expression_field_errors(text, doc, None)
+    };
     let has_errors = !field_errors.is_empty();
-    let show_computed_row = shows_computed_length_in_doc(text, doc);
+    let show_computed_row = if angle {
+        crate::value::shows_computed_angle_in_doc(text, doc)
+    } else {
+        shows_computed_length_in_doc(text, doc)
+    };
     let widget = if has_focus {
         &ui.style().visuals.widgets.active
     } else {
@@ -1501,8 +1523,14 @@ fn show_sketch_dimension_field(
 
     let computed = if has_errors {
         None
+    } else if angle {
+        crate::value::computed_angle_in_doc(text, doc)
+            .filter(|_| show_computed_row)
+            .map(crate::value::format_angle_display)
     } else {
-        computed_length_in_doc(text, doc).filter(|_| show_computed_row)
+        computed_length_in_doc(text, doc)
+            .filter(|_| show_computed_row)
+            .map(format_length_display)
     };
     let text_width = dim_input_text_width(text);
 
@@ -1511,7 +1539,7 @@ fn show_sketch_dimension_field(
         ui.vertical_centered(|ui| {
             if let Some(v) = computed {
                 ui.label(
-                    egui::RichText::new(format_length_display(v))
+                    egui::RichText::new(v)
                         .font(egui::FontId::monospace(11.0))
                         .color(col::DIM_INPUT_TEXT.gamma_multiply(0.65)),
                 );
@@ -1668,10 +1696,83 @@ fn push_circle_diameter_dim_layout(
         target,
         geom,
         world_geom,
+        arc_geom: None,
         label,
         label_rect,
         outward: geom.outward,
         offset: label_outward_px,
+    });
+}
+
+fn push_arc_dim_layout(
+    layouts: &mut Vec<CommittedDimLayout>,
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    frame: &face::SketchFrame,
+    doc: &model::Document,
+    target: DimLabelTarget,
+    line_a: model::ConstraintLine,
+    line_b: model::ConstraintLine,
+    label: String,
+) {
+    let Some((center, dir_a, dir_b)) = angle_constraint_display_dirs(doc, line_a, line_b) else {
+        return;
+    };
+    let plane_normal = frame.normal;
+    let radius_world = pixels_to_world_distance(&project, center, dir_a, ARC_RADIUS);
+    let label_outset_world = pixels_to_world_distance(&project, center, dir_a, LABEL_OUTSET);
+    let Some(world_geom) = arc_dimension_world_geom(
+        center,
+        dir_a,
+        dir_b,
+        plane_normal,
+        radius_world,
+        label_outset_world,
+    ) else {
+        return;
+    };
+    let Some(arc_geom) = project_arc_dimension_geom(&world_geom, &project) else {
+        return;
+    };
+    let color = col::DIM_ANNOTATION;
+    let label_rect = {
+        let galley = painter.layout_no_wrap(
+            label.clone(),
+            egui::FontId::proportional(LABEL_FONT_SIZE),
+            color,
+        );
+        egui::Rect::from_center_size(arc_geom.label_center, galley.size())
+            .expand(dimensions::LABEL_HIT_PAD)
+    };
+    layouts.push(CommittedDimLayout {
+        target,
+        geom: dimensions::LinearDimensionGeom {
+            ext_a_near: arc_geom.start,
+            ext_a_far: arc_geom.start,
+            ext_b_near: arc_geom.end,
+            ext_b_far: arc_geom.end,
+            dim_a: arc_geom.start,
+            dim_b: arc_geom.end,
+            label_center: arc_geom.label_center,
+            along: (arc_geom.end - arc_geom.start).normalized(),
+            outward: egui::Vec2::ZERO,
+        },
+        world_geom: dimensions::LinearDimensionWorldGeom {
+            ext_a_near: center,
+            ext_a_far: center,
+            ext_b_near: center,
+            ext_b_far: center,
+            dim_a: center,
+            dim_b: center,
+            label_center: world_geom.label_center,
+            along_world: dir_a,
+            outward_world: plane_normal,
+        },
+        arc_geom: Some(arc_geom),
+        label,
+        label_rect,
+        outward: egui::Vec2::ZERO,
+        offset: 0.0,
     });
 }
 
@@ -1722,6 +1823,7 @@ fn push_committed_dim_layout(
         target,
         geom,
         world_geom,
+        arc_geom: None,
         label,
         label_rect,
         outward: geom.outward,
@@ -1775,6 +1877,13 @@ fn build_committed_dim_layouts(
                 outward_perpendicular_uv(ua, va, ub, vb, iu, iv)
             }
             DistanceTarget::CircleDiameter(_) => unreachable!("handled above"),
+            DistanceTarget::LineLineDistance { .. }
+            | DistanceTarget::PointPointDistance { .. }
+            | DistanceTarget::PointLineDistance { .. } => {
+                let (ua, va) = world_to_local(&frame, a);
+                let (ub, vb) = world_to_local(&frame, b);
+                preferred_outward_uv(ua, va, ub, vb)
+            }
         };
         let label = constraint_evaluated_length(doc, index)
             .map(format_length_display)
@@ -1828,6 +1937,30 @@ fn build_committed_dim_layouts(
             label,
         );
     }
+    for (index, constraint) in doc
+        .constraints
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.sketch == session.sketch)
+    {
+        let ConstraintKind::Angle { line_a, line_b } = constraint.kind else {
+            continue;
+        };
+        let label = constraint_evaluated_angle(doc, index)
+            .map(crate::value::format_angle_display)
+            .unwrap_or_else(|| "?".to_string());
+        push_arc_dim_layout(
+            &mut layouts,
+            painter,
+            &project,
+            &frame,
+            doc,
+            index,
+            line_a,
+            line_b,
+            label,
+        );
+    }
     layouts
 }
 
@@ -1846,13 +1979,17 @@ fn draw_committed_dim_layouts<Project>(
             layout.target,
             col::DIM_ANNOTATION,
         );
-        draw_linear_dimension(
-            painter,
-            &layout.geom,
-            &layout.label,
-            color,
-            Some((&layout.world_geom, label_view, project)),
-        );
+        if let Some(arc_geom) = &layout.arc_geom {
+            draw_arc_dimension(painter, arc_geom, &layout.label, color);
+        } else {
+            draw_linear_dimension(
+                painter,
+                &layout.geom,
+                &layout.label,
+                color,
+                Some((&layout.world_geom, label_view, project)),
+            );
+        }
     }
 }
 
@@ -2683,7 +2820,7 @@ impl App {
                                 &target.kind,
                             ) {
                                 self.state.apply(Action::BeginDimensionEdit {
-                                    target: distance_target,
+                                    target: model::DimensionTarget::Distance(distance_target),
                                 });
                             }
                         }
@@ -3091,6 +3228,17 @@ impl App {
                                 })
                             },
                         )
+                    } else if let Some(model::DimensionTarget::Angle { line_a, line_b }) =
+                        edit.target.dimension_target(&self.state.doc)
+                    {
+                        angle_constraint_display_dirs(&self.state.doc, line_a, line_b).and_then(
+                            |(center, _dir_a, _dir_b)| {
+                                project(center).map(|pc| dim_input_layout_centered_on(
+                                    egui::Rect::from_center_size(pc, dim_input_size_for_text(&edit.text)),
+                                    &edit.text,
+                                ))
+                            },
+                        )
                     } else {
                         None
                     };
@@ -3114,6 +3262,7 @@ impl App {
                                 true,
                                 &mut edit.pending_focus,
                                 true,
+                                edit.target.is_angle(&self.state.doc),
                             );
                             commit_dim = result.enter_commit;
                         });
@@ -3373,6 +3522,7 @@ impl App {
                             cr.focused == 0,
                             &mut cr.pending_focus,
                             cr.user_edited[0],
+                            false,
                         );
                         if result.changed {
                             cr.user_edited[0] = true;
@@ -3395,6 +3545,7 @@ impl App {
                             cr.focused == 1,
                             &mut cr.pending_focus,
                             cr.user_edited[1],
+                            false,
                         );
                         if result.changed {
                             cr.user_edited[1] = true;
@@ -3476,6 +3627,7 @@ impl App {
                                 true,
                                 &mut cl.pending_focus,
                                 cl.user_edited,
+                                false,
                             );
                             if result.changed {
                                 cl.user_edited = true;
@@ -3548,6 +3700,7 @@ impl App {
                                     true,
                                     &mut cc.pending_focus,
                                     cc.user_edited,
+                                    false,
                                 );
                                 if result.changed {
                                     cc.user_edited = true;
@@ -3616,6 +3769,7 @@ impl App {
                             cp.focused == PlaneDim::Offset,
                             &mut cp.pending_focus,
                             cp.user_edited_offset,
+                            false,
                         );
                         if result.changed {
                             cp.user_edited_offset = true;
@@ -3639,6 +3793,7 @@ impl App {
                                 cp.focused == PlaneDim::Angle,
                                 &mut cp.pending_focus,
                                 cp.user_edited_angle,
+                                true,
                             );
                             if result.changed {
                                 cp.user_edited_angle = true;
@@ -3765,7 +3920,7 @@ impl App {
                 } else if self.state.sketch_session.is_none() {
                     "d: dimension  •  Open a sketch to add distance constraints"
                 } else {
-                    "d: dimension  •  Click a line segment • type length • Enter commit"
+                    "d: dimension  •  Select geometry, press D, or click a segment • Enter commit"
                 }
             }
             Tool::ConstructionPlane => {

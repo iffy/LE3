@@ -244,6 +244,9 @@ impl Instruction {
                     DistanceTarget::RectWidth(i) => format!("rect {i} width"),
                     DistanceTarget::RectHeight(i) => format!("rect {i} height"),
                     DistanceTarget::CircleDiameter(i) => format!("circle {i}"),
+                    DistanceTarget::LineLineDistance { .. } => "line_line".to_string(),
+                    DistanceTarget::PointPointDistance { .. } => "point_point".to_string(),
+                    DistanceTarget::PointLineDistance { .. } => "point_line".to_string(),
                 };
                 format!("add_constraint {target_name} {expression}")
             }
@@ -1062,6 +1065,11 @@ fn distance_target_lua_ref(target: &DistanceTarget) -> String {
         }
         DistanceTarget::RectHeight(index) => {
             format!("{{ kind = \"rect\", index = {index}, axis = \"height\" }}")
+        }
+        DistanceTarget::LineLineDistance { .. }
+        | DistanceTarget::PointPointDistance { .. }
+        | DistanceTarget::PointLineDistance { .. } => {
+            "{ kind = \"selection\" }".to_string()
         }
     }
 }

@@ -311,6 +311,15 @@ pub fn distance_target_alive(doc: &Document, target: DistanceTarget) -> bool {
             rect_alive(doc, index)
         }
         DistanceTarget::CircleDiameter(index) => circle_alive(doc, index),
+        DistanceTarget::LineLineDistance { line_a, line_b } => {
+            constraint_line_alive(doc, line_a) && constraint_line_alive(doc, line_b)
+        }
+        DistanceTarget::PointPointDistance { a, b } => {
+            constraint_point_alive(doc, a) && constraint_point_alive(doc, b)
+        }
+        DistanceTarget::PointLineDistance { point, line } => {
+            constraint_point_alive(doc, point) && constraint_line_alive(doc, line)
+        }
     }
 }
 
@@ -352,6 +361,9 @@ pub fn constraint_kind_applicable(doc: &Document, kind: ConstraintKind) -> bool 
         }
         ConstraintKind::Horizontal { line } | ConstraintKind::Vertical { line } => {
             constraint_line_alive(doc, line)
+        }
+        ConstraintKind::Angle { line_a, line_b } => {
+            constraint_line_alive(doc, line_a) && constraint_line_alive(doc, line_b)
         }
     }
 }

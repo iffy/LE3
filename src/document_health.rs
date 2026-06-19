@@ -8,7 +8,7 @@
 //! Siblings, child sketches, and other hierarchy descendants stay healthy unless they
 //! meet one of the rules above. Tombstoned (`deleted`) entities are hidden separately.
 
-use crate::constraints::find_distance_constraint;
+use crate::constraints::{find_dimension_constraint, find_distance_constraint};
 use crate::document_lifecycle::{
     constraint_entity_alive, constraint_line_alive, constraint_point_alive, distance_target_alive,
     element_alive,
@@ -16,9 +16,12 @@ use crate::document_lifecycle::{
 use crate::hierarchy::SceneElement;
 use crate::selection::SceneSelection;
 use crate::model::{
-    ConstraintEntity, ConstraintKind, ConstraintLine, ConstraintPoint, DistanceTarget, Document,
+    ConstraintEntity, ConstraintKind, ConstraintLine, ConstraintPoint, DimensionTarget,
+    DistanceTarget, Document,
 };
-use crate::value::{eval_length_mm_in_doc, parameter_names_referenced_in_expression};
+use crate::value::{
+    eval_angle_rad_in_doc, eval_length_mm_in_doc, parameter_names_referenced_in_expression,
+};
 use eframe::egui::Color32;
 use std::collections::HashMap;
 
@@ -158,7 +161,44 @@ fn scene_element_for_distance_target(target: DistanceTarget) -> SceneElement {
             SceneElement::Rect(index)
         }
         DistanceTarget::CircleDiameter(index) => SceneElement::Circle(index),
+        DistanceTarget::LineLineDistance { line_a, .. } => scene_element_for_line(line_a),
+        DistanceTarget::PointPointDistance { a, .. } => scene_element_for_point(a),
+        DistanceTarget::PointLineDistance { point, .. } => scene_element_for_point(point),
     }
+}
+
+fn scene_element_for_line(line: ConstraintLine) -> SceneElement {
+    match line {
+        ConstraintLine::Line(index) => SceneElement::Line(index),
+        ConstraintLine::RectEdge { rect, .. } => SceneElement::Rect(rect),
+    }
+}
+
+fn scene_element_for_point(point: ConstraintPoint) -> SceneElement {
+    match point {
+        ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(line),
+        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(rect),
+        ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(circle),
+    }
+}
+
+fn scene_element_for_dimension_target(target: DimensionTarget) -> SceneElement {
+    match target {
+        DimensionTarget::Distance(distance) => scene_element_for_distance_target(distance),
+        DimensionTarget::Angle { line_a, .. } => scene_element_for_line(line_a),
+    }
+}
+
+pub fn require_dimension_target_editable(
+    health: &DocumentHealth,
+    doc: &Document,
+    target: DimensionTarget,
+) -> Result<(), String> {
+    require_element_editable(health, scene_element_for_dimension_target(target))?;
+    if let Some(index) = find_dimension_constraint(doc, target) {
+        require_element_editable(health, SceneElement::Constraint(index))?;
+    }
+    Ok(())
 }
 
 pub fn require_distance_target_editable(
@@ -179,11 +219,18 @@ pub fn require_constraint_editable(
     constraint: usize,
 ) -> Result<(), String> {
     require_element_editable(health, SceneElement::Constraint(constraint))?;
-    if let Some(distance_target) = doc.constraints.get(constraint).and_then(|c| match c.kind {
-        ConstraintKind::Distance { target } => Some(target),
-        _ => None,
-    }) {
-        require_element_editable(health, scene_element_for_distance_target(distance_target))?;
+    let Some(kind) = doc.constraints.get(constraint).map(|c| c.kind) else {
+        return Ok(());
+    };
+    match kind {
+        ConstraintKind::Distance { target } => {
+            require_element_editable(health, scene_element_for_distance_target(target))?;
+        }
+        ConstraintKind::Angle { line_a, line_b } => {
+            require_element_editable(health, scene_element_for_line(line_a))?;
+            require_element_editable(health, scene_element_for_line(line_b))?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -374,6 +421,27 @@ fn mark_invalid_constraints_and_unstable_geometry(doc: &Document, health: &mut D
                         doc,
                         element,
                         "Referenced geometry was deleted".to_string(),
+                        None,
+                    );
+                }
+            }
+            ConstraintKind::Angle { line_a, line_b } => {
+                let a_alive = constraint_line_alive(doc, line_a);
+                let b_alive = constraint_line_alive(doc, line_b);
+                if !a_alive || !b_alive {
+                    set_element_invalid(
+                        health,
+                        doc,
+                        element,
+                        "Referenced geometry was deleted".to_string(),
+                        None,
+                    );
+                } else if eval_angle_rad_in_doc(&constraint.expression, doc).is_none() {
+                    set_element_invalid(
+                        health,
+                        doc,
+                        element,
+                        "Constraint expression cannot be evaluated".to_string(),
                         None,
                     );
                 }

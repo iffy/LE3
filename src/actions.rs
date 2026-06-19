@@ -24,7 +24,8 @@ use crate::hierarchy::ElementVisibility;
 use crate::names::{element_name, set_element_name, single_nameable_from_selection};
 use crate::document_health::{
     health_status_label, recompute_document_health, require_constraint_editable,
-    require_distance_target_editable, require_element_editable, require_parameter_editable,
+    require_dimension_target_editable, require_element_editable,
+    require_parameter_editable,
     selection_frozen_summary, DocumentHealth,
 };
 use crate::document_lifecycle::{delete_targets_from_selection, tombstone_elements};
@@ -32,12 +33,13 @@ use crate::selection::{click_scene_selection, SceneSelection};
 use crate::model::SketchId;
 use crate::view_cube::{self, CubeCornerId, CubeEdgeId};
 use crate::constraints::{
-    add_distance_constraint, constraint_expression, default_distance_expression,
-    distance_target_from_selection, find_distance_constraint, set_constraint_dim_offset,
-    set_constraint_expression, ConstraintId,
+    add_distance_constraint, apply_dimension_expression, constraint_expression,
+    default_dimension_expression, dimension_edit_from_selection, find_dimension_constraint,
+    find_distance_constraint, set_constraint_dim_offset, set_constraint_expression, ConstraintId,
 };
 use crate::model::{
-    Circle, ConstructionPlane, ConstraintPoint, DistanceTarget, Document, FaceId, Line, Rect,
+    Circle, ConstructionPlane, ConstraintPoint, DimensionTarget, DistanceTarget, Document, FaceId,
+    Line, Rect,
     RectEdge, ShapeKind,
 };
 use crate::vertex_drag;
@@ -321,7 +323,7 @@ pub enum Action {
         offset: f32,
     },
     BeginEditCommittedDim { target: DimLabelTarget },
-    BeginDimensionEdit { target: DistanceTarget },
+    BeginDimensionEdit { target: DimensionTarget },
     CommitCommittedDim,
     BeginConstructionPlane {
         reference: PlaneReference,
@@ -618,18 +620,37 @@ pub fn dim_label_axis_for_target(doc: &Document, target: DimLabelTarget) -> Opti
 #[derive(Clone, Debug, PartialEq)]
 pub enum DimEditTarget {
     Constraint(ConstraintId),
-    New(DistanceTarget),
+    New(DimensionTarget),
 }
 
 impl DimEditTarget {
-    pub fn distance_target(&self, doc: &Document) -> Option<DistanceTarget> {
+    pub fn dimension_target(&self, doc: &Document) -> Option<DimensionTarget> {
         match self {
             DimEditTarget::New(target) => Some(*target),
             DimEditTarget::Constraint(id) => doc.constraints.get(*id).and_then(|c| match c.kind {
-                crate::model::ConstraintKind::Distance { target } => Some(target),
+                crate::model::ConstraintKind::Distance { target } => {
+                    Some(DimensionTarget::Distance(target))
+                }
+                crate::model::ConstraintKind::Angle { line_a, line_b } => {
+                    Some(DimensionTarget::Angle { line_a, line_b })
+                }
                 _ => None,
             }),
         }
+    }
+
+    pub fn distance_target(&self, doc: &Document) -> Option<DistanceTarget> {
+        match self.dimension_target(doc)? {
+            DimensionTarget::Distance(target) => Some(target),
+            DimensionTarget::Angle { .. } => None,
+        }
+    }
+
+    pub fn is_angle(&self, doc: &Document) -> bool {
+        matches!(
+            self.dimension_target(doc),
+            Some(DimensionTarget::Angle { .. })
+        )
     }
 }
 
@@ -653,9 +674,8 @@ fn apply_committed_dim_expression(
 ) -> Result<(), String> {
     match target {
         DimEditTarget::Constraint(id) => set_constraint_expression(doc, id, expression.to_string()),
-        DimEditTarget::New(distance_target) => {
-            add_distance_constraint(doc, sketch, distance_target, expression.to_string())?;
-            Ok(())
+        DimEditTarget::New(dimension_target) => {
+            apply_dimension_expression(doc, sketch, dimension_target, expression)
         }
     }
 }
@@ -802,6 +822,16 @@ fn distance_target_status_label(target: DistanceTarget) -> String {
         DistanceTarget::RectWidth(i) => format!("rectangle {i} width"),
         DistanceTarget::RectHeight(i) => format!("rectangle {i} height"),
         DistanceTarget::CircleDiameter(i) => format!("circle {i} diameter"),
+        DistanceTarget::LineLineDistance { .. } => "parallel line spacing".to_string(),
+        DistanceTarget::PointPointDistance { .. } => "point distance".to_string(),
+        DistanceTarget::PointLineDistance { .. } => "point-line distance".to_string(),
+    }
+}
+
+fn dimension_target_status_label(target: DimensionTarget) -> String {
+    match target {
+        DimensionTarget::Distance(distance) => distance_target_status_label(distance),
+        DimensionTarget::Angle { .. } => "angle".to_string(),
     }
 }
 
@@ -848,13 +878,13 @@ impl AppState {
             && self.creating_circle.is_none()
     }
 
-    /// Start editing a dimension on the sole selected segment, if applicable.
+    /// Start editing a dimension on the current selection, if applicable.
     pub fn try_begin_dimension_from_selection(&mut self) -> bool {
         let Some(session) = self.sketch_session else {
             return false;
         };
         let Some(target) =
-            distance_target_from_selection(&self.doc, session.sketch, &self.scene_selection)
+            dimension_edit_from_selection(&self.doc, session.sketch, &self.scene_selection)
         else {
             return false;
         };
@@ -862,21 +892,25 @@ impl AppState {
         true
     }
 
-    fn start_committed_dimension_edit(&mut self, target: DistanceTarget) {
+    fn start_committed_dimension_edit(&mut self, target: DimensionTarget) {
         if self.sketch_session.is_none()
-            || require_distance_target_editable(&self.document_health, &self.doc, target).is_err()
+            || require_dimension_target_editable(&self.document_health, &self.doc, target).is_err()
         {
             return;
         }
-        let edit_target = if let Some(id) = find_distance_constraint(&self.doc, target) {
+        let edit_target = if let Some(id) = find_dimension_constraint(&self.doc, target) {
             DimEditTarget::Constraint(id)
         } else {
             DimEditTarget::New(target)
         };
         let text = match edit_target {
             DimEditTarget::Constraint(id) => committed_dim_expression(&self.doc, id)
-                .unwrap_or_else(|| default_distance_expression(&self.doc, target)),
-            DimEditTarget::New(_) => default_distance_expression(&self.doc, target),
+                .unwrap_or_else(|| default_dimension_expression(&self.doc, target)),
+            DimEditTarget::New(_) => default_dimension_expression(&self.doc, target),
+        };
+        let kind_label = match target {
+            DimensionTarget::Distance(_) => "length",
+            DimensionTarget::Angle { .. } => "angle",
         };
         self.editing_committed_dim = Some(EditingCommittedDim {
             target: edit_target,
@@ -884,8 +918,8 @@ impl AppState {
             pending_focus: true,
         });
         self.status = format!(
-            "Dimension {} • type length • Enter commit • Esc cancel",
-            distance_target_status_label(target)
+            "Dimension {} • type {kind_label} • Enter commit • Esc cancel",
+            dimension_target_status_label(target)
         );
     }
 
@@ -1100,7 +1134,7 @@ impl AppState {
                     Tool::Circle if self.sketch_session.is_some() => "Circle tool".to_string(),
                     Tool::Circle => "Circle tool — click a face".to_string(),
                     Tool::Dimension if self.sketch_session.is_some() => {
-                        "Dimension tool — click a segment".to_string()
+                        "Dimension tool — select geometry, then D, or click a segment".to_string()
                     }
                     Tool::Dimension => "Dimension tool — open a sketch first".to_string(),
                     Tool::Constraint if self.sketch_session.is_some() => {
@@ -1234,11 +1268,12 @@ impl AppState {
                         DimEditTarget::Constraint(id) => {
                             constraint_matches_rect_axis(&self.doc, *id, axis)
                         }
-                        DimEditTarget::New(target) => matches!(
+                        DimEditTarget::New(DimensionTarget::Distance(target)) => matches!(
                             (target, axis),
                             (DistanceTarget::RectWidth(_), RectAxis::Width)
                                 | (DistanceTarget::RectHeight(_), RectAxis::Height)
                         ),
+                        DimEditTarget::New(_) => false,
                     };
                     if matches {
                         edit.text = value;
@@ -1259,11 +1294,12 @@ impl AppState {
                         DimEditTarget::Constraint(id) => {
                             constraint_matches_rect_axis(&self.doc, *id, axis)
                         }
-                        DimEditTarget::New(target) => matches!(
+                        DimEditTarget::New(DimensionTarget::Distance(target)) => matches!(
                             (target, axis),
                             (DistanceTarget::RectWidth(_), RectAxis::Width)
                                 | (DistanceTarget::RectHeight(_), RectAxis::Height)
                         ),
+                        DimEditTarget::New(_) => false,
                     };
                     if matches {
                         edit.pending_focus = true;
@@ -1323,7 +1359,9 @@ impl AppState {
                 if let Some(edit) = &mut self.editing_committed_dim {
                     let matches = match &edit.target {
                         DimEditTarget::Constraint(id) => constraint_is_line_length(&self.doc, *id),
-                        DimEditTarget::New(DistanceTarget::LineLength(_)) => true,
+                        DimEditTarget::New(DimensionTarget::Distance(DistanceTarget::LineLength(_))) => {
+                            true
+                        }
                         DimEditTarget::New(_) => false,
                     };
                     if matches {
@@ -1361,7 +1399,9 @@ impl AppState {
                 if let Some(edit) = &mut self.editing_committed_dim {
                     let matches = match &edit.target {
                         DimEditTarget::Constraint(id) => constraint_is_line_length(&self.doc, *id),
-                        DimEditTarget::New(DistanceTarget::LineLength(_)) => true,
+                        DimEditTarget::New(DimensionTarget::Distance(DistanceTarget::LineLength(_))) => {
+                            true
+                        }
                         DimEditTarget::New(_) => false,
                     };
                     if matches {
@@ -1424,7 +1464,9 @@ impl AppState {
                         DimEditTarget::Constraint(id) => {
                             constraint_is_circle_diameter(&self.doc, *id)
                         }
-                        DimEditTarget::New(DistanceTarget::CircleDiameter(_)) => true,
+                        DimEditTarget::New(DimensionTarget::Distance(
+                            DistanceTarget::CircleDiameter(_),
+                        )) => true,
                         DimEditTarget::New(_) => false,
                     };
                     if matches {
@@ -1445,7 +1487,9 @@ impl AppState {
                         DimEditTarget::Constraint(id) => {
                             constraint_is_circle_diameter(&self.doc, *id)
                         }
-                        DimEditTarget::New(DistanceTarget::CircleDiameter(_)) => true,
+                        DimEditTarget::New(DimensionTarget::Distance(
+                            DistanceTarget::CircleDiameter(_),
+                        )) => true,
                         DimEditTarget::New(_) => false,
                     };
                     if matches {
@@ -1503,7 +1547,7 @@ impl AppState {
                         require_constraint_editable(&self.document_health, &self.doc, *id)
                     }
                     DimEditTarget::New(target) => {
-                        require_distance_target_editable(&self.document_health, &self.doc, *target)
+                        require_dimension_target_editable(&self.document_health, &self.doc, *target)
                     }
                 };
                 if let Err(e) = frozen {
@@ -2835,7 +2879,7 @@ mod tests {
         assert!(state.editing_committed_dim.is_some());
         assert_eq!(
             state.editing_committed_dim.as_ref().unwrap().target,
-            DimEditTarget::New(DistanceTarget::LineLength(0))
+            DimEditTarget::New(DimensionTarget::Distance(DistanceTarget::LineLength(0)))
         );
     }
 
@@ -2853,11 +2897,40 @@ mod tests {
         state.apply(Action::SetTool(Tool::Dimension));
         assert_eq!(
             state.editing_committed_dim.as_ref().unwrap().target,
-            DimEditTarget::New(DistanceTarget::RectHeight(0))
+            DimEditTarget::New(DimensionTarget::Distance(DistanceTarget::RectHeight(0)))
         );
     }
 
     #[test]
+    fn dimension_tool_begins_angle_edit_for_two_non_parallel_lines() {
+        use crate::model::{ConstraintLine, DimensionTarget};
+
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state.doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        state.doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 0.0, 10.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::Line(0),
+            additive: false,
+        });
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::Line(1),
+            additive: true,
+        });
+        state.apply(Action::SetTool(Tool::Dimension));
+        assert_eq!(
+            state.editing_committed_dim.as_ref().unwrap().target,
+            DimEditTarget::New(DimensionTarget::Angle {
+                line_a: ConstraintLine::Line(0),
+                line_b: ConstraintLine::Line(1),
+            })
+        );
+    }
+
     fn dimension_tool_adds_distance_constraint_to_line() {
         let mut state = AppState::default();
         let sketch = begin_default_sketch(&mut state);
@@ -2866,7 +2939,7 @@ mod tests {
         state.doc.shape_order.push(ShapeKind::Line);
         state.apply(Action::SetTool(Tool::Dimension));
         state.apply(Action::BeginDimensionEdit {
-            target: DistanceTarget::LineLength(0),
+            target: DimensionTarget::Distance(DistanceTarget::LineLength(0)),
         });
         state.apply(Action::SetLineLength {
             value: "12mm".to_string(),

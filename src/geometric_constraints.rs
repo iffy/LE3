@@ -407,6 +407,17 @@ fn validate_constraint_kind(
             validate_line_ref(doc, sketch, line)?;
             Ok(())
         }
+        ConstraintKind::Angle { line_a, line_b } => {
+            validate_line_ref(doc, sketch, line_a)?;
+            validate_line_ref(doc, sketch, line_b)?;
+            if line_a == line_b {
+                return Err("Constraint requires two different lines".to_string());
+            }
+            if lines_are_parallel(doc, line_a, line_b) {
+                return Err("Angle constraint requires non-parallel lines".to_string());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -531,6 +542,7 @@ fn apply_constraint_kind(doc: &mut Document, kind: ConstraintKind) -> Result<(),
         }
         ConstraintKind::Coincident { a, b } => apply_coincident(doc, a, b),
         ConstraintKind::Midpoint { point, line } => apply_midpoint(doc, point, line),
+        ConstraintKind::Angle { .. } => Ok(()),
     }
 }
 
@@ -600,7 +612,7 @@ fn apply_perpendicular(
 }
 
 /// Prefer moving sketch lines over rectangle edges when one side of the pair is fixed.
-fn parallel_reference_and_movable(
+pub fn parallel_reference_and_movable(
     line_a: ConstraintLine,
     line_b: ConstraintLine,
 ) -> (ConstraintLine, ConstraintLine) {
@@ -645,7 +657,7 @@ fn apply_coincident(doc: &mut Document, a: ConstraintEntity, b: ConstraintEntity
 }
 
 /// Prefer moving free line/circle points over rectangle corners, which reshape the rect.
-fn coincident_mover_and_anchor(
+pub fn coincident_mover_and_anchor(
     a: ConstraintPoint,
     b: ConstraintPoint,
 ) -> (ConstraintPoint, ConstraintPoint) {
@@ -679,7 +691,40 @@ fn project_point_on_segment(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32
     (x0 + dx * t, y0 + dy * t)
 }
 
-fn line_uv_endpoints(
+/// Whether two sketch lines are parallel (within tolerance).
+pub fn lines_are_parallel(doc: &Document, line_a: ConstraintLine, line_b: ConstraintLine) -> bool {
+    let Ok(((ax0, ay0), (ax1, ay1))) = line_uv_endpoints(doc, line_a) else {
+        return false;
+    };
+    let Ok(((bx0, by0), (bx1, by1))) = line_uv_endpoints(doc, line_b) else {
+        return false;
+    };
+    let adu = ax1 - ax0;
+    let adv = ay1 - ay0;
+    let bdu = bx1 - bx0;
+    let bdv = by1 - by0;
+    let alen = (adu * adu + adv * adv).sqrt();
+    let blen = (bdu * bdu + bdv * bdv).sqrt();
+    if alen < 1e-6 || blen < 1e-6 {
+        return false;
+    }
+    let cross = adu * bdv - adv * bdu;
+    (cross / (alen * blen)).abs() < 1e-3
+}
+
+/// Unit direction `(du, dv)` of a constraint line in sketch UV coordinates.
+pub fn line_direction_uv(doc: &Document, line: ConstraintLine) -> Option<(f32, f32)> {
+    let ((x0, y0), (x1, y1)) = line_uv_endpoints(doc, line).ok()?;
+    let du = x1 - x0;
+    let dv = y1 - y0;
+    let len = (du * du + dv * dv).sqrt();
+    if len < 1e-6 {
+        return None;
+    }
+    Some((du / len, dv / len))
+}
+
+pub fn line_uv_endpoints(
     doc: &Document,
     line: ConstraintLine,
 ) -> Result<((f32, f32), (f32, f32)), String> {
@@ -728,7 +773,7 @@ pub fn translate_line(
     set_line_uv_endpoints(doc, line, (x0 + du, y0 + dv), (x1 + du, y1 + dv))
 }
 
-fn set_line_uv_endpoints(
+pub fn set_line_uv_endpoints(
     doc: &mut Document,
     line: ConstraintLine,
     start: (f32, f32),

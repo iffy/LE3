@@ -417,6 +417,18 @@ fn distance_target_touches_element(target: DistanceTarget, element: SceneElement
             SceneElement::RectEdge(i, RectEdge::Left | RectEdge::Right),
         ) => r == i,
         (DistanceTarget::CircleDiameter(c), SceneElement::Circle(i)) => c == i,
+        (DistanceTarget::LineLineDistance { line_a, line_b }, element) => {
+            constraint_line_touches_element(line_a, element)
+                || constraint_line_touches_element(line_b, element)
+        }
+        (DistanceTarget::PointPointDistance { a, b }, element) => {
+            constraint_point_touches_element(a, element)
+                || constraint_point_touches_element(b, element)
+        }
+        (DistanceTarget::PointLineDistance { point, line }, element) => {
+            constraint_point_touches_element(point, element)
+                || constraint_line_touches_element(line, element)
+        }
         _ => false,
     }
 }
@@ -476,6 +488,10 @@ fn constraint_kind_touches_element(kind: ConstraintKind, element: SceneElement) 
         }
         ConstraintKind::Horizontal { line } | ConstraintKind::Vertical { line } => {
             constraint_line_touches_element(line, element)
+        }
+        ConstraintKind::Angle { line_a, line_b } => {
+            constraint_line_touches_element(line_a, element)
+                || constraint_line_touches_element(line_b, element)
         }
     }
 }
