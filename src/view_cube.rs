@@ -2,6 +2,7 @@
 //! drag-to-orbit, click faces/edges/corners to animate standard views.
 
 use crate::camera::{Camera, ProjectionMode, StandardView, VIEW_TRANSITION_DURATION};
+use crate::icons::{icon_for_projection_mode, paint_icon, IconId};
 use crate::stl::{fit_mesh_to_unit_cube, parse_ascii_stl, scale_mesh, MeshTriangle};
 use eframe::egui::epaint::TextShape;
 use eframe::egui::{
@@ -23,7 +24,6 @@ const BBOX_HOVER_STROKE: Color32 = Color32::from_rgb(255, 220, 120);
 const PRESET_TOGGLE_SIZE: f32 = 20.0;
 const PRESET_TOGGLE_MARGIN: f32 = 3.0;
 const PRESET_TOGGLE_ICON_PAD: f32 = 4.0;
-const PRESET_TOGGLE_ICON_STROKE: f32 = 1.4;
 /// Hide faces that are too edge-on to the camera (they flare when orthographically projected).
 const FACE_CULL_DOT: f32 = 0.22;
 /// Hide only nearly edge-on facets (grazing triangles are unstable to rasterize).
@@ -1072,6 +1072,14 @@ fn pick_cube(
     best.map(|(pick, _, _)| pick)
 }
 
+fn cube_pick_instruction(pick: CubePick) -> crate::script::Instruction {
+    match pick {
+        CubePick::Face(view) => crate::script::Instruction::View(view),
+        CubePick::Edge(id) => crate::script::Instruction::ViewEdge(id),
+        CubePick::Corner(id) => crate::script::Instruction::ViewCorner(id),
+    }
+}
+
 fn apply_cube_pick(cam: &mut Camera, pick: CubePick) {
     match pick {
         CubePick::Face(view) => cam.start_view_transition(view, VIEW_TRANSITION_DURATION),
@@ -1141,69 +1149,6 @@ fn projection_toggle_icon_rect(button: Rect) -> Rect {
     button.shrink(PRESET_TOGGLE_ICON_PAD)
 }
 
-fn icon_point(rect: Rect, u: f32, v: f32) -> Pos2 {
-    Pos2::new(
-        rect.min.x + rect.width() * u,
-        rect.min.y + rect.height() * v,
-    )
-}
-
-fn orthographic_icon_rect(rect: Rect) -> Rect {
-    rect.shrink(rect.width() * 0.22)
-}
-
-fn natural_icon_segments(rect: Rect) -> [(Pos2, Pos2); 4] {
-    let p = |u: f32, v: f32| icon_point(rect, u, v);
-    let bl = p(0.20, 0.78);
-    let br = p(0.80, 0.78);
-    let tl = p(0.30, 0.24);
-    let tr = p(0.70, 0.24);
-    [(bl, br), (br, tr), (tr, tl), (tl, bl)]
-}
-
-fn paint_icon_segments(painter: &Painter, segments: &[(Pos2, Pos2)], color: Color32) {
-    let stroke = Stroke::new(PRESET_TOGGLE_ICON_STROKE, color);
-    for &(a, b) in segments {
-        painter.line_segment([a, b], stroke);
-    }
-}
-
-/// Flat square — parallel projection has no vanishing point.
-fn paint_orthographic_icon(painter: &Painter, rect: Rect, color: Color32) {
-    painter.rect_stroke(
-        orthographic_icon_rect(rect),
-        1.0,
-        Stroke::new(PRESET_TOGGLE_ICON_STROKE, color),
-    );
-}
-
-/// Perspective trapezoid — converging edges.
-fn paint_natural_icon(painter: &Painter, rect: Rect, color: Color32) {
-    let segments = natural_icon_segments(rect);
-    paint_icon_segments(painter, &segments, color);
-}
-
-fn paint_home_icon(painter: &Painter, rect: Rect, color: Color32) {
-    let p = |u: f32, v: f32| icon_point(rect, u, v);
-    let stroke = Stroke::new(PRESET_TOGGLE_ICON_STROKE, color);
-    let peak = p(0.5, 0.18);
-    let eave_l = p(0.22, 0.42);
-    let eave_r = p(0.78, 0.42);
-    let base_l = p(0.30, 0.82);
-    let base_r = p(0.70, 0.82);
-    let door_top = p(0.46, 0.58);
-    let door_bl = p(0.46, 0.82);
-    let door_br = p(0.54, 0.82);
-    painter.line_segment([eave_l, peak], stroke);
-    painter.line_segment([peak, eave_r], stroke);
-    painter.line_segment([eave_l, base_l], stroke);
-    painter.line_segment([eave_r, base_r], stroke);
-    painter.line_segment([base_l, base_r], stroke);
-    painter.line_segment([door_top, door_bl], stroke);
-    painter.line_segment([door_bl, door_br], stroke);
-    painter.line_segment([door_br, door_top], stroke);
-}
-
 fn paint_icon_toggle_button(ui: &Ui, rect: Rect, hovered: bool, pressed: bool) {
     let fill = if pressed {
         Color32::from_gray(42)
@@ -1224,7 +1169,7 @@ fn show_icon_toggle_button(
     ui: &mut Ui,
     rect: Rect,
     hover_hint: &str,
-    paint_icon: impl FnOnce(&Painter, Rect, Color32),
+    icon: IconId,
     on_click: impl FnOnce(),
 ) {
     let response = ui.allocate_rect(rect, Sense::click());
@@ -1238,23 +1183,25 @@ fn show_icon_toggle_button(
     }
 
     paint_icon_toggle_button(ui, rect, hovered, pressed);
-    paint_icon(ui.painter(), rect, Color32::from_gray(210));
+    paint_icon(
+        ui.painter(),
+        ui.ctx(),
+        icon,
+        projection_toggle_icon_rect(rect),
+        Color32::from_gray(210),
+    );
 
     if clicked {
         on_click();
     }
 }
 
-fn paint_projection_mode_icon(painter: &Painter, button: Rect, mode: ProjectionMode) {
-    let color = Color32::from_gray(210);
-    let icon_rect = projection_toggle_icon_rect(button);
-    match mode {
-        ProjectionMode::Orthographic => paint_orthographic_icon(painter, icon_rect, color),
-        ProjectionMode::Natural => paint_natural_icon(painter, icon_rect, color),
-    }
-}
-
-fn show_projection_mode_toggle(ui: &mut Ui, cam: &mut Camera, pad_rect: Rect) {
+fn show_projection_mode_toggle(
+    ui: &mut Ui,
+    cam: &mut Camera,
+    pad_rect: Rect,
+    command_log: &mut Option<std::cell::RefMut<'_, crate::command_log::CommandLog>>,
+) {
     let rect = view_preset_toggle_rect(pad_rect);
     let active = cam.projection_mode();
     let target = active.opposite();
@@ -1262,15 +1209,20 @@ fn show_projection_mode_toggle(ui: &mut Ui, cam: &mut Camera, pad_rect: Rect) {
         ProjectionMode::Orthographic => "Orthographic projection",
         ProjectionMode::Natural => "Natural (perspective) projection",
     };
-    show_icon_toggle_button(ui, rect, hint, |painter, button, color| {
-        paint_projection_mode_icon(painter, button, target);
-        let _ = color;
-    }, || {
+    show_icon_toggle_button(ui, rect, hint, icon_for_projection_mode(target), || {
         cam.set_projection_mode(target);
+        if let Some(log) = command_log {
+            log.note_view_instruction(crate::script::Instruction::ProjectionMode(target));
+        }
     });
 }
 
-fn show_home_button(ui: &mut Ui, cam: &mut Camera, pad_rect: Rect) {
+fn show_home_button(
+    ui: &mut Ui,
+    cam: &mut Camera,
+    pad_rect: Rect,
+    command_log: &mut Option<std::cell::RefMut<'_, crate::command_log::CommandLog>>,
+) {
     let rect = view_home_toggle_rect(pad_rect);
     let response = ui.allocate_rect(rect, Sense::click());
     let hovered = response.hovered();
@@ -1282,17 +1234,29 @@ fn show_home_button(ui: &mut Ui, cam: &mut Camera, pad_rect: Rect) {
     }
 
     paint_icon_toggle_button(ui, rect, hovered, pressed);
-    paint_home_icon(ui.painter(), rect, Color32::from_gray(210));
+    paint_icon(
+        ui.painter(),
+        ui.ctx(),
+        IconId::Home,
+        projection_toggle_icon_rect(rect),
+        Color32::from_gray(210),
+    );
 
     response.context_menu(|ui| {
         if ui.button("Set current view as home").clicked() {
             cam.set_home_from_current();
+            if let Some(log) = command_log {
+                log.note_view_instruction(crate::script::Instruction::SetHomeView);
+            }
             ui.close_menu();
         }
     });
 
     if response.clicked() {
         cam.start_home_transition(VIEW_TRANSITION_DURATION);
+        if let Some(log) = command_log {
+            log.note_view_instruction(crate::script::Instruction::ViewHome);
+        }
     }
 }
 
@@ -1313,6 +1277,7 @@ pub fn show_hud(
     viewport: Rect,
     render_state: Option<&eframe::egui_wgpu::RenderState>,
     gpu_bear: bool,
+    command_log: Option<std::cell::RefMut<'_, crate::command_log::CommandLog>>,
 ) {
     let screen_rect = cube_rect_in_viewport(viewport);
     egui::Area::new(egui::Id::new("view_cube_hud"))
@@ -1321,7 +1286,7 @@ pub fn show_hud(
         .interactable(true)
         .constrain(false)
         .show(ctx, |ui| {
-            show(ui, cam, screen_rect, render_state, gpu_bear);
+            show(ui, cam, screen_rect, render_state, gpu_bear, command_log);
         });
 }
 
@@ -1332,6 +1297,7 @@ fn show(
     screen_rect: Rect,
     render_state: Option<&eframe::egui_wgpu::RenderState>,
     gpu_bear: bool,
+    mut command_log: Option<std::cell::RefMut<'_, crate::command_log::CommandLog>>,
 ) {
     let center = screen_rect.center();
     let scale = CUBE_SIZE * 0.42;
@@ -1367,13 +1333,20 @@ fn show(
     }
 
     if response.dragged() {
-        cam.orbit_trackball(response.drag_delta());
+        let delta = response.drag_delta();
+        cam.orbit_trackball(delta);
+        if let Some(log) = command_log.as_mut() {
+            log.note_orbit(delta);
+        }
     }
 
     if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if response.drag_delta().length() < DRAG_CLICK_THRESHOLD {
                 if let Some(pick) = pick_cube(&faces, &edges, &corners, pos) {
+                    if let Some(log) = command_log.as_mut() {
+                        log.note_view_instruction(cube_pick_instruction(pick));
+                    }
                     apply_cube_pick(cam, pick);
                 }
             }
@@ -1412,8 +1385,8 @@ fn show(
     if let Some(id) = hover_corner {
         draw_hovered_corner(painter, &corners, id);
     }
-    show_projection_mode_toggle(ui, cam, pad_rect);
-    show_home_button(ui, cam, pad_rect);
+    show_projection_mode_toggle(ui, cam, pad_rect, &mut command_log);
+    show_home_button(ui, cam, pad_rect, &mut command_log);
 }
 
 #[cfg(test)]
@@ -1741,16 +1714,9 @@ mod tests {
     fn projection_toggle_icons_fit_inside_button() {
         let button = Rect::from_min_size(Pos2::ZERO, Vec2::splat(PRESET_TOGGLE_SIZE));
         let icon = projection_toggle_icon_rect(button);
-        let stroke_pad = PRESET_TOGGLE_ICON_STROKE * 0.5 + 0.5;
-        let bounds = button.shrink(stroke_pad);
-        let square = orthographic_icon_rect(icon);
-        for corner in [square.left_top(), square.right_top(), square.right_bottom(), square.left_bottom()] {
-            assert!(bounds.contains(corner), "point {corner:?} outside {bounds:?}");
-        }
-        for &(a, b) in natural_icon_segments(icon).iter() {
-            assert!(bounds.contains(a), "point {a:?} outside {bounds:?}");
-            assert!(bounds.contains(b), "point {b:?} outside {bounds:?}");
-        }
+        assert!(button.contains_rect(icon));
+        assert!(icon.width() > 0.0);
+        assert!(icon.height() > 0.0);
     }
 
     #[test]
@@ -1779,18 +1745,7 @@ mod tests {
     fn home_icon_fits_inside_button() {
         let button = Rect::from_min_size(Pos2::ZERO, Vec2::splat(PRESET_TOGGLE_SIZE));
         let icon = projection_toggle_icon_rect(button);
-        let stroke_pad = PRESET_TOGGLE_ICON_STROKE * 0.5 + 0.5;
-        let bounds = button.shrink(stroke_pad);
-        let p = |u: f32, v: f32| icon_point(icon, u, v);
-        for corner in [
-            p(0.22, 0.18),
-            p(0.78, 0.18),
-            p(0.30, 0.82),
-            p(0.70, 0.82),
-            p(0.54, 0.58),
-        ] {
-            assert!(bounds.contains(corner), "point {corner:?} outside {bounds:?}");
-        }
+        assert!(button.contains_rect(icon));
     }
 
     #[test]

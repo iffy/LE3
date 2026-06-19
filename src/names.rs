@@ -14,6 +14,7 @@ pub fn nameable_element(element: SceneElement) -> Option<SceneElement> {
         | SceneElement::Line(_)
         | SceneElement::Circle(_)
         | SceneElement::Constraint(_) => Some(element),
+        SceneElement::Point(_) => None,
     }
 }
 
@@ -24,6 +25,64 @@ pub fn single_nameable_from_selection(
     selection.single().and_then(nameable_element)
 }
 
+fn name_matches(stored: Option<&str>, query: &str) -> bool {
+    stored
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|s| s == query)
+}
+
+/// Find the first scene element with the given custom name (case-sensitive).
+pub fn find_element_by_name(doc: &Document, name: &str) -> Option<SceneElement> {
+    let query = name.trim();
+    if query.is_empty() {
+        return None;
+    }
+    for (index, plane) in doc.construction_planes.iter().enumerate() {
+        if name_matches(plane.name.as_deref(), query) {
+            return Some(SceneElement::ConstructionPlane(index));
+        }
+    }
+    for (index, sketch) in doc.sketches.iter().enumerate() {
+        if name_matches(sketch.name.as_deref(), query) {
+            return Some(SceneElement::Sketch(index));
+        }
+    }
+    for (index, line) in doc.lines.iter().enumerate() {
+        if line.deleted {
+            continue;
+        }
+        if name_matches(line.name.as_deref(), query) {
+            return Some(SceneElement::Line(index));
+        }
+    }
+    for (index, rect) in doc.rects.iter().enumerate() {
+        if rect.deleted {
+            continue;
+        }
+        if name_matches(rect.name.as_deref(), query) {
+            return Some(SceneElement::Rect(index));
+        }
+    }
+    for (index, circle) in doc.circles.iter().enumerate() {
+        if circle.deleted {
+            continue;
+        }
+        if name_matches(circle.name.as_deref(), query) {
+            return Some(SceneElement::Circle(index));
+        }
+    }
+    for (index, constraint) in doc.constraints.iter().enumerate() {
+        if constraint.deleted {
+            continue;
+        }
+        if name_matches(constraint.name.as_deref(), query) {
+            return Some(SceneElement::Constraint(index));
+        }
+    }
+    None
+}
+
 pub fn element_name(doc: &Document, element: SceneElement) -> Option<&str> {
     let name = match element {
         SceneElement::ConstructionPlane(index) => doc.construction_planes.get(index)?.name.as_deref(),
@@ -32,7 +91,7 @@ pub fn element_name(doc: &Document, element: SceneElement) -> Option<&str> {
         SceneElement::Line(index) => doc.lines.get(index)?.name.as_deref(),
         SceneElement::Circle(index) => doc.circles.get(index)?.name.as_deref(),
         SceneElement::Constraint(index) => doc.constraints.get(index)?.name.as_deref(),
-        SceneElement::RectEdge(_, _) => None,
+        SceneElement::RectEdge(_, _) | SceneElement::Point(_) => None,
     }?;
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -96,6 +155,9 @@ pub fn set_element_name(doc: &mut Document, element: SceneElement, name: String)
         }
         SceneElement::RectEdge(_, _) => {
             return Err("rectangle edges cannot be renamed".to_string());
+        }
+        SceneElement::Point(_) => {
+            return Err("points cannot be renamed".to_string());
         }
     }
     Ok(())
@@ -189,6 +251,22 @@ mod tests {
         set_element_name(&mut doc, SceneElement::Rect(0), "   ".to_string()).unwrap();
         assert_eq!(element_name(&doc, SceneElement::Rect(0)), None);
         assert!(node_label(&doc, HierarchyNode::Rect(0)).starts_with("Rectangle 0"));
+    }
+
+    #[test]
+    fn find_element_by_name_returns_first_match() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
+        set_element_name(&mut doc, SceneElement::Line(0), "Guide".to_string()).unwrap();
+        set_element_name(&mut doc, SceneElement::Rect(0), "Guide".to_string()).unwrap();
+        assert_eq!(
+            find_element_by_name(&doc, "Guide"),
+            Some(SceneElement::Line(0))
+        );
+        assert_eq!(find_element_by_name(&doc, "Missing"), None);
     }
 
     #[test]

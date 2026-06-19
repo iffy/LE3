@@ -22,6 +22,12 @@ use crate::context::{
 use crate::hierarchy::SceneElement;
 use crate::hierarchy::ElementVisibility;
 use crate::names::{element_name, set_element_name, single_nameable_from_selection};
+use crate::document_health::{
+    health_status_label, recompute_document_health, require_constraint_editable,
+    require_distance_target_editable, require_element_editable, require_parameter_editable,
+    selection_frozen_summary, DocumentHealth,
+};
+use crate::document_lifecycle::{delete_targets_from_selection, tombstone_elements};
 use crate::selection::{click_scene_selection, SceneSelection};
 use crate::model::SketchId;
 use crate::view_cube::{self, CubeCornerId, CubeEdgeId};
@@ -31,8 +37,10 @@ use crate::constraints::{
     set_constraint_expression, ConstraintId,
 };
 use crate::model::{
-    Circle, ConstructionPlane, DistanceTarget, Document, FaceId, Line, Rect, RectEdge, ShapeKind,
+    Circle, ConstructionPlane, ConstraintPoint, DistanceTarget, Document, FaceId, Line, Rect,
+    RectEdge, ShapeKind,
 };
+use crate::vertex_drag;
 use crate::face::SketchFrame;
 use crate::parameters::{
     add_parameter, delete_parameter, recompute_document_geometry, set_parameter_expression,
@@ -63,6 +71,8 @@ pub enum Tool {
     Sketch,
     /// Click a line segment to add or edit a distance constraint.
     Dimension,
+    /// Select sketch entities and apply geometric constraints from the context pane.
+    Constraint,
 }
 
 impl Tool {
@@ -77,12 +87,16 @@ impl Tool {
             }
             "sketch" => Some(Tool::Sketch),
             "dimension" | "dim" => Some(Tool::Dimension),
+            "constraint" | "constraints" => Some(Tool::Constraint),
             _ => None,
         }
     }
 
     pub fn is_sketch_edit_tool(self) -> bool {
-        matches!(self, Tool::Rectangle | Tool::Line | Tool::Circle | Tool::Dimension)
+        matches!(
+            self,
+            Tool::Rectangle | Tool::Line | Tool::Circle | Tool::Dimension | Tool::Constraint
+        )
     }
 }
 
@@ -354,6 +368,8 @@ pub enum Action {
     CommitParameterName { index: usize, name: String },
     CommitParameterExpression { index: usize, expression: String },
     DeleteParameter { index: usize },
+    /// Tombstone every element in the current scene selection.
+    DeleteSelection,
     SetCommandPaletteOpen { open: bool },
     ToggleCommandPalette,
     ClickSceneElement {
@@ -376,6 +392,26 @@ pub enum Action {
         name: String,
     },
     FocusElementName,
+    /// Apply a geometric constraint type to the current selection (constraint tool).
+    AddGeometricConstraint(crate::geometric_constraints::GeometricConstraintType),
+    /// Apply the Nth enabled constraint shortcut (1–9) in the context pane.
+    ApplyConstraintShortcut(u8),
+    /// Move a sketch vertex to local `(u, v)` while satisfying constraints.
+    DragVertex {
+        point: ConstraintPoint,
+        u: f32,
+        v: f32,
+    },
+    /// Start dragging a line or rectangle edge from an anchor in sketch-local coords.
+    BeginLineDrag {
+        target: crate::model::ConstraintLine,
+        anchor_u: f32,
+        anchor_v: f32,
+    },
+    /// Continue dragging the active line segment to sketch-local `(u, v)`.
+    DragLine { u: f32, v: f32 },
+    /// Finish an interactive line drag.
+    EndLineDrag,
 }
 
 /// A toggleable UI pane (SPEC §11.1).
@@ -566,6 +602,18 @@ pub fn constraint_is_circle_diameter(doc: &Document, target: DimLabelTarget) -> 
     })
 }
 
+pub fn dim_label_axis_for_target(doc: &Document, target: DimLabelTarget) -> Option<DimLabelAxis> {
+    if constraint_matches_rect_axis(doc, target, RectAxis::Width) {
+        Some(DimLabelAxis::Width)
+    } else if constraint_matches_rect_axis(doc, target, RectAxis::Height) {
+        Some(DimLabelAxis::Height)
+    } else if constraint_is_line_length(doc, target) {
+        Some(DimLabelAxis::Length)
+    } else {
+        None
+    }
+}
+
 /// In-progress edit of a sketch dimension (Select or Dimension tool).
 #[derive(Clone, Debug, PartialEq)]
 pub enum DimEditTarget {
@@ -579,6 +627,7 @@ impl DimEditTarget {
             DimEditTarget::New(target) => Some(*target),
             DimEditTarget::Constraint(id) => doc.constraints.get(*id).and_then(|c| match c.kind {
                 crate::model::ConstraintKind::Distance { target } => Some(target),
+                _ => None,
             }),
         }
     }
@@ -690,6 +739,11 @@ pub struct AppState {
     pub context_pane: crate::context::ContextPaneState,
     pub editing_committed_dim: Option<EditingCommittedDim>,
     pub status: String,
+    pub command_log: Option<std::cell::RefCell<crate::command_log::CommandLog>>,
+    /// Reframe sketch geometry once the viewport rect is known (e.g. hierarchy open before first paint).
+    pub sketch_reframe_pending: bool,
+    pub document_health: DocumentHealth,
+    pub line_drag_session: Option<crate::vertex_drag::LineDragSession>,
 }
 
 impl Default for AppState {
@@ -713,7 +767,17 @@ impl Default for AppState {
             context_pane: crate::context::ContextPaneState::default(),
             editing_committed_dim: None,
             status: String::new(),
+            command_log: None,
+            sketch_reframe_pending: false,
+            document_health: DocumentHealth::default(),
+            line_drag_session: None,
         }
+    }
+}
+
+impl AppState {
+    pub fn refresh_document_health(&mut self) {
+        self.document_health = recompute_document_health(&self.doc);
     }
 }
 
@@ -752,7 +816,18 @@ fn element_label(element: SceneElement) -> String {
             format!("Rectangle {i} {} edge", edge.script_name())
         }
         SceneElement::Constraint(i) => format!("Constraint {i}"),
+        SceneElement::Point(_) => "Point".to_string(),
     }
+}
+
+fn require_construction_targets_editable(
+    health: &DocumentHealth,
+    selection: &SceneSelection,
+) -> Result<(), String> {
+    for element in construction_targets_from_selection(selection) {
+        require_element_editable(health, element)?;
+    }
+    Ok(())
 }
 
 /// Result of dispatching an action.
@@ -788,6 +863,11 @@ impl AppState {
     }
 
     fn start_committed_dimension_edit(&mut self, target: DistanceTarget) {
+        if self.sketch_session.is_none()
+            || require_distance_target_editable(&self.document_health, &self.doc, target).is_err()
+        {
+            return;
+        }
         let edit_target = if let Some(id) = find_distance_constraint(&self.doc, target) {
             DimEditTarget::Constraint(id)
         } else {
@@ -849,7 +929,11 @@ impl AppState {
     }
 
     pub fn apply(&mut self, action: Action) -> ActionResult {
-        match action {
+        let logged_action = self.command_log.is_some().then(|| action.clone());
+        if let Some(log) = &self.command_log {
+            log.borrow_mut().before_apply(&action, &self.cam);
+        }
+        let result = match action {
             Action::NewDocument => {
                 self.doc = Document::default();
                 self.path = None;
@@ -862,6 +946,7 @@ impl AppState {
                 self.element_visibility = ElementVisibility::default();
                 self.scene_selection.clear();
                 self.tool = Tool::Select;
+                self.document_health = DocumentHealth::default();
                 self.status = "New document".to_string();
                 ActionResult::Ok
             }
@@ -876,6 +961,7 @@ impl AppState {
                     self.doc = doc;
                     self.sketch_session = None;
                     self.cam.set_view_up(None);
+                    self.refresh_document_health();
                     self.path = Some(path.clone());
                     self.status = format!(
                         "Opened {} ({} rectangle(s), {} line(s))",
@@ -903,10 +989,12 @@ impl AppState {
                 self.creating_line = None;
                 self.creating_circle = None;
                 self.element_visibility = ElementVisibility::default();
+                self.document_health = DocumentHealth::default();
                 self.status = "Cleared".to_string();
                 ActionResult::Ok
             }
             Action::UndoLast => {
+                let mut undone = false;
                 match self.doc.shape_order.pop() {
                     Some(ShapeKind::Sketch) => {
                         let idx = self.doc.sketches.len().saturating_sub(1);
@@ -921,28 +1009,34 @@ impl AppState {
                                 self.exit_sketch_session();
                             }
                             self.status = "Undid last sketch".to_string();
+                            undone = true;
                         }
                     }
                     Some(ShapeKind::Rect) => {
                         self.doc.rects.pop();
                         self.status = "Undid last rectangle".to_string();
+                        undone = true;
                     }
                     Some(ShapeKind::Line) => {
                         self.doc.lines.pop();
                         self.status = "Undid last line".to_string();
+                        undone = true;
                     }
                     Some(ShapeKind::Circle) => {
                         self.doc.circles.pop();
                         self.status = "Undid last circle".to_string();
+                        undone = true;
                     }
                     Some(ShapeKind::Constraint) => {
                         self.doc.constraints.pop();
                         let _ = recompute_document_geometry(&mut self.doc);
                         self.status = "Undid last constraint".to_string();
+                        undone = true;
                     }
                     Some(ShapeKind::Parameter) => {
                         self.doc.parameters.pop();
                         self.status = "Undid last parameter".to_string();
+                        undone = true;
                     }
                     Some(ShapeKind::ConstructionPlane) => {
                         if self.doc.construction_planes.len() <= 1 {
@@ -964,10 +1058,14 @@ impl AppState {
                                     self.exit_sketch_session();
                                 }
                                 self.status = "Undid last construction plane".to_string();
+                                undone = true;
                             }
                         }
                     }
                     None => self.status = "Nothing to undo".to_string(),
+                }
+                if undone {
+                    self.refresh_document_health();
                 }
                 ActionResult::Ok
             }
@@ -984,12 +1082,14 @@ impl AppState {
                 if self.creating_plane.is_some() && tool != Tool::ConstructionPlane {
                     self.creating_plane = None;
                 }
-                if !matches!(tool, Tool::Select | Tool::Dimension) {
+                if !matches!(tool, Tool::Select | Tool::Dimension | Tool::Constraint) {
                     self.editing_committed_dim = None;
                 }
                 self.tool = tool;
                 self.status = match tool {
-                    Tool::Select => "Select tool".to_string(),
+                    Tool::Select => {
+                        "Select tool — Delete/Backspace removes selection".to_string()
+                    }
                     Tool::Sketch => "Sketch tool — click a face".to_string(),
                     Tool::Rectangle if self.sketch_session.is_some() => {
                         "Rectangle tool".to_string()
@@ -1003,6 +1103,10 @@ impl AppState {
                         "Dimension tool — click a segment".to_string()
                     }
                     Tool::Dimension => "Dimension tool — open a sketch first".to_string(),
+                    Tool::Constraint if self.sketch_session.is_some() => {
+                        "Constraint tool — select geometry, then pick a constraint".to_string()
+                    }
+                    Tool::Constraint => "Constraint tool — open a sketch first".to_string(),
                     Tool::ConstructionPlane => "Construction plane tool".to_string(),
                 };
                 if tool == Tool::Dimension {
@@ -1028,11 +1132,13 @@ impl AppState {
                         self.creating_line = None;
                         self.creating_circle = None;
                         self.tool = Tool::Select;
-                        self.status = "Select tool".to_string();
+                        self.status =
+                            "Select tool — Delete/Backspace removes selection".to_string();
                     }
                 } else if self.tool != Tool::Select {
                     self.tool = Tool::Select;
-                    self.status = "Select tool".to_string();
+                    self.status =
+                        "Select tool — Delete/Backspace removes selection".to_string();
                 }
                 ActionResult::Ok
             }
@@ -1233,6 +1339,11 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::SetDimLabelOffset { target, offset } => {
+                if let Err(e) = require_constraint_editable(&self.document_health, &self.doc, target)
+                {
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
                 let offset = if constraint_is_circle_diameter(&self.doc, target) {
                     crate::dimensions::effective_circle_diameter_label_offset(Some(offset))
                 } else {
@@ -1355,6 +1466,10 @@ impl AppState {
                             .to_string(),
                     );
                 }
+                if let Err(e) = require_constraint_editable(&self.document_health, &self.doc, target)
+                {
+                    return ActionResult::Err(e);
+                }
                 let Some(text) = committed_dim_expression(&self.doc, target) else {
                     return ActionResult::Err("Dimension is not editable".to_string());
                 };
@@ -1383,6 +1498,18 @@ impl AppState {
                 let Some(edit) = self.editing_committed_dim.take() else {
                     return ActionResult::Err("No committed dimension being edited".to_string());
                 };
+                let frozen = match &edit.target {
+                    DimEditTarget::Constraint(id) => {
+                        require_constraint_editable(&self.document_health, &self.doc, *id)
+                    }
+                    DimEditTarget::New(target) => {
+                        require_distance_target_editable(&self.document_health, &self.doc, *target)
+                    }
+                };
+                if let Err(e) = frozen {
+                    self.editing_committed_dim = Some(edit);
+                    return ActionResult::Err(e);
+                }
                 let target = edit.target.clone();
                 let text = edit.text.clone();
                 match apply_committed_dim_expression(
@@ -1392,6 +1519,7 @@ impl AppState {
                     &text,
                 ) {
                     Ok(()) => {
+                        self.refresh_document_health();
                         self.status = "Updated dimension".to_string();
                         ActionResult::Ok
                     }
@@ -1601,8 +1729,13 @@ impl AppState {
                 }
             }
             Action::CommitParameterName { index, name } => {
+                if let Err(e) = require_parameter_editable(&self.document_health, index) {
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
                 match set_parameter_name(&mut self.doc, index, name.clone()) {
                     Ok(()) => {
+                        self.refresh_document_health();
                         self.status = format!("Renamed parameter to {name}");
                         ActionResult::Ok
                     }
@@ -1613,8 +1746,14 @@ impl AppState {
                 }
             }
             Action::CommitParameterExpression { index, expression } => {
+                if let Err(e) = require_parameter_editable(&self.document_health, index) {
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
                 match set_parameter_expression(&mut self.doc, index, expression.clone()) {
                     Ok(()) => {
+                        let _ = recompute_document_geometry(&mut self.doc);
+                        self.refresh_document_health();
                         self.status = "Updated parameter".to_string();
                         ActionResult::Ok
                     }
@@ -1627,6 +1766,8 @@ impl AppState {
             Action::DeleteParameter { index } => {
                 match delete_parameter(&mut self.doc, index) {
                     Ok(()) => {
+                        let _ = recompute_document_geometry(&mut self.doc);
+                        self.refresh_document_health();
                         self.status = "Deleted parameter".to_string();
                         ActionResult::Ok
                     }
@@ -1635,6 +1776,46 @@ impl AppState {
                         ActionResult::Err(e)
                     }
                 }
+            }
+            Action::DeleteSelection => {
+                if self.scene_selection.is_empty() {
+                    self.status = "Nothing selected".to_string();
+                    return ActionResult::Ok;
+                }
+                let targets = delete_targets_from_selection(&self.scene_selection);
+                let count = tombstone_elements(&mut self.doc, &targets);
+                if let Some(session) = self.sketch_session {
+                    if !crate::document_lifecycle::sketch_alive(&self.doc, session.sketch) {
+                        self.exit_sketch_session();
+                    }
+                }
+                self.scene_selection.clear();
+                let _ = recompute_document_geometry(&mut self.doc);
+                self.refresh_document_health();
+                let mut status = format!("Deleted {count} element(s)");
+                let invalid = self
+                    .document_health
+                    .elements
+                    .values()
+                    .filter(|s| **s == crate::document_health::HealthStatus::Invalid)
+                    .count()
+                    + self
+                        .document_health
+                        .parameters
+                        .values()
+                        .filter(|s| **s == crate::document_health::HealthStatus::Invalid)
+                        .count();
+                let unstable = self
+                    .document_health
+                    .elements
+                    .values()
+                    .filter(|s| **s == crate::document_health::HealthStatus::Unstable)
+                    .count();
+                if invalid > 0 || unstable > 0 {
+                    status.push_str(&format!(" — {invalid} invalid, {unstable} unstable"));
+                }
+                self.status = status;
+                ActionResult::Ok
             }
             Action::SetCommandPaletteOpen { open } => {
                 if open {
@@ -1664,8 +1845,78 @@ impl AppState {
                 self.status = pane_status(pane, self.panes.is_visible(pane));
                 ActionResult::Ok
             }
+            Action::DragVertex { point, u, v } => {
+                let Some(sketch) = self.sketch_session.map(|s| s.sketch) else {
+                    return ActionResult::Err("Not in sketch mode".to_string());
+                };
+                let element = vertex_drag::scene_element_for_point(point);
+                if let Err(e) = require_element_editable(&self.document_health, element) {
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
+                match vertex_drag::drag_point(&mut self.doc, sketch, point, u, v) {
+                    Ok(()) => ActionResult::Ok,
+                    Err(e) => ActionResult::Err(e),
+                }
+            }
+            Action::BeginLineDrag {
+                target,
+                anchor_u,
+                anchor_v,
+            } => {
+                let Some(sketch) = self.sketch_session.map(|s| s.sketch) else {
+                    return ActionResult::Err("Not in sketch mode".to_string());
+                };
+                let element = vertex_drag::scene_element_for_line(target);
+                if let Err(e) = require_element_editable(&self.document_health, element) {
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
+                match vertex_drag::begin_line_drag_session(
+                    &self.doc,
+                    sketch,
+                    target,
+                    (anchor_u, anchor_v),
+                ) {
+                    Ok(session) => {
+                        self.line_drag_session = Some(session);
+                        ActionResult::Ok
+                    }
+                    Err(e) => ActionResult::Err(e),
+                }
+            }
+            Action::DragLine { u, v } => {
+                let Some(sketch) = self.sketch_session.map(|s| s.sketch) else {
+                    return ActionResult::Err("Not in sketch mode".to_string());
+                };
+                let Some(session) = self.line_drag_session.clone() else {
+                    return ActionResult::Err("No line drag in progress".to_string());
+                };
+                let element = vertex_drag::scene_element_for_line(session.target);
+                if let Err(e) = require_element_editable(&self.document_health, element) {
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
+                match vertex_drag::drag_line(&mut self.doc, sketch, &session, (u, v)) {
+                    Ok(()) => ActionResult::Ok,
+                    Err(e) => ActionResult::Err(e),
+                }
+            }
+            Action::EndLineDrag => {
+                self.line_drag_session = None;
+                ActionResult::Ok
+            }
             Action::ClickSceneElement { element, additive } => {
                 click_scene_selection(&mut self.scene_selection, element, additive);
+                if let Some((health_status, reason)) =
+                    selection_frozen_summary(&self.document_health, &self.scene_selection)
+                {
+                    self.status = format!(
+                        "{} — {}",
+                        health_status_label(health_status),
+                        reason
+                    );
+                }
                 ActionResult::Ok
             }
             Action::ClearSceneSelection => {
@@ -1675,7 +1926,11 @@ impl AppState {
             Action::SetShapeConstruction {
                 element,
                 construction,
-            } => match set_edge_construction(&mut self.doc, element, construction) {
+            } => {
+                if let Err(e) = require_element_editable(&self.document_health, element) {
+                    return ActionResult::Err(e);
+                }
+                match set_edge_construction(&mut self.doc, element, construction) {
                 Ok(()) => {
                     self.status = format!(
                         "{} {}",
@@ -1689,7 +1944,8 @@ impl AppState {
                     ActionResult::Ok
                 }
                 Err(e) => ActionResult::Err(e),
-            },
+                }
+            }
             Action::ApplyConstruction { construction } => {
                 if let Some(cr) = &mut self.creating_rect {
                     cr.construction = construction;
@@ -1723,6 +1979,11 @@ impl AppState {
                     self.draw_construction = construction;
                     self.status = draw_mode_status("Circle", construction);
                     return ActionResult::Ok;
+                }
+                if let Err(e) =
+                    require_construction_targets_editable(&self.document_health, &self.scene_selection)
+                {
+                    return ActionResult::Err(e);
                 }
                 let targets = construction_targets_from_selection(&self.scene_selection);
                 match set_construction_for_targets(&mut self.doc, &targets, construction) {
@@ -1775,6 +2036,11 @@ impl AppState {
                     self.status = draw_mode_status("Circle", self.draw_construction);
                     return ActionResult::Ok;
                 }
+                if let Err(e) =
+                    require_construction_targets_editable(&self.document_health, &self.scene_selection)
+                {
+                    return ActionResult::Err(e);
+                }
                 let targets = construction_targets_from_selection(&self.scene_selection);
                 match toggle_construction_for_targets(&mut self.doc, &targets) {
                     Ok(count) if count > 0 => {
@@ -1804,6 +2070,10 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::CommitElementName { element, name } => {
+                if let Err(e) = require_element_editable(&self.document_health, element) {
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
                 match set_element_name(&mut self.doc, element, name) {
                     Ok(()) => {
                         let label = element_name(&self.doc, element)
@@ -1818,6 +2088,39 @@ impl AppState {
                     }
                 }
             }
+            Action::AddGeometricConstraint(kind) => {
+                let Some(session) = self.sketch_session else {
+                    return ActionResult::Err("Open a sketch to add constraints".to_string());
+                };
+                for element in self.scene_selection.iter() {
+                    if let Err(e) = require_element_editable(&self.document_health, element) {
+                        return ActionResult::Err(e);
+                    }
+                }
+                match crate::geometric_constraints::add_geometric_constraint_from_selection(
+                    &mut self.doc,
+                    session.sketch,
+                    kind,
+                    &self.scene_selection,
+                ) {
+                    Ok(index) => {
+                        self.refresh_document_health();
+                        self.status =
+                            format!("Added {} constraint {index}", kind.label());
+                        ActionResult::Ok
+                    }
+                    Err(e) => ActionResult::Err(e),
+                }
+            }
+            Action::ApplyConstraintShortcut(index) => {
+                let rows = crate::geometric_constraints::constraint_pane_rows(&self.scene_selection);
+                let Some(kind) =
+                    crate::geometric_constraints::enabled_constraint_type(&rows, index)
+                else {
+                    return ActionResult::Err(format!("Constraint shortcut {index} is not active"));
+                };
+                self.apply(Action::AddGeometricConstraint(kind))
+            }
             Action::FocusElementName => {
                 let Some(element) = single_nameable_from_selection(&self.scene_selection) else {
                     return ActionResult::Err("Select a single element to rename".to_string());
@@ -1830,16 +2133,72 @@ impl AppState {
                 self.status = "Rename element".to_string();
                 ActionResult::Ok
             }
+        };
+        if matches!(result, ActionResult::Ok) {
+            if let (Some(log), Some(action)) = (&self.command_log, logged_action) {
+                log.borrow_mut().after_apply(action, &self.doc);
+            }
         }
+        result
     }
 
     fn exit_sketch_session(&mut self) {
         self.sketch_session = None;
+        self.sketch_reframe_pending = false;
         self.creating_rect = None;
         self.creating_line = None;
         self.editing_committed_dim = None;
         self.cam.leave_sketch_mode();
         self.tool = Tool::Select;
+    }
+
+    fn sketch_zoom_distance(
+        &self,
+        sketch: SketchId,
+        viewport: egui::Rect,
+        frame_padding_px: f32,
+    ) -> Option<f32> {
+        let frame_target = sketch_camera_target(&self.doc, sketch)?;
+        let bounds = frame_target.zoom?;
+        let face = self.doc.sketch_face(sketch)?;
+        let frame = sketch_frame(&self.doc, face)?;
+        let view_direction = self.cam.visible_face_view_direction(
+            frame_target.target,
+            frame_target.face_normal,
+        );
+        let current_look = (frame_target.target - self.cam.eye()).normalize_or_zero();
+        let sketch_up = sketch_view_up(
+            view_direction,
+            &frame,
+            current_look,
+            self.cam.view_up_hint(),
+        );
+        let corners = bounds.world_corners(&frame);
+        Some(self.cam.distance_to_fit_corners_with_up(
+            frame_target.target,
+            view_direction,
+            sketch_up,
+            &corners,
+            frame_padding_px,
+            viewport,
+        ))
+    }
+
+    /// Apply deferred sketch framing once the viewport rect is available.
+    pub fn apply_pending_sketch_reframe(&mut self, viewport: egui::Rect) {
+        if !self.sketch_reframe_pending {
+            return;
+        }
+        let Some(sketch) = self.sketch_session.map(|session| session.sketch) else {
+            self.sketch_reframe_pending = false;
+            return;
+        };
+        if let Some(zoom_distance) =
+            self.sketch_zoom_distance(sketch, viewport, SKETCH_EDIT_FRAME_PADDING_PX)
+        {
+            self.cam.set_transition_zoom(zoom_distance);
+        }
+        self.sketch_reframe_pending = false;
     }
 
     fn enter_sketch(
@@ -1848,6 +2207,7 @@ impl AppState {
         viewport: Option<egui::Rect>,
         frame_padding_px: Option<f32>,
     ) -> ActionResult {
+        self.sketch_reframe_pending = false;
         if let Some(frame_target) = sketch_camera_target(&self.doc, sketch) {
             let face = self.doc.sketch_face(sketch).unwrap();
             let frame = sketch_frame(&self.doc, face).unwrap();
@@ -1862,19 +2222,14 @@ impl AppState {
                 current_look,
                 self.cam.view_up_hint(),
             );
-            let zoom_distance = frame_target.zoom.and_then(|bounds| {
-                let frame = sketch_frame(&self.doc, face)?;
+            let zoom_distance = frame_target.zoom.and_then(|_| {
                 let vp = viewport?;
                 let padding = frame_padding_px?;
-                let corners = bounds.world_corners(&frame);
-                Some(self.cam.distance_to_fit_corners(
-                    frame_target.target,
-                    view_direction,
-                    &corners,
-                    padding,
-                    vp,
-                ))
+                self.sketch_zoom_distance(sketch, vp, padding)
             });
+            if frame_target.zoom.is_some() && viewport.is_none() {
+                self.sketch_reframe_pending = true;
+            }
             self.cam.start_sketch_view_transition(
                 frame_target.target,
                 frame_target.face_normal,
@@ -2877,9 +3232,10 @@ mod tests {
             .unwrap();
         let corners = bounds.world_corners(&frame);
         let view = (state.cam.eye() - state.cam.target).normalize();
-        let fitted = state.cam.distance_to_fit_corners(
+        let fitted = state.cam.distance_to_fit_corners_with_up(
             state.cam.target,
             view,
+            state.cam.view_up_hint(),
             &corners,
             SKETCH_EDIT_FRAME_PADDING_PX,
             viewport,
@@ -2918,9 +3274,10 @@ mod tests {
         );
         let corners = bounds.world_corners(&frame);
         let view = (state.cam.eye() - state.cam.target).normalize();
-        let fitted = state.cam.distance_to_fit_corners(
+        let fitted = state.cam.distance_to_fit_corners_with_up(
             state.cam.target,
             view,
+            state.cam.view_up_hint(),
             &corners,
             SKETCH_EDIT_FRAME_PADDING_PX,
             viewport,
@@ -2928,6 +3285,87 @@ mod tests {
         assert!(
             (state.cam.distance - fitted).abs() < 1.0,
             "open sketch should frame all sketch geometry"
+        );
+    }
+
+    #[test]
+    fn open_sketch_deferred_reframe_when_viewport_missing() {
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 100.0, 100.0));
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 600.0));
+        let before = state.cam.distance;
+
+        state.apply(Action::OpenSketch {
+            sketch,
+            viewport: None,
+        });
+        assert!(state.sketch_reframe_pending);
+        while state.cam.tick_transition(0.05) {}
+        assert!(
+            (state.cam.distance - before).abs() < 0.5,
+            "zoom should wait for viewport"
+        );
+
+        state.apply_pending_sketch_reframe(viewport);
+        while state.cam.tick_transition(0.05) {}
+        assert!(state.cam.distance < before);
+        assert!(!state.sketch_reframe_pending);
+
+        let frame = sketch_frame(&state.doc, FaceId::ConstructionPlane(0)).unwrap();
+        let bounds = sketch_camera_target(&state.doc, sketch)
+            .unwrap()
+            .zoom
+            .unwrap();
+        let corners = bounds.world_corners(&frame);
+        let view = (state.cam.eye() - state.cam.target).normalize();
+        let fitted = state.cam.distance_to_fit_corners_with_up(
+            state.cam.target,
+            view,
+            state.cam.view_up_hint(),
+            &corners,
+            SKETCH_EDIT_FRAME_PADDING_PX,
+            viewport,
+        );
+        assert!((state.cam.distance - fitted).abs() < 1.0);
+    }
+
+    #[test]
+    fn open_sketch_frames_wide_geometry_from_isometric() {
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        state
+            .doc
+            .rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 300.0, 80.0));
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 600.0));
+        let before = state.cam.distance;
+
+        state.apply(Action::OpenSketch {
+            sketch,
+            viewport: Some(viewport),
+        });
+        while state.cam.tick_transition(0.05) {}
+        assert!(state.cam.distance < before);
+
+        let frame = sketch_frame(&state.doc, FaceId::ConstructionPlane(0)).unwrap();
+        let bounds = sketch_camera_target(&state.doc, sketch)
+            .unwrap()
+            .zoom
+            .unwrap();
+        let corners = bounds.world_corners(&frame);
+        let view = (state.cam.eye() - state.cam.target).normalize();
+        let fitted = state.cam.distance_to_fit_corners_with_up(
+            state.cam.target,
+            view,
+            state.cam.view_up_hint(),
+            &corners,
+            SKETCH_EDIT_FRAME_PADDING_PX,
+            viewport,
+        );
+        assert!(
+            (state.cam.distance - fitted).abs() < 1.0,
+            "wide sketch from isometric should frame with sketch view up"
         );
     }
 
@@ -2996,6 +3434,210 @@ mod tests {
             additive: false,
         });
         assert!(state.scene_selection.is_empty());
+    }
+
+    #[test]
+    fn delete_selection_tombstones_selected_geometry() {
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::default());
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::Line(0),
+            additive: false,
+        });
+        state.apply(Action::DeleteSelection);
+        assert!(state.doc.lines[0].deleted);
+        assert!(state.scene_selection.is_empty());
+        assert_eq!(
+            state.document_health.element_status(SceneElement::Line(0)),
+            crate::document_health::HealthStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn delete_selection_status_reports_invalid_and_unstable_counts() {
+        use crate::model::{Constraint, ConstraintKind, ConstraintLine};
+
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 5.0, 10.0, 5.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.doc.constraints.push(Constraint {
+            sketch,
+            kind: ConstraintKind::Parallel {
+                line_a: ConstraintLine::Line(0),
+                line_b: ConstraintLine::Line(1),
+            },
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+        state.apply(Action::ClickSceneElement {
+            element: SceneElement::Line(0),
+            additive: false,
+        });
+        state.apply(Action::DeleteSelection);
+        assert!(state.status.contains("1 invalid"));
+        assert!(state.status.contains("1 unstable"));
+    }
+
+    #[test]
+    fn invalid_constraint_blocks_dim_label_offset() {
+        use crate::document_lifecycle::tombstone_element;
+
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
+        state.doc.shape_order.push(ShapeKind::Rect);
+        add_distance_constraint(
+            &mut state.doc,
+            sketch,
+            DistanceTarget::RectWidth(0),
+            "10mm".to_string(),
+        )
+        .unwrap();
+        tombstone_element(&mut state.doc, SceneElement::Rect(0));
+        state.refresh_document_health();
+        let width_constraint =
+            find_distance_constraint(&state.doc, DistanceTarget::RectWidth(0)).unwrap();
+        assert_eq!(
+            state.apply(Action::SetDimLabelOffset {
+                target: width_constraint,
+                offset: 55.0,
+            }),
+            ActionResult::Err("invalid: Dimension target was deleted".to_string())
+        );
+    }
+
+    #[test]
+    fn frozen_unstable_line_blocks_rename_and_vertex_drag() {
+        use crate::document_lifecycle::tombstone_element;
+        use crate::model::{Constraint, ConstraintKind, ConstraintLine, LineEnd};
+
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 5.0, 10.0, 5.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.doc.constraints.push(Constraint {
+            sketch,
+            kind: ConstraintKind::Parallel {
+                line_a: ConstraintLine::Line(0),
+                line_b: ConstraintLine::Line(1),
+            },
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+        tombstone_element(&mut state.doc, SceneElement::Line(0));
+        state.refresh_document_health();
+        state.apply(Action::OpenSketch {
+            sketch,
+            viewport: None,
+        });
+
+        assert_eq!(
+            state.apply(Action::CommitElementName {
+                element: SceneElement::Line(1),
+                name: "Partner".to_string(),
+            }),
+            ActionResult::Err("unstable: Lost parallel/perpendicular partner".to_string())
+        );
+        assert_eq!(
+            state.apply(Action::DragVertex {
+                point: ConstraintPoint::LineEndpoint {
+                    line: 1,
+                    end: LineEnd::Start,
+                },
+                u: 1.0,
+                v: 5.0,
+            }),
+            ActionResult::Err("unstable: Lost parallel/perpendicular partner".to_string())
+        );
+    }
+
+    #[test]
+    fn undo_last_refreshes_document_health() {
+        let mut state = AppState::default();
+        state.doc.parameters.push(crate::model::Parameter {
+            name: "bad".to_string(),
+            expression: "1mm / 0".to_string(),
+            deleted: false,
+        });
+        state.doc.shape_order.push(ShapeKind::Parameter);
+        state.refresh_document_health();
+        assert_eq!(
+            state.document_health.parameter_status(0),
+            crate::document_health::HealthStatus::Invalid
+        );
+
+        state.apply(Action::UndoLast);
+        assert!(state.doc.parameters.is_empty());
+        assert!(state.document_health.parameters.is_empty());
+    }
+
+    #[test]
+    fn open_tombstoned_document_recomputes_health() {
+        use crate::document_lifecycle::tombstone_element;
+        use crate::model::{Constraint, ConstraintKind, ConstraintLine};
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("le3_open_health.le3");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.shape_order.push(ShapeKind::Line);
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 5.0, 10.0, 5.0));
+        doc.shape_order.push(ShapeKind::Line);
+        doc.constraints.push(Constraint {
+            sketch,
+            kind: ConstraintKind::Parallel {
+                line_a: ConstraintLine::Line(0),
+                line_b: ConstraintLine::Line(1),
+            },
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+        doc.shape_order.push(ShapeKind::Constraint);
+        tombstone_element(&mut doc, SceneElement::Line(0));
+        crate::storage::save(&path, &doc).unwrap();
+
+        let loaded = crate::storage::open(&path).unwrap();
+        assert!(loaded.lines[0].deleted);
+        assert!(!loaded.lines[1].deleted);
+        let health_after_load = crate::document_health::recompute_document_health(&loaded);
+        assert_eq!(
+            health_after_load.element_status(SceneElement::Constraint(0)),
+            crate::document_health::HealthStatus::Invalid
+        );
+        assert_eq!(
+            health_after_load.element_status(SceneElement::Line(1)),
+            crate::document_health::HealthStatus::Unstable
+        );
+
+        let mut state = AppState::default();
+        state.apply(Action::Open { path: path.clone() });
+        assert_eq!(
+            state.document_health.element_status(SceneElement::Constraint(0)),
+            crate::document_health::HealthStatus::Invalid
+        );
+        assert_eq!(
+            state.document_health.element_status(SceneElement::Line(1)),
+            crate::document_health::HealthStatus::Unstable
+        );
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -2,6 +2,9 @@
 
 use crate::actions::SketchSession;
 use crate::camera::Camera;
+use crate::constraints::constraint_segment_endpoints;
+use crate::document_health::{health_tint_color, DocumentHealth};
+use crate::document_lifecycle::{circle_alive, constraint_alive, line_alive, rect_alive};
 use crate::construction::{
     axis_angle_handle, axis_normal, axis_reference_perp, gizmo_display_offset, global_axis_segment,
     plane_corners, AxisGizmoHit, AXIS_ANGLE_GIZMO_RADIUS_MM, CONSTRUCTION_DASH_GAP_PX,
@@ -174,10 +177,10 @@ pub struct ViewportSceneInput<'a> {
     pub active_sketch_face: Option<FaceId>,
     pub dimension_labels: &'a [ViewportDimLabel],
     pub dim_label_view: Option<PlanarLabelView>,
-    pub dim_annotation_color: Color32,
     pub plane_gizmo: Option<ViewportPlaneGizmo>,
     pub hover_highlight: Option<ViewportHoverHighlight>,
     pub hover_color: Color32,
+    pub document_health: &'a DocumentHealth,
 }
 
 impl ViewportScene {
@@ -199,52 +202,69 @@ impl ViewportScene {
         );
 
         for (ri, rect) in input.doc.rects.iter().enumerate() {
-            if !input
-                .element_visibility
-                .effective_visible(input.doc, SceneElement::Rect(ri))
+            if !rect_alive(input.doc, ri)
+                || !input
+                    .element_visibility
+                    .effective_visible(input.doc, SceneElement::Rect(ri))
             {
                 continue;
             }
             let dim = input.sketch_session.is_some_and(|s| {
                 !sketch_rect_is_active(input.doc, s, ri, rect.sketch)
             });
+            let element = SceneElement::Rect(ri);
             mesh.push_rect_fill(
                 input.doc,
                 rect,
                 ri,
                 input.cam,
-                sketch_color(input.palette.rect_line, dim),
-                sketch_color(input.palette.construction, dim),
+                health_tint_color(
+                    sketch_color(input.palette.rect_line, dim),
+                    input.document_health.element_status(element),
+                ),
+                health_tint_color(
+                    sketch_color(input.palette.construction, dim),
+                    input.document_health.element_status(element),
+                ),
                 shape_fill_depth_bias(ri),
             );
         }
 
         for (ci, circle) in input.doc.circles.iter().enumerate() {
-            if !input
-                .element_visibility
-                .effective_visible(input.doc, SceneElement::Circle(ci))
+            if !circle_alive(input.doc, ci)
+                || !input
+                    .element_visibility
+                    .effective_visible(input.doc, SceneElement::Circle(ci))
             {
                 continue;
             }
             let dim = input.sketch_session.is_some_and(|s| {
                 !sketch_circle_is_active(input.doc, s, ci, circle.sketch)
             });
+            let element = SceneElement::Circle(ci);
             mesh.push_circle_fill(
                 input.doc,
                 circle,
                 ci,
                 input.cam,
-                sketch_color(input.palette.rect_line, dim),
-                sketch_color(input.palette.construction, dim),
+                health_tint_color(
+                    sketch_color(input.palette.rect_line, dim),
+                    input.document_health.element_status(element),
+                ),
+                health_tint_color(
+                    sketch_color(input.palette.construction, dim),
+                    input.document_health.element_status(element),
+                ),
                 shape_fill_depth_bias(ci),
             );
         }
 
         let mut plane_draws: Vec<(usize, ConstructionPlane, Color32, f32)> = Vec::new();
         for (i, plane) in input.doc.construction_planes.iter().enumerate() {
-            if !input
-                .element_visibility
-                .effective_visible(input.doc, SceneElement::ConstructionPlane(i))
+            if plane.deleted
+                || !input
+                    .element_visibility
+                    .effective_visible(input.doc, SceneElement::ConstructionPlane(i))
             {
                 continue;
             }
@@ -268,18 +288,21 @@ impl ViewportScene {
         mesh.set_index_layer(MeshIndexLayer::Base);
 
         for (li, line) in input.doc.lines.iter().enumerate() {
-            if !input
-                .element_visibility
-                .effective_visible(input.doc, SceneElement::Line(li))
+            if !line_alive(input.doc, li)
+                || !input
+                    .element_visibility
+                    .effective_visible(input.doc, SceneElement::Line(li))
             {
                 continue;
             }
+            let element = SceneElement::Line(li);
             let dim = input.sketch_session.is_some_and(|s| line.sketch != s.sketch);
-            let color = if line.construction {
+            let base = if line.construction {
                 sketch_color(input.palette.construction, dim)
             } else {
                 sketch_color(input.palette.line_stroke, dim)
             };
+            let color = health_tint_color(base, input.document_health.element_status(element));
             if let Some((a, b)) = line_world_endpoints(input.doc, line) {
                 if line.construction {
                     mesh.push_dashed_line_segment(
@@ -299,35 +322,45 @@ impl ViewportScene {
 
         mesh.set_index_layer(MeshIndexLayer::Overlay);
         for (ri, rect) in input.doc.rects.iter().enumerate() {
-            if !input
-                .element_visibility
-                .effective_visible(input.doc, SceneElement::Rect(ri))
+            if !rect_alive(input.doc, ri)
+                || !input
+                    .element_visibility
+                    .effective_visible(input.doc, SceneElement::Rect(ri))
             {
                 continue;
             }
             let dim = input.sketch_session.is_some_and(|s| {
                 !sketch_rect_is_active(input.doc, s, ri, rect.sketch)
             });
+            let element = SceneElement::Rect(ri);
             mesh.push_rect_strokes(
                 input.doc,
                 rect,
                 input.cam,
                 input.viewport,
                 &vp,
-                sketch_color(input.palette.rect_line, dim),
-                sketch_color(input.palette.construction, dim),
+                health_tint_color(
+                    sketch_color(input.palette.rect_line, dim),
+                    input.document_health.element_status(element),
+                ),
+                health_tint_color(
+                    sketch_color(input.palette.construction, dim),
+                    input.document_health.element_status(element),
+                ),
             );
         }
         for (ci, circle) in input.doc.circles.iter().enumerate() {
-            if !input
-                .element_visibility
-                .effective_visible(input.doc, SceneElement::Circle(ci))
+            if !circle_alive(input.doc, ci)
+                || !input
+                    .element_visibility
+                    .effective_visible(input.doc, SceneElement::Circle(ci))
             {
                 continue;
             }
             let dim = input.sketch_session.is_some_and(|s| {
                 !sketch_circle_is_active(input.doc, s, ci, circle.sketch)
             });
+            let element = SceneElement::Circle(ci);
             mesh.push_circle_strokes(
                 input.doc,
                 circle,
@@ -335,13 +368,20 @@ impl ViewportScene {
                 input.cam,
                 input.viewport,
                 &vp,
-                sketch_color(input.palette.rect_line, dim),
-                sketch_color(input.palette.construction, dim),
+                health_tint_color(
+                    sketch_color(input.palette.rect_line, dim),
+                    input.document_health.element_status(element),
+                ),
+                health_tint_color(
+                    sketch_color(input.palette.construction, dim),
+                    input.document_health.element_status(element),
+                ),
             );
         }
 
         mesh.push_selection(
             input.doc,
+            input.document_health,
             input.selection,
             input.cam,
             input.viewport,
@@ -444,7 +484,7 @@ impl ViewportScene {
                 push_linear_dimension_world(
                     &mut mesh,
                     &label.world_geom,
-                    input.dim_annotation_color,
+                    label.color,
                     input.cam,
                     input.viewport,
                     &vp,
@@ -592,6 +632,28 @@ impl<'a> SceneMesh<'a> {
             viewport,
             view_proj,
             STROKE_DEPTH_BIAS,
+        );
+    }
+
+    fn push_point_marker(
+        &mut self,
+        world: Vec3,
+        color: Color32,
+        radius_px: f32,
+        cam: &Camera,
+        viewport: UiRect,
+        view_proj: &Mat4,
+    ) {
+        let project = |p: Vec3| cam.project(p, viewport, view_proj);
+        push_screen_disc(
+            self,
+            world,
+            radius_px,
+            color,
+            cam,
+            viewport,
+            view_proj,
+            &project,
         );
     }
 
@@ -942,19 +1004,24 @@ impl<'a> SceneMesh<'a> {
     fn push_selection(
         &mut self,
         doc: &Document,
+        health: &DocumentHealth,
         selection: &SceneSelection,
         cam: &Camera,
         viewport: UiRect,
         view_proj: &Mat4,
-        color: Color32,
+        base_color: Color32,
     ) {
         if selection.is_empty() {
             return;
         }
         for element in selection.iter() {
+            let color = health_tint_color(base_color, health.element_status(element));
             let dashed = selection_highlight_dashed(doc, element) == Some(true);
             match element {
                 SceneElement::Line(index) => {
+                    if !line_alive(doc, index) {
+                        continue;
+                    }
                     if let Some(line) = doc.lines.get(index) {
                         if let Some((a, b)) = line_world_endpoints(doc, line) {
                             if dashed {
@@ -968,6 +1035,9 @@ impl<'a> SceneMesh<'a> {
                     }
                 }
                 SceneElement::RectEdge(index, edge) => {
+                    if !rect_alive(doc, index) {
+                        continue;
+                    }
                     if let Some(rect) = doc.rects.get(index) {
                         let segments = rect_edge_segments(doc, rect);
                         let (a, b) = segments[edge.index()];
@@ -981,6 +1051,9 @@ impl<'a> SceneMesh<'a> {
                     }
                 }
                 SceneElement::Rect(index) => {
+                    if !rect_alive(doc, index) {
+                        continue;
+                    }
                     if let Some(rect) = doc.rects.get(index) {
                         for (edge_index, (a, b)) in
                             rect_edge_segments(doc, rect).into_iter().enumerate()
@@ -1002,6 +1075,9 @@ impl<'a> SceneMesh<'a> {
                     }
                 }
                 SceneElement::Circle(index) => {
+                    if !circle_alive(doc, index) {
+                        continue;
+                    }
                     if let Some(circle) = doc.circles.get(index) {
                         if let Some(perimeter) =
                             circle_world_perimeter(doc, circle, CIRCLE_SEGMENTS)
@@ -1030,6 +1106,19 @@ impl<'a> SceneMesh<'a> {
                                 }
                             }
                         }
+                    }
+                }
+                SceneElement::Constraint(index) => {
+                    if !constraint_alive(doc, index) {
+                        continue;
+                    }
+                    if let Some((a, b)) = constraint_segment_endpoints(doc, index) {
+                        self.push_line_segment(a, b, color, 3.0, cam, viewport, view_proj);
+                    }
+                }
+                SceneElement::Point(point) => {
+                    if let Some(world) = crate::construction::point_world_position(doc, point) {
+                        self.push_point_marker(world, color, 6.0, cam, viewport, view_proj);
                     }
                 }
                 _ => {}
@@ -1213,6 +1302,20 @@ impl<'a> SceneMesh<'a> {
         project: &impl Fn(Vec3) -> Option<egui::Pos2>,
     ) {
         match kind {
+            PickTargetKind::Point(point) => {
+                if let Some(world) = crate::construction::point_world_position(doc, *point) {
+                    push_screen_disc(
+                        self,
+                        world,
+                        6.0,
+                        color,
+                        cam,
+                        viewport,
+                        view_proj,
+                        project,
+                    );
+                }
+            }
             PickTargetKind::Line(index) => {
                 if let Some(line) = doc.lines.get(*index) {
                     if let Some((a, b)) = line_world_endpoints(doc, line) {
@@ -2106,10 +2209,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         let preview_plane = state.doc.construction_planes[0].clone();
         let with_preview = ViewportScene::build(&ViewportSceneInput {
@@ -2131,10 +2234,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         assert!(
             with_preview.overlay_indices.len() > base.overlay_indices.len(),
@@ -2162,10 +2265,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: crate::construction::PICK_HOVER_RGBA,
+            document_health: &DocumentHealth::default(),
         });
         let with_hover = ViewportScene::build(&ViewportSceneInput {
             doc: &state.doc,
@@ -2182,12 +2285,12 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: Some(ViewportHoverHighlight::SketchFace(
                 FaceId::ConstructionPlane(0),
             )),
             hover_color: crate::construction::PICK_HOVER_RGBA,
+            document_health: &DocumentHealth::default(),
         });
         let hover_indices =
             with_hover.overlay_indices.len() - base.overlay_indices.len();
@@ -2219,10 +2322,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         let gizmo = ViewportPlaneGizmo {
             reference: PlaneReference::Face {
@@ -2250,10 +2353,11 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
+
             plane_gizmo: Some(gizmo),
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         assert!(
             with_gizmo.indices.len() > base.indices.len(),
@@ -2280,10 +2384,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         assert!(!scene.vertices.is_empty());
         assert!(!scene.indices.is_empty());
@@ -2321,10 +2425,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         })
     }
 
@@ -2420,10 +2524,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         assert!(scene.vertices.len() >= 8);
         assert!(scene.indices.len() >= 18);
@@ -2461,10 +2565,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         assert!(scene.indices.len() > CIRCLE_SEGMENTS);
     }
@@ -2614,6 +2718,7 @@ mod tests {
         );
         let dim_label = crate::gpu_viewport::ViewportDimLabel {
             world_geom: world,
+            color: Color32::WHITE,
             text_vertices,
             text_indices,
         };
@@ -2632,10 +2737,11 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: Some(view),
-            dim_annotation_color: Color32::WHITE,
+
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         })
         .vertices
         .len();
@@ -2654,10 +2760,11 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: std::slice::from_ref(&dim_label),
             dim_label_view: Some(view),
-            dim_annotation_color: Color32::WHITE,
+
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         assert!(!scene.text_vertices.is_empty());
         assert!(!scene.text_indices.is_empty());
@@ -2744,10 +2851,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         })
         .indices
         .len();
@@ -2766,10 +2873,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         let solid_scene = ViewportScene::build(&ViewportSceneInput {
             doc: &solid_doc,
@@ -2786,10 +2893,10 @@ mod tests {
             active_sketch_face: None,
             dimension_labels: &[],
             dim_label_view: None,
-            dim_annotation_color: Color32::WHITE,
             plane_gizmo: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
+            document_health: &DocumentHealth::default(),
         });
         let dashed_line_indices = dashed_scene.indices.len().saturating_sub(grid_indices);
         let solid_line_indices = solid_scene.indices.len().saturating_sub(grid_indices);

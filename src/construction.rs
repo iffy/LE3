@@ -8,8 +8,8 @@ use crate::face::{
 };
 use crate::hierarchy::SceneElement;
 use crate::model::{
-    ConstructionPlane, ConstructionPlaneParent, Document, FaceId, Line, PlaneAnchor,
-    PlaneDefinition, Rect, RectEdge, SketchId,
+    ConstructionPlane, ConstructionPlaneParent, ConstraintPoint, Document, FaceId, Line, LineEnd,
+    PlaneAnchor, PlaneDefinition, Rect, RectEdge, SketchId,
 };
 use crate::value::{eval_length_mm, parse_length_or};
 use eframe::egui;
@@ -419,6 +419,7 @@ pub fn plane_from_face(offset: f32, origin: Vec3, normal: Vec3) -> ConstructionP
             0.0,
         ),
         name: None,
+        deleted: false,
     }
 }
 
@@ -451,6 +452,7 @@ pub fn plane_from_axis(
             angle_deg,
         ),
         name: None,
+        deleted: false,
     }
 }
 
@@ -469,9 +471,18 @@ pub fn sketch_from_pick_target(doc: &Document, kind: PickTargetKind) -> Option<S
                 ConstructionPlaneParent::Root => None,
             }
         }),
+        PickTargetKind::Point(point) => point_sketch(doc, point),
         PickTargetKind::PlaneEdge { .. } | PickTargetKind::GlobalAxis(_) | PickTargetKind::Ground(_) => {
             None
         }
+    }
+}
+
+pub fn point_sketch(doc: &Document, point: ConstraintPoint) -> Option<SketchId> {
+    match point {
+        ConstraintPoint::LineEndpoint { line, .. } => doc.lines.get(line).map(|l| l.sketch),
+        ConstraintPoint::RectCorner { rect, .. } => doc.rects.get(rect).map(|r| r.sketch),
+        ConstraintPoint::CircleCenter(circle) => doc.circles.get(circle).map(|c| c.sketch),
     }
 }
 
@@ -869,6 +880,8 @@ pub fn draw_axis_plane_gizmo(
 /// Which geometry would be selected at a viewport position.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PickTargetKind {
+    /// A sketch point (line endpoint, rect corner, or circle center).
+    Point(ConstraintPoint),
     /// A standalone sketch line segment.
     Line(usize),
     /// A sketch circle (picked on its perimeter).
@@ -926,6 +939,23 @@ pub fn resolve_pick_target(
             best = Some(candidate);
         }
     };
+
+    if let Some((kind, dist)) = nearest_sketch_point(screen, project, doc) {
+        let origin = match kind {
+            PickTargetKind::Point(point) => point_world_position(doc, point).unwrap_or(Vec3::ZERO),
+            _ => Vec3::ZERO,
+        };
+        consider(PickTarget {
+            kind,
+            reference: PlaneReference::Face {
+                origin,
+                normal: Vec3::Z,
+                label: "Point".to_string(),
+            },
+            distance_px: dist,
+            priority: 0,
+        });
+    }
 
     if let Some((kind, a, b, label, dist)) = nearest_sketch_edge(screen, project, doc) {
         consider(PickTarget {
@@ -1033,6 +1063,7 @@ impl PickTarget {
 /// Map a viewport pick to a scene-tree selection target, when selectable.
 pub fn scene_element_from_pick(kind: &PickTargetKind) -> Option<SceneElement> {
     match kind {
+        PickTargetKind::Point(point) => Some(SceneElement::Point(*point)),
         PickTargetKind::Line(index) => Some(SceneElement::Line(*index)),
         PickTargetKind::Circle(index) => Some(SceneElement::Circle(*index)),
         PickTargetKind::ShapeEdge {
@@ -1053,6 +1084,14 @@ pub fn draw_pick_highlight(
     color: egui::Color32,
 ) {
     match kind {
+        PickTargetKind::Point(point) => {
+            if let Some(world) = point_world_position(doc, point) {
+                if let Some(sp) = project(world) {
+                    painter.circle_filled(sp, 6.0, color);
+                    painter.circle_stroke(sp, 6.0, egui::Stroke::new(2.0, color));
+                }
+            }
+        }
         PickTargetKind::Line(index) => {
             if let Some(line) = doc.lines.get(index) {
                 draw_line_highlight(painter, project, doc, line, color);
@@ -1278,6 +1317,221 @@ fn segment_pick_distance(
     }
 }
 
+pub fn point_world_position(doc: &Document, point: ConstraintPoint) -> Option<Vec3> {
+    use crate::face::{circle_world_center, local_to_world, sketch_geometry_frame};
+    match point {
+        ConstraintPoint::LineEndpoint { line, end } => {
+            let entity = doc.lines.get(line)?;
+            let frame = sketch_geometry_frame(doc, entity.sketch)?;
+            let (u, v) = match end {
+                LineEnd::Start => (entity.x0, entity.y0),
+                LineEnd::End => (entity.x1, entity.y1),
+            };
+            Some(local_to_world(&frame, u, v))
+        }
+        ConstraintPoint::RectCorner { rect, corner } => {
+            let entity = doc.rects.get(rect)?;
+            let corners = rect_world_corners(doc, entity)?;
+            Some(corners[corner as usize])
+        }
+        ConstraintPoint::CircleCenter(circle) => {
+            let entity = doc.circles.get(circle)?;
+            circle_world_center(doc, entity)
+        }
+    }
+}
+
+/// Nearest sketch vertex in `sketch` under the cursor, if any.
+pub fn nearest_sketch_point_in_sketch(
+    screen: egui::Pos2,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    doc: &Document,
+    sketch: SketchId,
+) -> Option<(ConstraintPoint, f32)> {
+    let mut best: Option<(ConstraintPoint, f32)> = None;
+
+    let mut consider = |point: ConstraintPoint, world: Vec3| {
+        if point_sketch(doc, point) != Some(sketch) {
+            return;
+        }
+        let Some(sp) = project(world) else {
+            return;
+        };
+        let dist = (screen - sp).length();
+        if dist <= POINT_PICK_RADIUS_PX && best.as_ref().is_none_or(|(_, d)| dist < *d) {
+            best = Some((point, dist));
+        }
+    };
+
+    for (li, line) in doc.lines.iter().enumerate() {
+        if line.deleted || line.sketch != sketch {
+            continue;
+        }
+        let Some((a, b)) = line_world_endpoints(doc, line) else {
+            continue;
+        };
+        consider(
+            ConstraintPoint::LineEndpoint {
+                line: li,
+                end: LineEnd::Start,
+            },
+            a,
+        );
+        consider(
+            ConstraintPoint::LineEndpoint {
+                line: li,
+                end: LineEnd::End,
+            },
+            b,
+        );
+    }
+
+    for (ri, rect) in doc.rects.iter().enumerate() {
+        if rect.deleted || rect.sketch != sketch {
+            continue;
+        }
+        let corners = rect_corners_world(doc, rect);
+        for (corner, world) in corners.into_iter().enumerate() {
+            consider(
+                ConstraintPoint::RectCorner {
+                    rect: ri,
+                    corner: corner as u8,
+                },
+                world,
+            );
+        }
+    }
+
+    for (ci, circle) in doc.circles.iter().enumerate() {
+        if circle.deleted || circle.sketch != sketch {
+            continue;
+        }
+        if let Some(center) = crate::face::circle_world_center(doc, circle) {
+            consider(ConstraintPoint::CircleCenter(ci), center);
+        }
+    }
+
+    best
+}
+
+/// Nearest line or rectangle edge in `sketch` under the cursor (not vertices).
+pub fn nearest_sketch_line_in_sketch(
+    screen: egui::Pos2,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    doc: &Document,
+    sketch: SketchId,
+) -> Option<(crate::model::ConstraintLine, f32)> {
+    use crate::model::ConstraintLine;
+    let mut best: Option<(ConstraintLine, f32)> = None;
+
+    let mut consider = |line: ConstraintLine, a: Vec3, b: Vec3| {
+        let Some(dist) = segment_pick_distance(screen, project, a, b) else {
+            return;
+        };
+        if best.as_ref().is_none_or(|(_, d)| dist < *d) {
+            best = Some((line, dist));
+        }
+    };
+
+    for (li, line) in doc.lines.iter().enumerate() {
+        if line.deleted || line.sketch != sketch {
+            continue;
+        }
+        let Some((a, b)) = line_world_endpoints(doc, line) else {
+            continue;
+        };
+        consider(ConstraintLine::Line(li), a, b);
+    }
+
+    for (ri, rect) in doc.rects.iter().enumerate() {
+        if rect.deleted || rect.sketch != sketch {
+            continue;
+        }
+        for (edge_index, (a, b)) in rect_edge_segments(doc, rect).into_iter().enumerate() {
+            consider(
+                ConstraintLine::RectEdge {
+                    rect: ri,
+                    edge: RectEdge::from_index(edge_index),
+                },
+                a,
+                b,
+            );
+        }
+    }
+
+    best
+}
+
+fn nearest_sketch_point(
+    screen: egui::Pos2,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    doc: &Document,
+) -> Option<(PickTargetKind, f32)> {
+    let mut best: Option<(PickTargetKind, f32)> = None;
+
+    let mut consider = |point: ConstraintPoint, world: Vec3| {
+        let Some(sp) = project(world) else {
+            return;
+        };
+        let dist = (screen - sp).length();
+        if dist <= POINT_PICK_RADIUS_PX
+            && best.as_ref().is_none_or(|(_, d)| dist < *d)
+        {
+            best = Some((PickTargetKind::Point(point), dist));
+        }
+    };
+
+    for (li, line) in doc.lines.iter().enumerate() {
+        if line.deleted {
+            continue;
+        }
+        let Some((a, b)) = line_world_endpoints(doc, line) else {
+            continue;
+        };
+        consider(
+            ConstraintPoint::LineEndpoint {
+                line: li,
+                end: LineEnd::Start,
+            },
+            a,
+        );
+        consider(
+            ConstraintPoint::LineEndpoint {
+                line: li,
+                end: LineEnd::End,
+            },
+            b,
+        );
+    }
+
+    for (ri, rect) in doc.rects.iter().enumerate() {
+        if rect.deleted {
+            continue;
+        }
+        let corners = rect_corners_world(doc, rect);
+        for (corner, world) in corners.into_iter().enumerate() {
+            consider(
+                ConstraintPoint::RectCorner {
+                    rect: ri,
+                    corner: corner as u8,
+                },
+                world,
+            );
+        }
+    }
+
+    for (ci, circle) in doc.circles.iter().enumerate() {
+        if circle.deleted {
+            continue;
+        }
+        if let Some(center) = crate::face::circle_world_center(doc, circle) {
+            consider(ConstraintPoint::CircleCenter(ci), center);
+        }
+    }
+
+    best
+}
+
 fn nearest_sketch_edge(
     screen: egui::Pos2,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
@@ -1295,6 +1549,9 @@ fn nearest_sketch_edge(
     };
 
     for (li, line) in doc.lines.iter().enumerate() {
+        if line.deleted {
+            continue;
+        }
         let Some((a, b)) = line_world_endpoints(doc, line) else {
             continue;
         };
@@ -1302,6 +1559,9 @@ fn nearest_sketch_edge(
     }
 
     for (ri, rect) in doc.rects.iter().enumerate() {
+        if rect.deleted {
+            continue;
+        }
         for (edge_index, (a, b)) in rect_edge_segments(doc, rect).into_iter().enumerate() {
             consider(
                 PickTargetKind::ShapeEdge {
@@ -1318,6 +1578,9 @@ fn nearest_sketch_edge(
     }
 
     for (ci, circle) in doc.circles.iter().enumerate() {
+        if circle.deleted {
+            continue;
+        }
         let Some(pts) = crate::face::circle_world_perimeter(doc, circle, 32) else {
             continue;
         };
@@ -1670,7 +1933,10 @@ mod tests {
         let target = resolve_pick_target(Pos2::new(100.0, 59.0), &project, None, &doc);
         assert!(matches!(
             target.map(|t| t.kind),
-            Some(PickTargetKind::Line(_))
+            Some(PickTargetKind::Point(ConstraintPoint::LineEndpoint {
+                line: 0,
+                end: LineEnd::Start,
+            }))
         ));
     }
 
@@ -1748,7 +2014,7 @@ mod tests {
         let (mut doc, sketch) = doc_with_plane_sketch();
         doc.rects = vec![Rect::from_local_corners(sketch, 10.0, 10.0, 50.0, 40.0)];
         let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
-        let target = resolve_pick_target(Pos2::new(50.0, 8.0), &project, None, &doc).unwrap();
+        let target = resolve_pick_target(Pos2::new(30.0, 8.0), &project, None, &doc).unwrap();
         assert!(matches!(
             target.kind,
             PickTargetKind::ShapeEdge { .. }

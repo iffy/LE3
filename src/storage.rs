@@ -20,6 +20,7 @@ use rusqlite::Connection;
 const SCHEMA_VERSION: i64 = 1;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONSTRUCTION_PLANES_META_KEY: &str = "construction_planes";
+const SHAPE_ORDER_META_KEY: &str = "shape_order";
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -76,126 +77,100 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
     )
     .map_err(|e| e.to_string())?;
 
+    let shape_order_payload =
+        serde_json::to_string(&doc.shape_order).map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![SHAPE_ORDER_META_KEY, shape_order_payload],
+    )
+    .map_err(|e| e.to_string())?;
+
     tx.execute(
         "DELETE FROM dag_nodes WHERE kind IN ('sketch', 'rectangle', 'line', 'circle', 'parameter', 'constraint', 'construction_plane')",
         [],
     )
     .map_err(|e| e.to_string())?;
 
-    let mut sketch_i = 0usize;
-    let mut rect_i = 0usize;
-    let mut line_i = 0usize;
-    let mut circle_i = 0usize;
-    let mut constraint_i = 0usize;
-    let mut param_i = 0usize;
-    let mut plane_i = 1usize;
-    for (id, kind) in doc.shape_order.iter().enumerate() {
-        match kind {
-            ShapeKind::Sketch => {
-                let sketch = doc
-                    .sketches
-                    .get(sketch_i)
-                    .ok_or_else(|| "shape_order out of sync with sketches".to_string())?;
-                let payload = serde_json::to_string(sketch).map_err(|e| e.to_string())?;
-                tx.execute(
-                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
-                     VALUES (?1, 0, 'sketch', ?2)",
-                    rusqlite::params![id as i64, payload],
-                )
-                .map_err(|e| e.to_string())?;
-                sketch_i += 1;
-            }
-            ShapeKind::Rect => {
-                let rect = doc
-                    .rects
-                    .get(rect_i)
-                    .ok_or_else(|| "shape_order out of sync with rects".to_string())?;
-                let payload = serde_json::to_string(rect).map_err(|e| e.to_string())?;
-                tx.execute(
-                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
-                     VALUES (?1, 0, 'rectangle', ?2)",
-                    rusqlite::params![id as i64, payload],
-                )
-                .map_err(|e| e.to_string())?;
-                rect_i += 1;
-            }
-            ShapeKind::Line => {
-                let line = doc
-                    .lines
-                    .get(line_i)
-                    .ok_or_else(|| "shape_order out of sync with lines".to_string())?;
-                let payload = serde_json::to_string(line).map_err(|e| e.to_string())?;
-                tx.execute(
-                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
-                     VALUES (?1, 0, 'line', ?2)",
-                    rusqlite::params![id as i64, payload],
-                )
-                .map_err(|e| e.to_string())?;
-                line_i += 1;
-            }
-            ShapeKind::Circle => {
-                let circle = doc
-                    .circles
-                    .get(circle_i)
-                    .ok_or_else(|| "shape_order out of sync with circles".to_string())?;
-                let payload = serde_json::to_string(circle).map_err(|e| e.to_string())?;
-                tx.execute(
-                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
-                     VALUES (?1, 0, 'circle', ?2)",
-                    rusqlite::params![id as i64, payload],
-                )
-                .map_err(|e| e.to_string())?;
-                circle_i += 1;
-            }
-            ShapeKind::Parameter => {
-                let param = doc
-                    .parameters
-                    .get(param_i)
-                    .ok_or_else(|| "shape_order out of sync with parameters".to_string())?;
-                let payload = serde_json::to_string(param).map_err(|e| e.to_string())?;
-                tx.execute(
-                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
-                     VALUES (?1, 0, 'parameter', ?2)",
-                    rusqlite::params![id as i64, payload],
-                )
-                .map_err(|e| e.to_string())?;
-                param_i += 1;
-            }
-            ShapeKind::Constraint => {
-                let constraint = doc
-                    .constraints
-                    .get(constraint_i)
-                    .ok_or_else(|| "shape_order out of sync with constraints".to_string())?;
-                let payload = serde_json::to_string(constraint).map_err(|e| e.to_string())?;
-                tx.execute(
-                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
-                     VALUES (?1, 0, 'constraint', ?2)",
-                    rusqlite::params![id as i64, payload],
-                )
-                .map_err(|e| e.to_string())?;
-                constraint_i += 1;
-            }
-            ShapeKind::ConstructionPlane => {
-                let plane = doc
-                    .construction_planes
-                    .get(plane_i)
-                    .ok_or_else(|| {
-                        "shape_order out of sync with construction_planes".to_string()
-                    })?;
-                let payload = serde_json::to_string(plane).map_err(|e| e.to_string())?;
-                tx.execute(
-                    "INSERT INTO dag_nodes (id, component_id, kind, payload)
-                     VALUES (?1, 0, 'construction_plane', ?2)",
-                    rusqlite::params![id as i64, payload],
-                )
-                .map_err(|e| e.to_string())?;
-                plane_i += 1;
-            }
-        }
+    let mut row_id = 0i64;
+    save_indexed_nodes(&tx, &mut row_id, "sketch", &doc.sketches)?;
+    save_indexed_nodes(&tx, &mut row_id, "rectangle", &doc.rects)?;
+    save_indexed_nodes(&tx, &mut row_id, "line", &doc.lines)?;
+    save_indexed_nodes(&tx, &mut row_id, "circle", &doc.circles)?;
+    save_indexed_nodes(&tx, &mut row_id, "parameter", &doc.parameters)?;
+    save_indexed_nodes(&tx, &mut row_id, "constraint", &doc.constraints)?;
+    if doc.construction_planes.len() > 1 {
+        save_indexed_nodes(
+            &tx,
+            &mut row_id,
+            "construction_plane",
+            &doc.construction_planes[1..],
+        )?;
     }
 
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn save_indexed_nodes<T: serde::Serialize>(
+    tx: &rusqlite::Transaction<'_>,
+    row_id: &mut i64,
+    kind: &str,
+    entities: &[T],
+) -> Result<()> {
+    for (index, entity) in entities.iter().enumerate() {
+        let payload = serde_json::to_string(entity).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO dag_nodes (id, component_id, kind, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![*row_id, index as i64, kind, payload],
+        )
+        .map_err(|e| e.to_string())?;
+        *row_id += 1;
+    }
+    Ok(())
+}
+
+fn load_shape_order_meta(conn: &Connection) -> Option<Vec<ShapeKind>> {
+    let payload: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            rusqlite::params![SHAPE_ORDER_META_KEY],
+            |row| row.get(0),
+        )
+        .ok()?;
+    serde_json::from_str(&payload).ok()
+}
+
+fn load_indexed_entities<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    kind: &str,
+) -> Result<Vec<T>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT component_id, payload FROM dag_nodes
+             WHERE kind = ?1
+             ORDER BY component_id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![kind], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut entities = Vec::new();
+    for row in rows {
+        let (index, payload) = row.map_err(|e| e.to_string())?;
+        let index = usize::try_from(index).map_err(|_| format!("bad {kind} index"))?;
+        if index != entities.len() {
+            return Err(format!(
+                "{kind} indices must be dense starting at 0 (expected {}, got {index})",
+                entities.len()
+            ));
+        }
+        let entity: T = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+        entities.push(entity);
+    }
+    Ok(entities)
 }
 
 fn load_construction_planes(
@@ -237,10 +212,18 @@ fn ensure_construction_plane_indices(doc: &mut Document) {
     }
 }
 
-/// Open the document stored at `path`.
-pub fn open(path: &str) -> Result<Document> {
-    let conn = Connection::open(path).map_err(|e| e.to_string())?;
-
+fn load_legacy_document_nodes(
+    conn: &Connection,
+) -> Result<(
+    Vec<Parameter>,
+    Vec<Sketch>,
+    Vec<Rect>,
+    Vec<Line>,
+    Vec<Circle>,
+    Vec<Constraint>,
+    Vec<ConstructionPlane>,
+    Vec<ShapeKind>,
+)> {
     let mut stmt = conn
         .prepare(
             "SELECT kind, payload FROM dag_nodes
@@ -304,6 +287,52 @@ pub fn open(path: &str) -> Result<Document> {
             _ => {}
         }
     }
+    Ok((
+        parameters,
+        sketches,
+        rects,
+        lines,
+        circles,
+        constraints,
+        construction_planes,
+        shape_order,
+    ))
+}
+
+/// Open the document stored at `path`.
+pub fn open(path: &str) -> Result<Document> {
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+
+    let (
+        parameters,
+        sketches,
+        rects,
+        lines,
+        circles,
+        constraints,
+        construction_planes,
+        shape_order,
+    ) = if let Some(shape_order) = load_shape_order_meta(&conn) {
+        let parameters = load_indexed_entities(&conn, "parameter")?;
+        let sketches = load_indexed_entities(&conn, "sketch")?;
+        let rects = load_indexed_entities(&conn, "rectangle")?;
+        let lines = load_indexed_entities(&conn, "line")?;
+        let circles = load_indexed_entities(&conn, "circle")?;
+        let constraints = load_indexed_entities(&conn, "constraint")?;
+        let dag_planes = load_indexed_entities(&conn, "construction_plane")?;
+        (
+            parameters,
+            sketches,
+            rects,
+            lines,
+            circles,
+            constraints,
+            dag_planes,
+            shape_order,
+        )
+    } else {
+        load_legacy_document_nodes(&conn)?
+    };
 
     let construction_planes =
         load_construction_planes(&conn, construction_planes).map_err(|e| e.to_string())?;
@@ -649,6 +678,7 @@ mod tests {
             sketches: vec![Sketch {
                 face: FaceId::ConstructionPlane(1),
                 name: None,
+                deleted: false,
             }],
             rects: vec![Rect::from_local_corners(0, 0.0, 0.0, 10.0, 10.0)],
             lines: vec![],
@@ -765,10 +795,12 @@ mod tests {
         doc.parameters.push(Parameter {
             name: "A".to_string(),
             expression: "B".to_string(),
+            deleted: false,
         });
         doc.parameters.push(Parameter {
             name: "B".to_string(),
             expression: "A".to_string(),
+            deleted: false,
         });
         doc.shape_order.push(ShapeKind::Parameter);
         doc.shape_order.push(ShapeKind::Parameter);
@@ -790,10 +822,12 @@ mod tests {
         doc.parameters.push(Parameter {
             name: "A".to_string(),
             expression: "5mm".to_string(),
+            deleted: false,
         });
         doc.parameters.push(Parameter {
             name: "B".to_string(),
             expression: "A + 5in".to_string(),
+            deleted: false,
         });
         doc.shape_order.push(ShapeKind::Parameter);
         doc.shape_order.push(ShapeKind::Parameter);
@@ -802,6 +836,81 @@ mod tests {
         let loaded = open(&path).unwrap();
         assert_eq!(loaded.parameters, doc.parameters);
         assert_eq!(loaded.shape_order, doc.shape_order);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn round_trips_tombstoned_entities() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("le3_tombstone_roundtrip.le3");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.shape_order.push(ShapeKind::Line);
+        doc.lines[0].deleted = true;
+        doc.parameters.push(Parameter {
+            name: "width".to_string(),
+            expression: "10mm".to_string(),
+            deleted: true,
+        });
+        doc.shape_order.push(ShapeKind::Parameter);
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert!(loaded.lines[0].deleted);
+        assert!(loaded.parameters[0].deleted);
+        assert_eq!(loaded.lines.len(), 1);
+        assert_eq!(loaded.parameters.len(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn round_trips_tombstoned_line_with_alive_sibling() {
+        use crate::document_lifecycle::tombstone_element;
+        use crate::hierarchy::SceneElement;
+        use crate::model::{Constraint, ConstraintKind, ConstraintLine};
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("le3_tombstone_sibling.le3");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.shape_order.push(ShapeKind::Line);
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 5.0, 10.0, 5.0));
+        doc.shape_order.push(ShapeKind::Line);
+        doc.constraints.push(Constraint {
+            sketch,
+            kind: ConstraintKind::Parallel {
+                line_a: ConstraintLine::Line(0),
+                line_b: ConstraintLine::Line(1),
+            },
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+        doc.shape_order.push(ShapeKind::Constraint);
+        tombstone_element(&mut doc, SceneElement::Line(0));
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert_eq!(loaded.lines.len(), 2);
+        assert!(loaded.lines[0].deleted);
+        assert!(!loaded.lines[1].deleted);
+        assert_eq!(loaded.constraints.len(), 1);
+        let health = crate::document_health::recompute_document_health(&loaded);
+        assert_eq!(
+            health.element_status(SceneElement::Line(1)),
+            crate::document_health::HealthStatus::Unstable
+        );
 
         std::fs::remove_file(&path).unwrap();
     }

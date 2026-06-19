@@ -2,6 +2,8 @@
 
 use crate::actions::{Action, ActionResult, AppState};
 use crate::constraints::{propagate_parameter_rename_to_constraints, solve_document_constraints};
+use crate::icons::{icon_button, IconId};
+use crate::document_health::HealthStatus;
 use crate::model::{Document, Parameter};
 use crate::value::{
     eval_length_mm_in_doc, eval_length_mm_with_params, expression_references_document_parameter,
@@ -9,12 +11,23 @@ use crate::value::{
     parameter_names_referenced_in_expression, substitute_parameter_name,
     unknown_variables_in_parameter_expression,
 };
-use eframe::egui::{self, Id, Key};
+use eframe::egui::{self, Color32, Id, Key, RichText};
 
 pub const PANE_TITLE: &str = "Parameters";
 
 const NEW_NAME_ID: &str = "le3_parameters_new_name";
 const NEW_VALUE_ID: &str = "le3_parameters_new_value";
+const INVALID_TEXT: Color32 = Color32::from_rgb(220, 80, 80);
+const UNSTABLE_TEXT: Color32 = Color32::from_rgb(255, 180, 60);
+
+fn styled_parameter_label(label: &str, status: HealthStatus) -> RichText {
+    let text = RichText::new(label);
+    match status {
+        HealthStatus::Healthy => text,
+        HealthStatus::Invalid => text.color(INVALID_TEXT),
+        HealthStatus::Unstable => text.color(UNSTABLE_TEXT),
+    }
+}
 
 fn param_name_id(index: usize) -> Id {
     Id::new(("le3_parameters_name", index))
@@ -332,7 +345,11 @@ pub fn add_parameter(doc: &mut Document, name: String, expression: String) -> Re
     validate_new_parameter_name(doc, &name, None)?;
     validate_parameter_expression_for(doc, &name, &expression, None)?;
     let index = doc.parameters.len();
-    doc.parameters.push(Parameter { name, expression });
+    doc.parameters.push(Parameter {
+        name,
+        expression,
+        deleted: false,
+    });
     doc.shape_order.push(crate::model::ShapeKind::Parameter);
     recompute_document_geometry(doc)?;
     Ok(index)
@@ -374,17 +391,9 @@ pub fn delete_parameter(doc: &mut Document, index: usize) -> Result<(), String> 
     if index >= doc.parameters.len() {
         return Err(format!("Parameter {index} not found"));
     }
-    if let Some(pos) = doc
-        .shape_order
-        .iter()
-        .enumerate()
-        .filter(|(_, k)| **k == crate::model::ShapeKind::Parameter)
-        .nth(index)
-        .map(|(i, _)| i)
-    {
-        doc.shape_order.remove(pos);
+    if !crate::document_lifecycle::tombstone_parameter(doc, index) {
+        return Err(format!("Parameter {index} already deleted"));
     }
-    doc.parameters.remove(index);
     Ok(())
 }
 
@@ -433,14 +442,29 @@ pub fn show_pane(ui: &mut egui::Ui, app: &mut AppState) {
                 let enter = ui.input(|i| i.key_pressed(Key::Enter));
 
                 for index in 0..count {
-                    let (param_name, param_expression, param_display) = {
+                    if !crate::document_lifecycle::parameter_alive(&app.doc, index) {
+                        continue;
+                    }
+                    let (param_name, param_expression, param_display, param_status) = {
                         let param = &app.doc.parameters[index];
                         (
                             param.name.clone(),
                             param.expression.clone(),
                             format_parameter_value_display(&app.doc, &param.expression),
+                            app.document_health.parameter_status(index),
                         )
                     };
+                    let param_frozen = param_status.is_frozen();
+                    if param_frozen {
+                        match app.parameters_pane.editing {
+                            Some(ParameterEditCell::Name(i) | ParameterEditCell::Value(i))
+                                if i == index =>
+                            {
+                                app.parameters_pane.cancel_edit();
+                            }
+                            _ => {}
+                        }
+                    }
                     let editing_name = matches!(
                         app.parameters_pane.editing,
                         Some(ParameterEditCell::Name(i)) if i == index
@@ -482,8 +506,12 @@ pub fn show_pane(ui: &mut egui::Ui, app: &mut AppState) {
                                 });
                             }
                         } else if ui
-                            .selectable_label(false, &param_name)
+                            .selectable_label(
+                                false,
+                                styled_parameter_label(&param_name, param_status),
+                            )
                             .clicked()
+                            && !param_frozen
                         {
                             app.parameters_pane
                                 .begin_edit(ParameterEditCell::Name(index), &param_name);
@@ -532,8 +560,12 @@ pub fn show_pane(ui: &mut egui::Ui, app: &mut AppState) {
                                 });
                             }
                         } else if ui
-                            .selectable_label(false, &param_display)
+                            .selectable_label(
+                                false,
+                                styled_parameter_label(&param_display, param_status),
+                            )
                             .clicked()
+                            && !param_frozen
                         {
                             app.parameters_pane.begin_edit(
                                 ParameterEditCell::Value(index),
@@ -541,7 +573,23 @@ pub fn show_pane(ui: &mut egui::Ui, app: &mut AppState) {
                             );
                         }
                     });
-                    ui.label("");
+                    if param_frozen {
+                        let reason = app
+                            .document_health
+                            .parameter_reason(index)
+                            .unwrap_or("");
+                        ui.label(
+                            RichText::new(reason)
+                                .color(if param_status == HealthStatus::Invalid {
+                                    INVALID_TEXT
+                                } else {
+                                    UNSTABLE_TEXT
+                                })
+                                .size(11.0),
+                        );
+                    } else {
+                        ui.label("");
+                    }
                     ui.end_row();
                 }
 
@@ -578,10 +626,8 @@ pub fn show_pane(ui: &mut egui::Ui, app: &mut AppState) {
                     app.parameters_pane.focus_new_value = false;
                 }
 
-                let add_clicked = ui
-                    .button("+")
-                    .on_hover_text("Add parameter")
-                    .clicked();
+                let add_clicked =
+                    icon_button(ui, IconId::Plus, "Add parameter").clicked();
 
                 if name_response.gained_focus() || value_response.gained_focus() {
                     app.parameters_pane.cancel_edit();

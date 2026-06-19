@@ -44,6 +44,8 @@ pub type SketchId = usize;
 pub struct Parameter {
     pub name: String,
     pub expression: String,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// A 2D sketch hosted on a face. A single face may host multiple independent sketches.
@@ -53,6 +55,8 @@ pub struct Sketch {
     /// User-visible label in the Elements pane; empty uses the default.
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// One edge of a rectangle (bottom → right → top → left, matching [`rect_edge_segments`]).
@@ -102,6 +106,16 @@ impl RectEdge {
             RectEdge::Left => "left",
         }
     }
+
+    /// Corner indices (0–3) at the endpoints of this edge.
+    pub fn corner_indices(self) -> (u8, u8) {
+        match self {
+            RectEdge::Bottom => (0, 1),
+            RectEdge::Right => (1, 2),
+            RectEdge::Top => (2, 3),
+            RectEdge::Left => (3, 0),
+        }
+    }
 }
 
 /// An axis-aligned rectangle in face-local coordinates (millimetres, per SPEC §5.3).
@@ -140,6 +154,8 @@ pub struct Rect {
     /// User-visible label in the Elements pane; empty uses the default.
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 impl Rect {
@@ -159,6 +175,7 @@ impl Rect {
             height_expr: None,
             construction_edges: [false; 4],
             name: None,
+            deleted: false,
         }
     }
 
@@ -211,6 +228,8 @@ impl<'de> Deserialize<'de> for Rect {
             construction_edges: [bool; 4],
             #[serde(default)]
             name: Option<String>,
+            #[serde(default)]
+            deleted: bool,
         }
 
         let raw = RawRect::deserialize(deserializer)?;
@@ -232,6 +251,7 @@ impl<'de> Deserialize<'de> for Rect {
             height_expr: raw.height_expr,
             construction_edges,
             name: raw.name,
+            deleted: raw.deleted,
         })
     }
 }
@@ -259,6 +279,8 @@ pub struct Line {
     /// User-visible label in the Elements pane; empty uses the default.
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 impl Line {
@@ -280,6 +302,7 @@ impl Line {
             length_expr: None,
             construction: false,
             name: None,
+            deleted: false,
         }
     }
 
@@ -315,6 +338,8 @@ pub struct Circle {
     /// User-visible label in the Elements pane; empty uses the default.
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 impl Circle {
@@ -336,6 +361,7 @@ impl Circle {
             diameter_dim_angle,
             construction: false,
             name: None,
+            deleted: false,
         }
     }
 
@@ -394,6 +420,34 @@ pub struct ConstructionPlane {
     pub definition: PlaneDefinition,
     /// User-visible label in the Elements pane; empty uses the default.
     pub name: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+/// Which end of a line segment a constraint point refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineEnd {
+    Start,
+    End,
+}
+
+/// A point-like sketch entity for coincident and other constraints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintPoint {
+    LineEndpoint { line: usize, end: LineEnd },
+    /// Corner index 0–3 matches [`crate::face::rect_world_corners_in_frame`] order.
+    RectCorner { rect: usize, corner: u8 },
+    CircleCenter(usize),
+}
+
+/// A line-like sketch entity for parallel, perpendicular, and orientation constraints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintLine {
+    Line(usize),
+    RectEdge { rect: usize, edge: RectEdge },
 }
 
 /// Geometry a distance constraint applies to.
@@ -411,6 +465,32 @@ pub enum DistanceTarget {
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintKind {
     Distance { target: DistanceTarget },
+    Parallel {
+        line_a: ConstraintLine,
+        line_b: ConstraintLine,
+    },
+    Perpendicular {
+        line_a: ConstraintLine,
+        line_b: ConstraintLine,
+    },
+    Coincident {
+        a: ConstraintEntity,
+        b: ConstraintEntity,
+    },
+    Midpoint {
+        point: ConstraintPoint,
+        line: ConstraintLine,
+    },
+    Horizontal { line: ConstraintLine },
+    Vertical { line: ConstraintLine },
+}
+
+/// Point or line reference for coincident constraints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintEntity {
+    Point(ConstraintPoint),
+    Line(ConstraintLine),
 }
 
 /// A sketch constraint (distance is the first supported kind).
@@ -425,6 +505,8 @@ pub struct Constraint {
     /// User-visible label in the Elements pane; empty uses the default.
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// Which sketch primitive was created, in chronological order (for undo).
@@ -494,6 +576,7 @@ impl Document {
         self.sketches.push(Sketch {
             face,
             name: None,
+            deleted: false,
         });
         self.shape_order.push(ShapeKind::Sketch);
         id

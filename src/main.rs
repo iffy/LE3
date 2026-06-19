@@ -4,31 +4,37 @@
 //! dimension inputs on the sides. Type to constrain a side, Tab to cycle,
 //! Enter to commit. Right-drag orbit, wheel zoom. Save/Open .le3. (prototype)
 //!
-//! Fully scriptable via instruction files (SPEC §9.3):
-//!   le3 --script demo.le3script
+//! Fully scriptable via Lua files (SPEC §8):
+//!   le3 --script demo.lua
 //!   le3 --exit
 //!   le3 drawing.le3 --exit
-//!   le3 demo.le3script --exit
+//!   le3 demo.lua --exit
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod actions;
 mod camera;
+mod command_log;
 mod command_palette;
 mod constraints;
+mod geometric_constraints;
 mod context;
 mod construction;
 mod dimensions;
+mod document_health;
+mod document_lifecycle;
 mod expression_input;
 mod face;
 mod gpu_view_cube;
 mod gpu_viewport;
 mod hierarchy;
+mod icons;
 mod names;
 mod parameters;
 
 mod model;
 mod native_menu;
+mod lua_script;
 mod script;
 mod selection;
 mod shortcuts;
@@ -36,6 +42,7 @@ mod stl;
 mod storage;
 mod theme;
 mod value;
+mod vertex_drag;
 mod view_cube;
 
 use actions::{
@@ -49,15 +56,19 @@ use constraints::{
 };
 use command_palette::{commands_for_state, filter_commands, show_palette, PaletteOutcome};
 use hierarchy::SceneElement;
+use selection::additive_click_modifiers;
 use construction::{
     angle_from_axis_plane_hit, axis_angle_handle, axis_gizmo_hit, axis_normal,
     axis_offset_handle, draw_axis_plane_gizmo, draw_circle_face_highlight, draw_offset_gizmo,
     draw_quad_face_highlight,
-    offset_from_normal_drag, offset_gizmo_hit, offset_handle, parent_from_pick_target,
-    plane_corners, preview_plane_edit_dependents, rect_edge_segments, resolve_pick_target,
-    scene_element_from_pick, AxisGizmoDrag,
+    nearest_sketch_line_in_sketch, nearest_sketch_point_in_sketch, offset_from_normal_drag,
+    offset_gizmo_hit, offset_handle,
+    parent_from_pick_target, plane_corners, point_world_position, preview_plane_edit_dependents,
+    rect_edge_segments, resolve_pick_target, scene_element_from_pick, AxisGizmoDrag,
     AxisGizmoHit, PlaneDim, PlaneReference, AXIS_GIZMO_HANDLE_HIT_RADIUS_PX, PLANE_DISPLAY_HALF,
 };
+use document_health::{health_tint_color, DocumentHealth, HealthStatus};
+use document_lifecycle::{circle_alive, constraint_alive, line_alive, rect_alive};
 use dimensions::{
     circle_diameter_dimension_world_geom, circle_diameter_label_outward_px,
     draw_linear_dimension, effective_circle_diameter_label_offset, effective_dim_offset,
@@ -72,7 +83,9 @@ use face::{
     sketch_geometry_frame, sketch_label, world_to_local,
 };
 use model::SketchId;
-use model::{Circle, ConstraintKind, DistanceTarget, FaceId, Line, Rect, RectEdge};
+use model::{
+    Circle, ConstraintKind, ConstraintPoint, DistanceTarget, FaceId, Line, Rect, RectEdge,
+};
 use eframe::egui;
 use native_menu::{MenuCommand, NativeMenu};
 use glam::Vec3;
@@ -177,6 +190,7 @@ fn run_app(script_opts: script::ScriptOptions) -> eframe::Result<()> {
                 script,
                 script_opts.document_path,
                 script_opts.exit_on_complete,
+                script_opts.show_commands,
                 native_menu,
             )) as Box<dyn eframe::App>)
         }),
@@ -206,6 +220,10 @@ struct DimLabelDrag {
     anchor_screen: egui::Pos2,
 }
 
+struct VertexDrag {
+    point: ConstraintPoint,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct CommittedDimLayout {
     target: DimLabelTarget,
@@ -224,9 +242,11 @@ struct App {
     exit_on_script_complete: bool,
     exit_after_startup: bool,
     exit_after_startup_sent: bool,
+    show_commands: bool,
     last_viewport: Option<egui::Rect>,
     native_menu: NativeMenu,
     dim_label_drag: Option<DimLabelDrag>,
+    vertex_drag: Option<VertexDrag>,
     launch_maximize_frames_remaining: u8,
     gpu_viewport: bool,
     gpu_view_cube: bool,
@@ -238,6 +258,7 @@ impl App {
         script: Option<ScriptRunner>,
         document_path: Option<String>,
         exit_on_script_complete: bool,
+        show_commands: bool,
         native_menu: NativeMenu,
     ) -> Self {
         let status = if script.is_some() {
@@ -255,6 +276,9 @@ impl App {
                 _ => {}
             }
         }
+        if show_commands && script.is_none() {
+            state.command_log = Some(std::cell::RefCell::new(command_log::CommandLog::new()));
+        }
         let exit_after_startup = exit_on_script_complete && script.is_none();
         Self {
             state,
@@ -263,9 +287,11 @@ impl App {
             exit_on_script_complete,
             exit_after_startup,
             exit_after_startup_sent: false,
+            show_commands,
             last_viewport: None,
             native_menu,
             dim_label_drag: None,
+            vertex_drag: None,
             launch_maximize_frames_remaining: initial_launch_maximize_frames(),
             gpu_viewport: gpu_viewport::install(cc),
             gpu_view_cube: gpu_view_cube::install(cc),
@@ -384,7 +410,27 @@ impl App {
             if self.state.creating_rect.is_none()
                 && self.state.creating_line.is_none()
                 && self.state.creating_circle.is_none()
+                && self.state.creating_plane.is_none()
                 && ctx.input(|i| i.key_pressed(egui::Key::C))
+            {
+                if self.state.tool == Tool::Constraint && !self.state.scene_selection.is_empty() {
+                    let rows = crate::geometric_constraints::constraint_pane_rows(
+                        &self.state.scene_selection,
+                    );
+                    if let Some(kind) =
+                        crate::geometric_constraints::sole_enabled_constraint_type(&rows)
+                    {
+                        self.state.apply(Action::AddGeometricConstraint(kind));
+                    }
+                } else if self.state.tool != Tool::Constraint {
+                    self.state.apply(Action::SetTool(Tool::Constraint));
+                }
+            }
+
+            if self.state.creating_rect.is_none()
+                && self.state.creating_line.is_none()
+                && self.state.creating_circle.is_none()
+                && ctx.input(|i| i.key_pressed(egui::Key::O))
             {
                 if self.state.tool != Tool::Circle {
                     self.state.apply(Action::SetTool(Tool::Circle));
@@ -418,6 +464,35 @@ impl App {
             if ctx.input(|i| i.key_pressed(egui::Key::N)) {
                 self.state.apply(Action::FocusElementName);
             }
+
+            if self.state.creating_rect.is_none()
+                && self.state.creating_line.is_none()
+                && self.state.creating_circle.is_none()
+                && self.state.creating_plane.is_none()
+                && !self.state.scene_selection.is_empty()
+                && (ctx.input(|i| i.key_pressed(egui::Key::Delete))
+                    || ctx.input(|i| i.key_pressed(egui::Key::Backspace)))
+            {
+                self.state.apply(Action::DeleteSelection);
+            }
+
+            if self.state.tool == Tool::Constraint {
+                for (index, key) in [
+                    (1u8, egui::Key::Num1),
+                    (2, egui::Key::Num2),
+                    (3, egui::Key::Num3),
+                    (4, egui::Key::Num4),
+                    (5, egui::Key::Num5),
+                    (6, egui::Key::Num6),
+                    (7, egui::Key::Num7),
+                    (8, egui::Key::Num8),
+                    (9, egui::Key::Num9),
+                ] {
+                    if ctx.input(|i| i.key_pressed(key)) {
+                        self.state.apply(Action::ApplyConstraintShortcut(index));
+                    }
+                }
+            }
         }
 
         if self.state.tool != Tool::Rectangle || self.state.sketch_session.is_none() {
@@ -432,7 +507,10 @@ impl App {
         if self.state.tool != Tool::ConstructionPlane {
             self.state.creating_plane = None;
         }
-        if !matches!(self.state.tool, Tool::Select | Tool::Dimension) {
+        if !matches!(
+            self.state.tool,
+            Tool::Select | Tool::Dimension | Tool::Constraint
+        ) {
             self.state.editing_committed_dim = None;
         }
     }
@@ -471,6 +549,12 @@ impl App {
     }
 
     fn tick_script(&mut self, ctx: &egui::Context) {
+        if self.script.as_ref().is_some_and(|r| !r.done) {
+            self.state.command_log = None;
+        } else if self.show_commands && self.state.command_log.is_none() {
+            self.state.command_log =
+                Some(std::cell::RefCell::new(command_log::CommandLog::new()));
+        }
         let needs_repaint = if let Some(runner) = &mut self.script {
             if runner.done {
                 if let Some(err) = &runner.error {
@@ -512,8 +596,12 @@ impl eframe::App for App {
         theme::apply(ctx);
 
         let dt = ctx.input(|i| i.stable_dt);
-        if self.state.cam.tick_transition(dt) {
+        let transition_active = self.state.cam.tick_transition(dt);
+        if transition_active {
             ctx.request_repaint();
+        } else if let Some(log) = &self.state.command_log {
+            log.borrow_mut()
+                .on_transition_complete(&self.state.cam);
         }
 
         self.process_screenshots(ctx);
@@ -529,79 +617,98 @@ impl eframe::App for App {
             .frame(theme::panel_frame())
             .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut self.state.tool,
-                    Tool::Select,
+                if icons::selectable_icon_button(
+                    ui,
+                    icons::IconId::Select,
+                    self.state.tool == Tool::Select,
                     shortcuts::compact_label("Select", shortcuts::tool_shortcut(Tool::Select)),
-                );
-                if ui
-                    .selectable_label(
-                        self.state.tool == Tool::Sketch,
-                        shortcuts::compact_label(
-                            "Sketch",
-                            shortcuts::tool_shortcut(Tool::Sketch),
-                        ),
-                    )
-                    .clicked()
+                )
+                .clicked()
+                {
+                    self.state.apply(Action::SetTool(Tool::Select));
+                }
+                if icons::selectable_icon_button(
+                    ui,
+                    icons::IconId::Sketch,
+                    self.state.tool == Tool::Sketch,
+                    shortcuts::compact_label("Sketch", shortcuts::tool_shortcut(Tool::Sketch)),
+                )
+                .clicked()
                 {
                     self.state.apply(Action::SetTool(Tool::Sketch));
                 }
-                if ui
-                    .selectable_label(
-                        self.state.tool == Tool::Rectangle,
-                        shortcuts::compact_label(
-                            "Rectangle",
-                            shortcuts::tool_shortcut(Tool::Rectangle),
-                        ),
-                    )
-                    .clicked()
+                if icons::selectable_icon_button(
+                    ui,
+                    icons::IconId::Rectangle,
+                    self.state.tool == Tool::Rectangle,
+                    shortcuts::compact_label(
+                        "Rectangle",
+                        shortcuts::tool_shortcut(Tool::Rectangle),
+                    ),
+                )
+                .clicked()
                 {
                     self.state.apply(Action::SetTool(Tool::Rectangle));
                 }
-                if ui
-                    .selectable_label(
-                        self.state.tool == Tool::Line,
-                        shortcuts::compact_label(
-                            "Line",
-                            shortcuts::tool_shortcut(Tool::Line),
-                        ),
-                    )
-                    .clicked()
+                if icons::selectable_icon_button(
+                    ui,
+                    icons::IconId::Line,
+                    self.state.tool == Tool::Line,
+                    shortcuts::compact_label("Line", shortcuts::tool_shortcut(Tool::Line)),
+                )
+                .clicked()
                 {
                     self.state.apply(Action::SetTool(Tool::Line));
                 }
-                if ui
-                    .selectable_label(
-                        self.state.tool == Tool::Circle,
-                        shortcuts::compact_label(
-                            "Circle",
-                            shortcuts::tool_shortcut(Tool::Circle),
-                        ),
-                    )
-                    .clicked()
+                if icons::selectable_icon_button(
+                    ui,
+                    icons::IconId::Circle,
+                    self.state.tool == Tool::Circle,
+                    shortcuts::compact_label("Circle", shortcuts::tool_shortcut(Tool::Circle)),
+                )
+                .clicked()
                 {
                     self.state.apply(Action::SetTool(Tool::Circle));
                 }
-                if ui
-                    .selectable_label(
-                        self.state.tool == Tool::Dimension,
-                        shortcuts::compact_label(
-                            "Dimension",
-                            shortcuts::tool_shortcut(Tool::Dimension),
-                        ),
-                    )
-                    .clicked()
+                if icons::selectable_icon_button(
+                    ui,
+                    icons::IconId::Dimension,
+                    self.state.tool == Tool::Dimension,
+                    shortcuts::compact_label(
+                        "Dimension",
+                        shortcuts::tool_shortcut(Tool::Dimension),
+                    ),
+                )
+                .clicked()
                 {
                     self.state.apply(Action::SetTool(Tool::Dimension));
                 }
-                ui.selectable_value(
-                    &mut self.state.tool,
-                    Tool::ConstructionPlane,
+                if icons::selectable_icon_button(
+                    ui,
+                    icons::IconId::Constraint,
+                    self.state.tool == Tool::Constraint,
+                    shortcuts::compact_label(
+                        "Constraint",
+                        shortcuts::tool_shortcut(Tool::Constraint),
+                    ),
+                )
+                .clicked()
+                {
+                    self.state.apply(Action::SetTool(Tool::Constraint));
+                }
+                if icons::selectable_icon_button(
+                    ui,
+                    icons::IconId::Plane,
+                    self.state.tool == Tool::ConstructionPlane,
                     shortcuts::compact_label(
                         "Plane",
                         shortcuts::tool_shortcut(Tool::ConstructionPlane),
                     ),
-                );
+                )
+                .clicked()
+                {
+                    self.state.apply(Action::SetTool(Tool::ConstructionPlane));
+                }
                 if let Some(session) = self.state.sketch_session {
                     ui.separator();
                     ui.label(sketch_label(&self.state.doc, session.sketch));
@@ -609,12 +716,6 @@ impl eframe::App for App {
                 ui.separator();
                 if ui.button("Clear").clicked() {
                     self.state.apply(Action::Clear);
-                }
-                if ui
-                    .button(shortcuts::compact_label("Undo last", Some(shortcuts::UNDO)))
-                    .clicked()
-                {
-                    self.state.apply(Action::UndoLast);
                 }
             });
         });
@@ -675,6 +776,7 @@ impl eframe::App for App {
                         self.state.sketch_session,
                         &mut self.state.element_visibility,
                         &self.state.scene_selection,
+                        &self.state.document_health,
                         &mut queue_edit_sketch,
                         &mut queue_edit_plane,
                         &mut noop_visibility,
@@ -709,6 +811,7 @@ impl eframe::App for App {
             let context_input = context::ContextInput {
                 doc: &self.state.doc,
                 selection: &self.state.scene_selection,
+                tool: self.state.tool,
                 draw_rect_construction: self.state.rect_draw_construction_mode(),
                 draw_line_construction: self.state.line_draw_construction_mode(),
                 draw_circle_construction: self.state.circle_draw_construction_mode(),
@@ -717,6 +820,8 @@ impl eframe::App for App {
             context::sync_name_draft(&mut self.state.context_pane, &self.state.doc, &content);
             let mut construction_change: Option<bool> = None;
             let mut name_commit: Option<(SceneElement, String)> = None;
+            let mut constraint_apply: Option<crate::geometric_constraints::GeometricConstraintType> =
+                None;
             egui::SidePanel::right("context")
                 .resizable(true)
                 .default_width(200.0)
@@ -727,12 +832,18 @@ impl eframe::App for App {
                         ctx,
                         &content,
                         &mut self.state.context_pane,
+                        &self.state.document_health,
+                        &self.state.scene_selection,
                         &mut |element, name| name_commit = Some((element, name)),
                         &mut |construction| {
                             construction_change = Some(construction);
                         },
+                        &mut |kind| constraint_apply = Some(kind),
                     );
                 });
+            if let Some(kind) = constraint_apply {
+                self.state.apply(Action::AddGeometricConstraint(kind));
+            }
             if let Some((element, name)) = name_commit {
                 self.state
                     .apply(Action::CommitElementName { element, name });
@@ -830,10 +941,16 @@ fn build_gpu_dimension_labels(
     view_proj: &glam::Mat4,
     project: &impl Fn(glam::Vec3) -> Option<egui::Pos2>,
     skip_constraint: Option<DimLabelTarget>,
+    health: &document_health::DocumentHealth,
 ) -> Vec<gpu_viewport::ViewportDimLabel> {
     layouts
         .iter()
         .map(|layout| {
+            let color = document_health::constraint_annotation_color(
+                health,
+                layout.target,
+                col::DIM_ANNOTATION,
+            );
             let (text_vertices, text_indices) = if skip_constraint == Some(layout.target) {
                 (Vec::new(), Vec::new())
             } else {
@@ -842,7 +959,7 @@ fn build_gpu_dimension_labels(
                     &layout.world_geom,
                     view,
                     &layout.label,
-                    col::DIM_ANNOTATION,
+                    color,
                     cam,
                     viewport,
                     view_proj,
@@ -851,6 +968,7 @@ fn build_gpu_dimension_labels(
             };
             gpu_viewport::ViewportDimLabel {
                 world_geom: layout.world_geom,
+                color,
                 text_vertices,
                 text_indices,
             }
@@ -858,7 +976,25 @@ fn build_gpu_dimension_labels(
         .collect()
 }
 
+/// True while orbiting/panning or dragging sketch geometry — pick hover is distracting then.
+fn suppress_viewport_pick_hover(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    vertex_drag_active: bool,
+    line_drag_active: bool,
+    dim_label_drag_active: bool,
+    plane_gizmo_drag_active: bool,
+) -> bool {
+    ui.input(|i| i.pointer.secondary_down())
+        || response.dragged_by(egui::PointerButton::Secondary)
+        || vertex_drag_active
+        || line_drag_active
+        || dim_label_drag_active
+        || plane_gizmo_drag_active
+}
+
 fn resolve_viewport_hover_highlight(
+    suppress_hover: bool,
     tool: Tool,
     sketch_session: Option<SketchSession>,
     creating_plane: bool,
@@ -872,6 +1008,9 @@ fn resolve_viewport_hover_highlight(
     doc: &model::Document,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
 ) -> Option<gpu_viewport::ViewportHoverHighlight> {
+    if suppress_hover {
+        return None;
+    }
     let pp = pointer_screen?;
     match tool {
         Tool::Sketch => pick_sketch_face(pp, project, doc)
@@ -885,7 +1024,7 @@ fn resolve_viewport_hover_highlight(
             resolve_pick_target(pp, project, gp, doc)
                 .map(|t| gpu_viewport::ViewportHoverHighlight::PickTarget(t.kind))
         }
-        Tool::Select
+        Tool::Select | Tool::Constraint
             if !editing_committed_dim && !over_committed_dim_label && !dim_label_drag =>
         {
             let gp = cam.ground_point(pp, viewport, vp);
@@ -934,6 +1073,7 @@ fn build_viewport_scene_input<'a>(
     sketch_session: Option<SketchSession>,
     element_visibility: &'a hierarchy::ElementVisibility,
     selection: &'a crate::selection::SceneSelection,
+    document_health: &'a document_health::DocumentHealth,
     creating_rect: Option<&CreatingRect>,
     creating_line: Option<&CreatingLine>,
     creating_circle: Option<&CreatingCircle>,
@@ -1031,10 +1171,10 @@ fn build_viewport_scene_input<'a>(
         active_sketch_face,
         dimension_labels,
         dim_label_view,
-        dim_annotation_color: col::DIM_ANNOTATION,
         plane_gizmo,
         hover_highlight,
         hover_color: construction::PICK_HOVER_RGBA,
+        document_health,
     }
 }
 /// Expression fields grow with content up to this many characters.
@@ -1606,7 +1746,9 @@ fn build_committed_dim_layouts(
         .enumerate()
         .filter(|(_, c)| c.sketch == session.sketch)
     {
-        let ConstraintKind::Distance { target } = constraint.kind;
+        let ConstraintKind::Distance { target } = constraint.kind else {
+            continue;
+        };
         if matches!(target, DistanceTarget::CircleDiameter(_)) {
             continue;
         }
@@ -1694,11 +1836,16 @@ fn draw_committed_dim_layouts<Project>(
     layouts: &[CommittedDimLayout],
     label_view: &PlanarLabelView,
     project: &Project,
+    health: &document_health::DocumentHealth,
 ) where
     Project: Fn(Vec3) -> Option<egui::Pos2>,
 {
-    let color = col::DIM_ANNOTATION;
     for layout in layouts {
+        let color = document_health::constraint_annotation_color(
+            health,
+            layout.target,
+            col::DIM_ANNOTATION,
+        );
         draw_linear_dimension(
             painter,
             &layout.geom,
@@ -1741,6 +1888,162 @@ fn handle_committed_dim_label_double_click(
     };
     state.apply(Action::BeginEditCommittedDim { target: hit.target });
     true
+}
+
+fn handle_vertex_drag(
+    ui: &egui::Ui,
+    drag: &mut Option<VertexDrag>,
+    state: &mut AppState,
+    session: SketchSession,
+    viewport: egui::Rect,
+    vp: &glam::Mat4,
+    cam: &camera::Camera,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    pointer_screen: Option<egui::Pos2>,
+) -> bool {
+    if state.creating_rect.is_some()
+        || state.creating_line.is_some()
+        || state.creating_circle.is_some()
+        || state.editing_committed_dim.is_some()
+    {
+        *drag = None;
+        return false;
+    }
+
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+    let primary_released = ui.input(|i| i.pointer.primary_released());
+
+    if let Some(active) = drag.as_ref() {
+        if primary_released {
+            *drag = None;
+            return false;
+        }
+        if primary_down {
+            if let Some(pp) = pointer_screen {
+                if let Some(world) =
+                    sketch_plane_point(cam, viewport, vp, &state.doc, session, pp)
+                {
+                    let frame = sketch_geometry_frame(&state.doc, session.sketch).unwrap();
+                    let (u, v) = world_to_local(&frame, world);
+                    let _ = state.apply(Action::DragVertex {
+                        point: active.point,
+                        u,
+                        v,
+                    });
+                }
+            }
+            return true;
+        }
+        *drag = None;
+    }
+
+    if primary_pressed {
+        if let Some(pp) = pointer_screen {
+            if let Some((point, _)) =
+                nearest_sketch_point_in_sketch(pp, project, &state.doc, session.sketch)
+            {
+                let element = vertex_drag::scene_element_for_point(point);
+                if document_health::require_element_editable(&state.document_health, element)
+                    .is_err()
+                {
+                    return false;
+                }
+                *drag = Some(VertexDrag { point });
+                state.apply(Action::ClickSceneElement {
+                    element: SceneElement::Point(point),
+                    additive: ui.input(|i| additive_click_modifiers(&i.modifiers)),
+                });
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn handle_line_drag(
+    ui: &egui::Ui,
+    state: &mut AppState,
+    session: SketchSession,
+    viewport: egui::Rect,
+    vp: &glam::Mat4,
+    cam: &camera::Camera,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    pointer_screen: Option<egui::Pos2>,
+) -> bool {
+    if state.creating_rect.is_some()
+        || state.creating_line.is_some()
+        || state.creating_circle.is_some()
+        || state.editing_committed_dim.is_some()
+    {
+        if state.line_drag_session.is_some() {
+            let _ = state.apply(Action::EndLineDrag);
+        }
+        return false;
+    }
+
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+    let primary_released = ui.input(|i| i.pointer.primary_released());
+
+    if state.line_drag_session.is_some() {
+        if primary_released {
+            let _ = state.apply(Action::EndLineDrag);
+            return false;
+        }
+        if primary_down {
+            if let Some(pp) = pointer_screen {
+                if let Some(world) =
+                    sketch_plane_point(cam, viewport, vp, &state.doc, session, pp)
+                {
+                    let frame = sketch_geometry_frame(&state.doc, session.sketch).unwrap();
+                    let (u, v) = world_to_local(&frame, world);
+                    let _ = state.apply(Action::DragLine { u, v });
+                }
+            }
+            return true;
+        }
+        let _ = state.apply(Action::EndLineDrag);
+        return false;
+    }
+
+    if primary_pressed {
+        if let Some(pp) = pointer_screen {
+            if nearest_sketch_point_in_sketch(pp, project, &state.doc, session.sketch).is_some() {
+                return false;
+            }
+            if let Some((target, _)) =
+                nearest_sketch_line_in_sketch(pp, project, &state.doc, session.sketch)
+            {
+                let element = vertex_drag::scene_element_for_line(target);
+                if document_health::require_element_editable(&state.document_health, element)
+                    .is_err()
+                {
+                    return false;
+                }
+                if let Some(world) =
+                    sketch_plane_point(cam, viewport, vp, &state.doc, session, pp)
+                {
+                    let frame = sketch_geometry_frame(&state.doc, session.sketch).unwrap();
+                    let (u, v) = world_to_local(&frame, world);
+                    let _ = state.apply(Action::BeginLineDrag {
+                        target,
+                        anchor_u: u,
+                        anchor_v: v,
+                    });
+                    let _ = state.apply(Action::DragLine { u, v });
+                    state.apply(Action::ClickSceneElement {
+                        element,
+                        additive: ui.input(|i| additive_click_modifiers(&i.modifiers)),
+                    });
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn handle_committed_dim_label_drag(
@@ -1792,6 +2095,15 @@ fn handle_committed_dim_label_drag(
     if primary_pressed && !double_clicked {
         if let Some(pos) = pointer {
             if let Some(hit) = layouts.iter().rev().find(|h| h.label_rect.contains(pos)) {
+                if document_health::require_constraint_editable(
+                    &state.document_health,
+                    &state.doc,
+                    hit.target,
+                )
+                .is_err()
+                {
+                    return false;
+                }
                 *drag = Some(DimLabelDrag {
                     target: hit.target,
                     outward: hit.outward,
@@ -1916,21 +2228,36 @@ impl App {
             ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         let viewport = response.rect;
         self.last_viewport = Some(viewport);
+        self.state.apply_pending_sketch_reframe(viewport);
 
         // Apply scripted right-drag as direct camera motion.
         self.synthetic.apply_pending_drag(viewport, |delta, modifiers, h| {
             if modifiers.shift {
                 self.state.cam.pan(delta, h);
+                if let Some(log) = &self.state.command_log {
+                    log.borrow_mut().note_pan(delta);
+                }
             } else {
                 self.state.cam.orbit(delta);
+                if let Some(log) = &self.state.command_log {
+                    log.borrow_mut().note_orbit(delta);
+                }
             }
         });
 
         if response.dragged_by(egui::PointerButton::Secondary) {
             if ui.input(|i| i.modifiers.shift) {
-                self.state.cam.pan(response.drag_delta(), viewport.height());
+                let delta = response.drag_delta();
+                self.state.cam.pan(delta, viewport.height());
+                if let Some(log) = &self.state.command_log {
+                    log.borrow_mut().note_pan(delta);
+                }
             } else {
-                self.state.cam.orbit(response.drag_delta());
+                let delta = response.drag_delta();
+                self.state.cam.orbit(delta);
+                if let Some(log) = &self.state.command_log {
+                    log.borrow_mut().note_orbit(delta);
+                }
             }
         }
         if response.hovered() {
@@ -1938,6 +2265,9 @@ impl App {
             if scroll != 0.0 {
                 let focal = response.hover_pos().unwrap_or(viewport.center());
                 self.state.cam.zoom(scroll, focal, viewport);
+                if let Some(log) = &self.state.command_log {
+                    log.borrow_mut().note_zoom(scroll);
+                }
             }
         }
 
@@ -1974,26 +2304,91 @@ impl App {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
 
-        if self.state.tool == Tool::Select
+        let mut vertex_dragging = false;
+        let mut line_dragging = false;
+        if matches!(self.state.tool, Tool::Select | Tool::Constraint)
             && self.state.editing_committed_dim.is_none()
             && !over_committed_dim_label
             && self.dim_label_drag.is_none()
+        {
+            if let Some(session) = sketch_session {
+                line_dragging = handle_line_drag(
+                    ui,
+                    &mut self.state,
+                    session,
+                    viewport,
+                    &vp,
+                    &cam,
+                    &project,
+                    pointer_screen,
+                );
+                if !line_dragging && self.state.line_drag_session.is_none() {
+                    vertex_dragging = handle_vertex_drag(
+                        ui,
+                        &mut self.vertex_drag,
+                        &mut self.state,
+                        session,
+                        viewport,
+                        &vp,
+                        &cam,
+                        &project,
+                        pointer_screen,
+                    );
+                }
+                if vertex_dragging || line_dragging || self.state.line_drag_session.is_some() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                } else if let Some(pp) = pointer_screen {
+                    if nearest_sketch_line_in_sketch(
+                        pp,
+                        &project,
+                        &self.state.doc,
+                        session.sketch,
+                    )
+                    .is_some()
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                }
+            }
+        }
+
+        let suppress_hover_highlight = suppress_viewport_pick_hover(
+            ui,
+            &response,
+            self.vertex_drag.is_some(),
+            self.state.line_drag_session.is_some(),
+            self.dim_label_drag.is_some(),
+            self.state
+                .creating_plane
+                .as_ref()
+                .is_some_and(|cp| cp.axis_gizmo_drag.is_some()),
+        );
+
+        if matches!(self.state.tool, Tool::Select | Tool::Constraint)
+            && self.state.editing_committed_dim.is_none()
+            && !over_committed_dim_label
+            && self.dim_label_drag.is_none()
+            && !vertex_dragging
+            && !line_dragging
+            && self.vertex_drag.is_none()
+            && self.state.line_drag_session.is_none()
         {
             if let Some(pp) = pointer_screen {
                 let gp = cam.ground_point(pp, viewport, &vp);
                 if ui.input(|i| i.pointer.primary_pressed()) {
                     if let Some(target) = resolve_pick_target(pp, &project, gp, &self.state.doc) {
                         if let Some(element) = scene_element_from_pick(&target.kind) {
-                            let additive = ui.input(|i| i.modifiers.command);
+                            let additive =
+                                ui.input(|i| additive_click_modifiers(&i.modifiers));
                             self.state
                                 .apply(Action::ClickSceneElement { element, additive });
-                        } else if !ui.input(|i| i.modifiers.command) {
+                        } else if !ui.input(|i| additive_click_modifiers(&i.modifiers)) {
                             self.state.apply(Action::ClearSceneSelection);
                         }
-                    } else if !ui.input(|i| i.modifiers.command) {
+                    } else if !ui.input(|i| additive_click_modifiers(&i.modifiers)) {
                         self.state.apply(Action::ClearSceneSelection);
                     }
-                } else if !self.gpu_viewport {
+                } else if !self.gpu_viewport && !suppress_hover_highlight {
                     if let Some(target) = resolve_pick_target(pp, &project, gp, &self.state.doc) {
                         if scene_element_from_pick(&target.kind).is_some() {
                             target.draw_highlight(&painter, &project, &self.state.doc);
@@ -2012,7 +2407,7 @@ impl App {
                             viewport: Some(viewport),
                         });
                     }
-                } else if !self.gpu_viewport {
+                } else if !self.gpu_viewport && !suppress_hover_highlight {
                     if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
                         draw_face_highlight(
                             &painter,
@@ -2036,7 +2431,7 @@ impl App {
                                 viewport: Some(viewport),
                             });
                         }
-                    } else if !self.gpu_viewport {
+                    } else if !self.gpu_viewport && !suppress_hover_highlight {
                         if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
                             draw_face_highlight(
                                 &painter,
@@ -2124,7 +2519,7 @@ impl App {
                                 viewport: Some(viewport),
                             });
                         }
-                    } else if !self.gpu_viewport {
+                    } else if !self.gpu_viewport && !suppress_hover_highlight {
                         if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
                             draw_face_highlight(
                                 &painter,
@@ -2199,7 +2594,7 @@ impl App {
                                 viewport: Some(viewport),
                             });
                         }
-                    } else if !self.gpu_viewport {
+                    } else if !self.gpu_viewport && !suppress_hover_highlight {
                         if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
                             draw_face_highlight(
                                 &painter,
@@ -2292,7 +2687,7 @@ impl App {
                                 });
                             }
                         }
-                    } else if self.state.editing_committed_dim.is_none() {
+                    } else if self.state.editing_committed_dim.is_none() && !suppress_hover_highlight {
                         if let Some(target) =
                             resolve_pick_target(pp, &project, Some(gp), &self.state.doc)
                         {
@@ -2522,6 +2917,7 @@ impl App {
                         &vp,
                         &project,
                         editing_constraint,
+                        &self.state.document_health,
                     )
                 })
                 .unwrap_or_default()
@@ -2538,6 +2934,7 @@ impl App {
             }
         });
         let hover_highlight = resolve_viewport_hover_highlight(
+            suppress_hover_highlight,
             self.state.tool,
             sketch_session,
             self.state.creating_plane.is_some(),
@@ -2558,6 +2955,7 @@ impl App {
             sketch_session,
             &self.state.element_visibility,
             &self.state.scene_selection,
+            &self.state.document_health,
             self.state.creating_rect.as_ref(),
             self.state.creating_line.as_ref(),
             self.state.creating_circle.as_ref(),
@@ -2581,37 +2979,52 @@ impl App {
             );
 
             let visibility = &self.state.element_visibility;
+            let health = &self.state.document_health;
             for (ri, r) in doc.rects.iter().enumerate() {
-                if !visibility.effective_visible(doc, SceneElement::Rect(ri)) {
+                if !rect_alive(doc, ri)
+                    || !visibility.effective_visible(doc, SceneElement::Rect(ri))
+                {
                     continue;
                 }
                 let dim = sketch_session
                     .is_some_and(|s| !sketch_rect_is_active(doc, s, ri, r.sketch));
-                draw_rect_edges(&painter, &project, doc, r, dim);
+                let element_health = health.element_status(SceneElement::Rect(ri));
+                draw_rect_edges(&painter, &project, doc, r, dim, element_health);
             }
             for (li, line) in doc.lines.iter().enumerate() {
-                if !visibility.effective_visible(doc, SceneElement::Line(li)) {
+                if !line_alive(doc, li)
+                    || !visibility.effective_visible(doc, SceneElement::Line(li))
+                {
                     continue;
                 }
                 let dim = sketch_session.is_some_and(|s| line.sketch != s.sketch);
+                let base = if line.construction {
+                    sketch_color(col::CONSTRUCTION, dim)
+                } else {
+                    sketch_color(col::LINE_STROKE, dim)
+                };
+                let color = health_tint_color(base, health.element_status(SceneElement::Line(li)));
                 if line.construction {
-                    let color = sketch_color(col::CONSTRUCTION, dim);
                     draw_construction_line_segment(&painter, &project, doc, line, color, 2.0);
                 } else {
-                    let color = sketch_color(col::LINE_STROKE, dim);
                     draw_line_segment(&painter, &project, doc, line, color, 2.0);
                 }
             }
             for (ci, circle) in doc.circles.iter().enumerate() {
-                if !visibility.effective_visible(doc, SceneElement::Circle(ci)) {
+                if !circle_alive(doc, ci)
+                    || !visibility.effective_visible(doc, SceneElement::Circle(ci))
+                {
                     continue;
                 }
                 let dim = sketch_session
                     .is_some_and(|s| !sketch_circle_is_active(doc, s, ci, circle.sketch));
-                draw_circle_edges(&painter, &project, doc, circle, dim);
+                let element_health = health.element_status(SceneElement::Circle(ci));
+                draw_circle_edges(&painter, &project, doc, circle, dim, element_health);
             }
             for (i, plane) in doc.construction_planes.iter().enumerate() {
-                if !visibility.effective_visible(doc, SceneElement::ConstructionPlane(i)) {
+                if plane.deleted
+                    || !visibility.effective_visible(doc, SceneElement::ConstructionPlane(i))
+                {
                     continue;
                 }
                 let session_face =
@@ -2628,6 +3041,7 @@ impl App {
                 &painter,
                 &project,
                 doc,
+                health,
                 &self.state.scene_selection,
             );
             if let Some(session) = sketch_session {
@@ -2649,7 +3063,13 @@ impl App {
             let mut commit_committed_dim = false;
             if let (Some(layouts), Some(view)) = (&committed_dim_layouts, planar_label_view) {
                 if !gpu_drawn {
-                    draw_committed_dim_layouts(&painter, layouts, &view, &project);
+                    draw_committed_dim_layouts(
+                        &painter,
+                        layouts,
+                        &view,
+                        &project,
+                        &self.state.document_health,
+                    );
                 }
                 if let Some(edit) = &mut self.state.editing_committed_dim {
                     let constraint_id = match &edit.target {
@@ -2746,7 +3166,14 @@ impl App {
                         for edge_index in 0..4 {
                             preview.set_edge_construction(RectEdge::from_index(edge_index), true);
                         }
-                        draw_rect_edges(&painter, &project, &self.state.doc, &preview, false);
+                        draw_rect_edges(
+                            &painter,
+                            &project,
+                            &self.state.doc,
+                            &preview,
+                            false,
+                            HealthStatus::Healthy,
+                        );
                     } else {
                         draw_rect(&painter, &project, &self.state.doc, &preview, col::PREVIEW, false);
                     }
@@ -2810,7 +3237,14 @@ impl App {
                         angle,
                     );
                     if cc.construction {
-                        draw_circle_edges(&painter, &project, &self.state.doc, &preview, false);
+                        draw_circle_edges(
+                            &painter,
+                            &project,
+                            &self.state.doc,
+                            &preview,
+                            false,
+                            HealthStatus::Healthy,
+                        );
                     } else {
                         draw_circle(
                             &painter,
@@ -2896,6 +3330,7 @@ impl App {
         if !gpu_drawn
             && self.state.tool == Tool::ConstructionPlane
             && self.state.creating_plane.is_none()
+            && !suppress_hover_highlight
         {
             if let Some(pp) = response.hover_pos().or(response.interact_pointer_pos()) {
                 let gp = cam.ground_point(pp, viewport, &vp);
@@ -3262,12 +3697,18 @@ impl App {
         }
 
         if self.state.panes.is_visible(Pane::ViewCube) {
+            let command_log = self
+                .state
+                .command_log
+                .as_ref()
+                .map(|log| log.borrow_mut());
             view_cube::show_hud(
                 ui.ctx(),
                 &mut self.state.cam,
                 viewport,
                 render_state,
                 self.gpu_view_cube,
+                command_log,
             );
         }
 
@@ -3276,9 +3717,9 @@ impl App {
                 if self.state.editing_committed_dim.is_some() {
                     "Edit dimension • Enter to commit • Esc to cancel"
                 } else if self.state.sketch_session.is_some() {
-                    "Sketch mode — double-click a dimension label to edit • drag labels to reposition • Esc: exit sketch"
+                    "Sketch mode — drag vertices • Shift+click or ⌘/Ctrl+click multi-select • double-click a dimension to edit • Esc: exit sketch"
                 } else {
-                    "Click lines/edges to select • ⌘/Ctrl+click multi-select • Right-drag: orbit  •  Wheel: zoom  •  s: sketch  •  p: plane"
+                    "Click to select • Shift+click or ⌘/Ctrl+click multi-select • Right-drag: orbit  •  Wheel: zoom  •  s: sketch  •  p: plane"
                 }
             }
             Tool::Sketch => {
@@ -3306,9 +3747,16 @@ impl App {
                 if self.state.creating_circle.is_some() {
                     "Move mouse (free diameter) • Type in diameter input to constrain • Click/Enter: create circle • Esc: cancel"
                 } else if self.state.sketch_session.is_none() {
-                    "c: circle  •  Click a face to sketch on  •  Right-drag: orbit  • Shift+right-drag: pan  •  Wheel: zoom"
+                    "o: circle  •  Click a face to sketch on  •  Right-drag: orbit  • Shift+right-drag: pan  •  Wheel: zoom"
                 } else {
-                    "c: circle  •  Left-click to set center • move to size • Right-drag: orbit  • Shift+right-drag: pan  •  Wheel: zoom"
+                    "o: circle  •  Left-click to set center • move to size • Right-drag: orbit  • Shift+right-drag: pan  •  Wheel: zoom"
+                }
+            }
+            Tool::Constraint => {
+                if self.state.sketch_session.is_none() {
+                    "c: constraint  •  Open a sketch to add geometric constraints"
+                } else {
+                    "c: constraint  •  Shift+click or ⌘/Ctrl+click multi-select • 1–9 apply constraint • context pane shows options"
                 }
             }
             Tool::Dimension => {
@@ -3508,9 +3956,10 @@ fn draw_circle_edges(
     doc: &model::Document,
     circle: &Circle,
     dim: bool,
+    health: HealthStatus,
 ) {
-    let solid_color = sketch_color(col::RECT_LINE, dim);
-    let construction_color = sketch_color(col::CONSTRUCTION, dim);
+    let solid_color = health_tint_color(sketch_color(col::RECT_LINE, dim), health);
+    let construction_color = health_tint_color(sketch_color(col::CONSTRUCTION, dim), health);
     if circle.construction {
         if let Some(screen_pts) = circle_screen_perimeter(project, doc, circle) {
             painter.add(egui::Shape::convex_polygon(
@@ -3531,12 +3980,13 @@ fn draw_rect_edges(
     doc: &model::Document,
     r: &Rect,
     dim: bool,
+    health: HealthStatus,
 ) {
     let Some(corners) = rect_world_corners(doc, r) else {
         return;
     };
-    let solid_color = sketch_color(col::RECT_LINE, dim);
-    let construction_color = sketch_color(col::CONSTRUCTION, dim);
+    let solid_color = health_tint_color(sketch_color(col::RECT_LINE, dim), health);
+    let construction_color = health_tint_color(sketch_color(col::CONSTRUCTION, dim), health);
     let all_construction = r.all_edges_construction();
     let has_solid_edge = r.construction_edges.iter().any(|&c| !c);
 
@@ -3576,19 +4026,24 @@ fn draw_scene_selection_highlights(
     painter: &egui::Painter,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
     doc: &model::Document,
+    health: &DocumentHealth,
     selection: &crate::selection::SceneSelection,
 ) {
     if selection.is_empty() {
         return;
     }
-    let color = col::DIM_EDGE_HIGHLIGHT;
+    let base_color = col::DIM_EDGE_HIGHLIGHT;
     let width = 3.0;
     for element in selection.iter() {
-        let dashed = context::selection_highlight_dashed(doc, element);
+        let color = health_tint_color(base_color, health.element_status(element));
+        let dashed = context::selection_highlight_dashed(doc, element) == Some(true);
         match element {
             SceneElement::Line(index) => {
+                if !line_alive(doc, index) {
+                    continue;
+                }
                 if let Some(line) = doc.lines.get(index) {
-                    if dashed == Some(true) {
+                    if dashed {
                         draw_construction_line_segment(painter, project, doc, line, color, width);
                     } else {
                         draw_line_segment(painter, project, doc, line, color, width);
@@ -3596,10 +4051,13 @@ fn draw_scene_selection_highlights(
                 }
             }
             SceneElement::RectEdge(index, edge) => {
+                if !rect_alive(doc, index) {
+                    continue;
+                }
                 if let Some(rect) = doc.rects.get(index) {
                     let segments = rect_edge_segments(doc, rect);
                     let (a, b) = segments[edge.index()];
-                    if dashed == Some(true) {
+                    if dashed {
                         draw_world_segment_dashed(painter, project, a, b, color, width);
                     } else {
                         draw_world_segment(painter, project, a, b, color, width);
@@ -3607,25 +4065,51 @@ fn draw_scene_selection_highlights(
                 }
             }
             SceneElement::Rect(index) => {
+                if !rect_alive(doc, index) {
+                    continue;
+                }
                 if let Some(rect) = doc.rects.get(index) {
                     for (edge_index, (a, b)) in
                         rect_edge_segments(doc, rect).into_iter().enumerate()
                     {
                         let edge = RectEdge::from_index(edge_index);
-                        if rect.edge_construction(edge) {
-                            draw_world_segment_dashed(painter, project, a, b, color, width);
+                        let stroke = if rect.edge_construction(edge) {
+                            color.gamma_multiply(0.85)
                         } else {
-                            draw_world_segment(painter, project, a, b, color, width);
+                            color
+                        };
+                        if dashed && rect.edge_construction(edge) {
+                            draw_world_segment_dashed(painter, project, a, b, stroke, width);
+                        } else {
+                            draw_world_segment(painter, project, a, b, stroke, width);
                         }
                     }
                 }
             }
             SceneElement::Circle(index) => {
+                if !circle_alive(doc, index) {
+                    continue;
+                }
                 if let Some(circle) = doc.circles.get(index) {
-                    if dashed == Some(true) {
+                    if dashed {
                         draw_construction_circle(painter, project, doc, circle, color, width);
                     } else {
                         draw_circle(painter, project, doc, circle, color, false, width);
+                    }
+                }
+            }
+            SceneElement::Constraint(index) => {
+                if !constraint_alive(doc, index) {
+                    continue;
+                }
+                if let Some((a, b)) = constraint_segment_endpoints(doc, index) {
+                    draw_world_segment(painter, project, a, b, color, width);
+                }
+            }
+            SceneElement::Point(point) => {
+                if let Some(world) = point_world_position(doc, point) {
+                    if let Some(screen) = project(world) {
+                        painter.circle_filled(screen, 6.0, color);
                     }
                 }
             }
@@ -4263,6 +4747,34 @@ mod tests {
         let (a, b) = rect_highlight_edge(corners, RectDimEdge::Height);
         assert_eq!(a, Vec3::new(1.0, 2.0, 0.0));
         assert_eq!(b, Vec3::new(1.0, 8.0, 0.0));
+    }
+
+    #[test]
+    fn resolve_viewport_hover_highlight_suppressed_returns_none() {
+        use super::resolve_viewport_hover_highlight;
+        let doc = crate::model::Document::default();
+        let cam = crate::camera::Camera::default();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let vp = cam.view_proj(viewport);
+        let project = |_: glam::Vec3| Some(egui::Pos2::ZERO);
+        assert!(
+            resolve_viewport_hover_highlight(
+                true,
+                crate::actions::Tool::Select,
+                None,
+                false,
+                false,
+                false,
+                false,
+                Some(egui::Pos2::ZERO),
+                &cam,
+                viewport,
+                &vp,
+                &doc,
+                &project,
+            )
+            .is_none()
+        );
     }
 
     #[test]

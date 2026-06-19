@@ -35,6 +35,7 @@ pub fn add_distance_constraint(
         expression,
         dim_offset: None,
         name: None,
+        deleted: false,
     });
     doc.shape_order.push(crate::model::ShapeKind::Constraint);
     solve_document_constraints(doc)?;
@@ -81,7 +82,9 @@ pub fn constraint_expression(doc: &Document, index: ConstraintId) -> Option<Stri
 
 pub fn constraint_evaluated_length(doc: &Document, index: ConstraintId) -> Option<f32> {
     let constraint = doc.constraints.get(index)?;
-    let ConstraintKind::Distance { target } = constraint.kind;
+    let ConstraintKind::Distance { target } = constraint.kind else {
+        return None;
+    };
     eval_length_mm_in_doc(&constraint.expression, doc).or_else(|| match target {
         DistanceTarget::LineLength(i) => doc.lines.get(i).map(|l| l.length()),
         DistanceTarget::RectWidth(i) => doc.rects.get(i).map(|r| r.w),
@@ -103,11 +106,26 @@ pub fn constraint_label(doc: &Document, index: ConstraintId) -> String {
         ConstraintKind::Distance { .. } => constraint_evaluated_length(doc, index)
             .map(format_length_display)
             .unwrap_or_else(|| "?".to_string()),
+        ConstraintKind::Parallel { .. }
+        | ConstraintKind::Perpendicular { .. }
+        | ConstraintKind::Coincident { .. }
+        | ConstraintKind::Midpoint { .. }
+        | ConstraintKind::Horizontal { .. }
+        | ConstraintKind::Vertical { .. } => String::new(),
     };
     let target_label = match constraint.kind {
         ConstraintKind::Distance { target } => distance_target_label(target),
+        ConstraintKind::Parallel { .. } => "Parallel".to_string(),
+        ConstraintKind::Perpendicular { .. } => "Perpendicular".to_string(),
+        ConstraintKind::Coincident { .. } => "Coincident".to_string(),
+        ConstraintKind::Midpoint { .. } => "Midpoint".to_string(),
+        ConstraintKind::Horizontal { .. } => "Horizontal".to_string(),
+        ConstraintKind::Vertical { .. } => "Vertical".to_string(),
     };
-    format!("Constraint {index} ({target_label}, {value})")
+    match constraint.kind {
+        ConstraintKind::Distance { .. } => format!("Constraint {index} ({target_label}, {value})"),
+        _ => format!("Constraint {index} ({target_label})"),
+    }
 }
 
 fn distance_target_label(target: DistanceTarget) -> String {
@@ -203,7 +221,11 @@ pub fn default_distance_expression(doc: &Document, target: DistanceTarget) -> St
         .unwrap_or_else(|| "10mm".to_string())
 }
 
-fn validate_distance_target(doc: &Document, sketch: SketchId, target: DistanceTarget) -> Result<(), String> {
+pub fn validate_distance_target(
+    doc: &Document,
+    sketch: SketchId,
+    target: DistanceTarget,
+) -> Result<(), String> {
     match target {
         DistanceTarget::LineLength(i) => {
             let line = doc
@@ -241,19 +263,26 @@ pub fn solve_document_constraints(doc: &mut Document) -> Result<(), String> {
     clear_legacy_dimension_locks(doc);
     for i in 0..doc.constraints.len() {
         let constraint = doc.constraints[i].clone();
-        let ConstraintKind::Distance { target } = constraint.kind;
-        let value = eval_length_mm_in_doc(&constraint.expression, doc)
-            .ok_or_else(|| format!("Invalid constraint expression '{}'", constraint.expression))?;
-        if value <= 0.0 {
-            return Err(format!(
-                "Constraint expression '{}' must be positive",
-                constraint.expression
-            ));
+        if constraint.deleted {
+            continue;
         }
-        apply_distance_constraint(doc, target, value)?;
-        sync_legacy_dimension_flags(doc, target, &constraint.expression, constraint.dim_offset);
+        if let ConstraintKind::Distance { target } = constraint.kind {
+            if !crate::document_lifecycle::distance_target_alive(doc, target) {
+                continue;
+            }
+            let Some(value) = eval_length_mm_in_doc(&constraint.expression, doc) else {
+                continue;
+            };
+            if value <= 0.0 {
+                continue;
+            }
+            if apply_distance_constraint(doc, target, value).is_err() {
+                continue;
+            }
+            sync_legacy_dimension_flags(doc, target, &constraint.expression, constraint.dim_offset);
+        }
     }
-    Ok(())
+    crate::geometric_constraints::apply_geometric_constraints(doc)
 }
 
 fn clear_legacy_dimension_locks(doc: &mut Document) {
@@ -452,6 +481,7 @@ fn add_distance_constraint_internal(
         expression,
         dim_offset,
         name: None,
+        deleted: false,
     });
     doc.shape_order.push(crate::model::ShapeKind::Constraint);
     Ok(id)
@@ -491,7 +521,9 @@ pub fn constraint_segment_endpoints(
     index: ConstraintId,
 ) -> Option<(glam::Vec3, glam::Vec3)> {
     let constraint = doc.constraints.get(index)?;
-    let ConstraintKind::Distance { target } = constraint.kind;
+    let ConstraintKind::Distance { target } = constraint.kind else {
+        return None;
+    };
     distance_target_segment_endpoints(doc, target)
 }
 

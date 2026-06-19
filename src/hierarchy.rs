@@ -4,9 +4,15 @@
 pub const PANE_TITLE: &str = "Elements";
 
 use crate::actions::SketchSession;
-use crate::model::{ConstructionPlaneParent, Document, FaceId, RectEdge, ShapeKind, SketchId};
+use crate::icons::{icon_button, icon_for_visibility};
+use crate::document_health::{DocumentHealth, HealthStatus};
+use crate::document_lifecycle::{element_alive, sketch_alive};
+use crate::model::{
+    ConstraintEntity, ConstraintKind, ConstraintLine, ConstraintPoint, ConstructionPlaneParent,
+    DistanceTarget, Document, FaceId, RectEdge, ShapeKind, SketchId,
+};
 use crate::names;
-use crate::selection::SceneSelection;
+use crate::selection::{additive_click_modifiers, SceneSelection};
 use eframe::egui::{self, Color32, RichText};
 use std::collections::{HashMap, HashSet};
 
@@ -30,6 +36,7 @@ pub enum SceneElement {
     Line(usize),
     Circle(usize),
     RectEdge(usize, RectEdge),
+    Point(ConstraintPoint),
     Constraint(usize),
 }
 
@@ -101,10 +108,29 @@ impl ElementVisibility {
             SceneElement::RectEdge(index, _) => doc.rects.get(index).is_some_and(|rect| {
                 self.effective_visible(doc, SceneElement::Sketch(rect.sketch))
             }),
+            SceneElement::Point(point) => point_effective_visible(self, doc, point),
             SceneElement::Constraint(index) => doc.constraints.get(index).is_some_and(|c| {
                 self.effective_visible(doc, SceneElement::Sketch(c.sketch))
             }),
         }
+    }
+}
+
+fn point_effective_visible(
+    visibility: &ElementVisibility,
+    doc: &Document,
+    point: ConstraintPoint,
+) -> bool {
+    match point {
+        ConstraintPoint::LineEndpoint { line, .. } => doc.lines.get(line).is_some_and(|entity| {
+            visibility.effective_visible(doc, SceneElement::Sketch(entity.sketch))
+        }),
+        ConstraintPoint::RectCorner { rect, .. } => doc.rects.get(rect).is_some_and(|entity| {
+            visibility.effective_visible(doc, SceneElement::Sketch(entity.sketch))
+        }),
+        ConstraintPoint::CircleCenter(circle) => doc.circles.get(circle).is_some_and(|entity| {
+            visibility.effective_visible(doc, SceneElement::Sketch(entity.sketch))
+        }),
     }
 }
 
@@ -192,7 +218,7 @@ pub fn build_hierarchy(
 ) -> Vec<HierarchyEntry> {
     let mut roots = Vec::new();
     for (i, plane) in doc.construction_planes.iter().enumerate() {
-        if !matches!(plane.parent, ConstructionPlaneParent::Root) {
+        if plane.deleted || !matches!(plane.parent, ConstructionPlaneParent::Root) {
             continue;
         }
         let face = FaceId::ConstructionPlane(i);
@@ -290,6 +316,18 @@ fn parent_element(doc: &Document, element: SceneElement) -> Option<SceneElement>
             .constraints
             .get(index)
             .map(|c| SceneElement::Sketch(c.sketch)),
+        SceneElement::Point(point) => point_parent_element(doc, point),
+    }
+}
+
+fn point_parent_element(doc: &Document, point: ConstraintPoint) -> Option<SceneElement> {
+    match point {
+        ConstraintPoint::LineEndpoint { line, .. } => doc
+            .lines
+            .get(line)
+            .map(|_| SceneElement::Line(line)),
+        ConstraintPoint::RectCorner { rect, .. } => Some(SceneElement::Rect(rect)),
+        ConstraintPoint::CircleCenter(circle) => Some(SceneElement::Circle(circle)),
     }
 }
 
@@ -353,7 +391,8 @@ fn collect_descendants(doc: &Document, element: SceneElement, out: &mut HashSet<
         }
         SceneElement::Line(_)
         | SceneElement::RectEdge(_, _)
-        | SceneElement::Constraint(_) => {}
+        | SceneElement::Constraint(_)
+        | SceneElement::Point(_) => {}
     }
 }
 
@@ -364,7 +403,110 @@ fn selection_anchor(element: SceneElement) -> SceneElement {
     }
 }
 
-/// Selected elements plus their ancestors and descendants.
+fn distance_target_touches_element(target: DistanceTarget, element: SceneElement) -> bool {
+    match (target, element) {
+        (DistanceTarget::LineLength(i), SceneElement::Line(j)) => i == j,
+        (DistanceTarget::RectWidth(r) | DistanceTarget::RectHeight(r), SceneElement::Rect(i)) => {
+            r == i
+        }
+        (DistanceTarget::RectWidth(r), SceneElement::RectEdge(i, RectEdge::Bottom | RectEdge::Top)) => {
+            r == i
+        }
+        (
+            DistanceTarget::RectHeight(r),
+            SceneElement::RectEdge(i, RectEdge::Left | RectEdge::Right),
+        ) => r == i,
+        (DistanceTarget::CircleDiameter(c), SceneElement::Circle(i)) => c == i,
+        _ => false,
+    }
+}
+
+fn constraint_line_touches_element(line: ConstraintLine, element: SceneElement) -> bool {
+    match (line, element) {
+        (ConstraintLine::Line(i), SceneElement::Line(j)) => i == j,
+        (
+            ConstraintLine::Line(i),
+            SceneElement::Point(ConstraintPoint::LineEndpoint { line, .. }),
+        ) => i == line,
+        (ConstraintLine::RectEdge { rect, edge }, SceneElement::RectEdge(r, e)) => {
+            rect == r && edge == e
+        }
+        (ConstraintLine::RectEdge { rect, .. }, SceneElement::Rect(r)) => rect == r,
+        (
+            ConstraintLine::RectEdge { rect, .. },
+            SceneElement::Point(ConstraintPoint::RectCorner { rect: r, .. }),
+        ) => rect == r,
+        _ => false,
+    }
+}
+
+fn constraint_point_touches_element(point: ConstraintPoint, element: SceneElement) -> bool {
+    match (point, element) {
+        (p, SceneElement::Point(q)) => p == q,
+        (ConstraintPoint::LineEndpoint { line, .. }, SceneElement::Line(i)) => line == i,
+        (ConstraintPoint::RectCorner { rect, .. }, SceneElement::Rect(r)) => rect == r,
+        (ConstraintPoint::RectCorner { rect, .. }, SceneElement::RectEdge(r, _)) => rect == r,
+        (ConstraintPoint::CircleCenter(c), SceneElement::Circle(i)) => c == i,
+        _ => false,
+    }
+}
+
+fn constraint_entity_touches_element(entity: ConstraintEntity, element: SceneElement) -> bool {
+    match entity {
+        ConstraintEntity::Point(point) => constraint_point_touches_element(point, element),
+        ConstraintEntity::Line(line) => constraint_line_touches_element(line, element),
+    }
+}
+
+fn constraint_kind_touches_element(kind: ConstraintKind, element: SceneElement) -> bool {
+    match kind {
+        ConstraintKind::Distance { target } => distance_target_touches_element(target, element),
+        ConstraintKind::Parallel { line_a, line_b }
+        | ConstraintKind::Perpendicular { line_a, line_b } => {
+            constraint_line_touches_element(line_a, element)
+                || constraint_line_touches_element(line_b, element)
+        }
+        ConstraintKind::Coincident { a, b } => {
+            constraint_entity_touches_element(a, element)
+                || constraint_entity_touches_element(b, element)
+        }
+        ConstraintKind::Midpoint { point, line } => {
+            constraint_point_touches_element(point, element)
+                || constraint_line_touches_element(line, element)
+        }
+        ConstraintKind::Horizontal { line } | ConstraintKind::Vertical { line } => {
+            constraint_line_touches_element(line, element)
+        }
+    }
+}
+
+fn constraints_for_element(doc: &Document, element: SceneElement) -> Vec<usize> {
+    doc.constraints
+        .iter()
+        .enumerate()
+        .filter_map(|(index, constraint)| {
+            constraint_kind_touches_element(constraint.kind, element).then_some(index)
+        })
+        .collect()
+}
+
+/// Constraint indices that apply to the current selection (for Elements pane highlighting).
+pub fn selection_related_constraints(
+    doc: &Document,
+    selection: &SceneSelection,
+) -> HashSet<usize> {
+    let mut related = HashSet::new();
+    for element in selection.iter() {
+        let anchor = selection_anchor(element);
+        related.extend(constraints_for_element(doc, anchor));
+        if anchor != element {
+            related.extend(constraints_for_element(doc, element));
+        }
+    }
+    related
+}
+
+/// Selected elements plus their ancestors, descendants, and related constraints.
 pub fn selection_context_elements(
     doc: &Document,
     selection: &SceneSelection,
@@ -376,16 +518,27 @@ pub fn selection_context_elements(
         collect_ancestors(doc, anchor, &mut context);
         collect_descendants(doc, anchor, &mut context);
     }
+    for index in selection_related_constraints(doc, selection) {
+        context.insert(SceneElement::Constraint(index));
+    }
     context
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowStyle {
     Selected,
+    RelatedConstraint,
+    Invalid,
+    Unstable,
     InContext,
     Normal,
     Faint,
 }
+
+/// Accent for constraint rows tied to the current selection.
+const RELATED_CONSTRAINT_TEXT: Color32 = Color32::from_rgb(255, 205, 88);
+const INVALID_TEXT: Color32 = Color32::from_rgb(220, 80, 80);
+const UNSTABLE_TEXT: Color32 = Color32::from_rgb(255, 180, 60);
 
 fn row_is_selected(element: SceneElement, selection: &SceneSelection) -> bool {
     selection.is_selected(element)
@@ -411,13 +564,22 @@ fn row_style(
     element: SceneElement,
     selection: &SceneSelection,
     context: &HashSet<SceneElement>,
+    related_constraints: &HashSet<usize>,
     style_selection: bool,
+    health: &DocumentHealth,
 ) -> RowStyle {
+    match health.element_status(element) {
+        HealthStatus::Invalid => return RowStyle::Invalid,
+        HealthStatus::Unstable => return RowStyle::Unstable,
+        HealthStatus::Healthy => {}
+    }
     if !style_selection {
         return RowStyle::Normal;
     }
     if row_is_selected(element, selection) {
         RowStyle::Selected
+    } else if matches!(element, SceneElement::Constraint(index) if related_constraints.contains(&index)) {
+        RowStyle::RelatedConstraint
     } else if context.contains(&element) {
         RowStyle::InContext
     } else {
@@ -428,6 +590,9 @@ fn row_style(
 fn styled_label(label: &str, style: RowStyle) -> RichText {
     match style {
         RowStyle::Selected | RowStyle::InContext | RowStyle::Normal => RichText::new(label),
+        RowStyle::RelatedConstraint => RichText::new(label).color(RELATED_CONSTRAINT_TEXT),
+        RowStyle::Invalid => RichText::new(label).color(INVALID_TEXT),
+        RowStyle::Unstable => RichText::new(label).color(UNSTABLE_TEXT),
         RowStyle::Faint => RichText::new(label).color(Color32::from_gray(120)),
     }
 }
@@ -471,6 +636,7 @@ fn build_face_sketches(
     sketch_session: Option<SketchSession>,
 ) -> Vec<HierarchyEntry> {
     doc.sketches_on_face(face)
+        .filter(|sketch| sketch_alive(doc, *sketch))
         .map(|sketch| build_sketch_entry(doc, sketch, sketch_session))
         .collect()
 }
@@ -482,7 +648,7 @@ fn build_sketch_child_planes(
 ) -> Vec<HierarchyEntry> {
     let mut children = Vec::new();
     for (pi, plane) in doc.construction_planes.iter().enumerate() {
-        if !matches!(plane.parent, ConstructionPlaneParent::Sketch(s) if s == sketch) {
+        if plane.deleted || !matches!(plane.parent, ConstructionPlaneParent::Sketch(s) if s == sketch) {
             continue;
         }
         let face = FaceId::ConstructionPlane(pi);
@@ -503,60 +669,66 @@ fn build_sketch_entry(
 
     if sketch_session.is_some_and(|s| s.sketch == sketch) {
         for (ri, rect) in doc.rects.iter().enumerate() {
-            if rect.sketch == sketch {
-                let nested = build_face_sketches(doc, FaceId::Rect(ri), sketch_session);
+            if rect.deleted || rect.sketch != sketch {
+                continue;
+            }
+            let nested = build_face_sketches(doc, FaceId::Rect(ri), sketch_session);
+            children.push(HierarchyEntry {
+                node: HierarchyNode::Rect(ri),
+                children: nested,
+            });
+        }
+        for (li, line) in doc.lines.iter().enumerate() {
+            if line.deleted || line.sketch != sketch {
+                continue;
+            }
+            children.push(HierarchyEntry {
+                node: HierarchyNode::Line(li),
+                children: vec![],
+            });
+        }
+        for (ci, circle) in doc.circles.iter().enumerate() {
+            if circle.deleted || circle.sketch != sketch {
+                continue;
+            }
+            let nested = build_face_sketches(doc, FaceId::Circle(ci), sketch_session);
+            children.push(HierarchyEntry {
+                node: HierarchyNode::Circle(ci),
+                children: nested,
+            });
+        }
+        for (ci, constraint) in doc.constraints.iter().enumerate() {
+            if constraint.deleted || constraint.sketch != sketch {
+                continue;
+            }
+            children.push(HierarchyEntry {
+                node: HierarchyNode::Constraint(ci),
+                children: vec![],
+            });
+        }
+    } else {
+        for (ri, rect) in doc.rects.iter().enumerate() {
+            if rect.deleted || rect.sketch != sketch {
+                continue;
+            }
+            let nested = build_face_sketches(doc, FaceId::Rect(ri), sketch_session);
+            if !nested.is_empty() {
                 children.push(HierarchyEntry {
                     node: HierarchyNode::Rect(ri),
                     children: nested,
                 });
             }
         }
-        for (li, line) in doc.lines.iter().enumerate() {
-            if line.sketch == sketch {
-                children.push(HierarchyEntry {
-                    node: HierarchyNode::Line(li),
-                    children: vec![],
-                });
-            }
-        }
         for (ci, circle) in doc.circles.iter().enumerate() {
-            if circle.sketch == sketch {
-                let nested = build_face_sketches(doc, FaceId::Circle(ci), sketch_session);
+            if circle.deleted || circle.sketch != sketch {
+                continue;
+            }
+            let nested = build_face_sketches(doc, FaceId::Circle(ci), sketch_session);
+            if !nested.is_empty() {
                 children.push(HierarchyEntry {
                     node: HierarchyNode::Circle(ci),
                     children: nested,
                 });
-            }
-        }
-        for (ci, constraint) in doc.constraints.iter().enumerate() {
-            if constraint.sketch == sketch {
-                children.push(HierarchyEntry {
-                    node: HierarchyNode::Constraint(ci),
-                    children: vec![],
-                });
-            }
-        }
-    } else {
-        for (ri, rect) in doc.rects.iter().enumerate() {
-            if rect.sketch == sketch {
-                let nested = build_face_sketches(doc, FaceId::Rect(ri), sketch_session);
-                if !nested.is_empty() {
-                    children.push(HierarchyEntry {
-                        node: HierarchyNode::Rect(ri),
-                        children: nested,
-                    });
-                }
-            }
-        }
-        for (ci, circle) in doc.circles.iter().enumerate() {
-            if circle.sketch == sketch {
-                let nested = build_face_sketches(doc, FaceId::Circle(ci), sketch_session);
-                if !nested.is_empty() {
-                    children.push(HierarchyEntry {
-                        node: HierarchyNode::Circle(ci),
-                        children: nested,
-                    });
-                }
             }
         }
     }
@@ -582,6 +754,7 @@ pub fn show_pane(
     sketch_session: Option<SketchSession>,
     visibility: &mut ElementVisibility,
     selection: &SceneSelection,
+    health: &DocumentHealth,
     on_edit_sketch: &mut impl FnMut(SketchId),
     on_edit_plane: &mut impl FnMut(usize),
     on_toggle_visibility: &mut impl FnMut(SceneElement, bool),
@@ -591,6 +764,7 @@ pub fn show_pane(
     ui.separator();
 
     let context = selection_context_elements(doc, selection);
+    let related_constraints = selection_related_constraints(doc, selection);
     let elements = build_element_list(doc, sketch_session);
     let style_selection = selection_styles_visible_list(&elements, selection);
 
@@ -602,7 +776,9 @@ pub fn show_pane(
                 node,
                 visibility,
                 selection,
+                health,
                 &context,
+                &related_constraints,
                 style_selection,
                 on_edit_sketch,
                 on_edit_plane,
@@ -619,7 +795,9 @@ fn show_row(
     node: HierarchyNode,
     visibility: &mut ElementVisibility,
     selection: &SceneSelection,
+    health: &DocumentHealth,
     context: &HashSet<SceneElement>,
+    related_constraints: &HashSet<usize>,
     style_selection: bool,
     on_edit_sketch: &mut impl FnMut(SketchId),
     on_edit_plane: &mut impl FnMut(usize),
@@ -627,15 +805,26 @@ fn show_row(
     on_click_element: &mut impl FnMut(SceneElement, bool),
 ) {
     let element = scene_element_for_node(node);
+    if !element_alive(doc, element) {
+        return;
+    }
     let visible = visibility.effective_visible(doc, element);
-    let style = row_style(element, selection, context, style_selection);
+    let style = row_style(
+        element,
+        selection,
+        context,
+        related_constraints,
+        style_selection,
+        health,
+    );
 
     ui.horizontal(|ui| {
-        let eye = if visible { "👁" } else { "◌" };
-        if ui
-            .button(eye)
-            .on_hover_text(if visible { "Hide" } else { "Show" })
-            .clicked()
+        if icon_button(
+            ui,
+            icon_for_visibility(visible),
+            if visible { "Hide" } else { "Show" },
+        )
+        .clicked()
         {
             let next = visibility.toggle(element);
             on_toggle_visibility(element, next);
@@ -648,7 +837,7 @@ fn show_row(
         );
         match node {
             HierarchyNode::Sketch(sketch) => {
-                let additive = ui.input(|i| i.modifiers.command);
+                let additive = ui.input(|i| additive_click_modifiers(&i.modifiers));
                 match sketch_row_action(
                     row_primary_double_clicked(&response, ui),
                     response.clicked(),
@@ -669,7 +858,7 @@ fn show_row(
             }
             HierarchyNode::ConstructionPlane(index) => {
                 if response.clicked() {
-                    let additive = ui.input(|i| i.modifiers.command);
+                    let additive = ui.input(|i| additive_click_modifiers(&i.modifiers));
                     on_click_element(element, additive);
                 }
                 response.context_menu(|ui| {
@@ -684,7 +873,7 @@ fn show_row(
             | HierarchyNode::Circle(_)
             | HierarchyNode::Constraint(_) => {
                 if response.clicked() {
-                    let additive = ui.input(|i| i.modifiers.command);
+                    let additive = ui.input(|i| additive_click_modifiers(&i.modifiers));
                     on_click_element(element, additive);
                 }
             }
@@ -925,15 +1114,19 @@ mod tests {
             false,
         );
         let context = selection_context_elements(&doc, &selection);
+        let related_constraints = selection_related_constraints(&doc, &selection);
         let list = build_element_list(&doc, None);
         let style_selection = selection_styles_visible_list(&list, &selection);
         assert!(style_selection);
+        let health = DocumentHealth::default();
         assert_eq!(
             row_style(
                 SceneElement::Sketch(0),
                 &selection,
                 &context,
-                style_selection
+                &related_constraints,
+                style_selection,
+                &health,
             ),
             RowStyle::Selected
         );
@@ -942,7 +1135,9 @@ mod tests {
                 SceneElement::ConstructionPlane(0),
                 &selection,
                 &context,
-                style_selection
+                &related_constraints,
+                style_selection,
+                &health,
             ),
             RowStyle::InContext
         );
@@ -951,7 +1146,9 @@ mod tests {
                 SceneElement::Sketch(1),
                 &selection,
                 &context,
-                style_selection
+                &related_constraints,
+                style_selection,
+                &health,
             ),
             RowStyle::Faint
         );
@@ -968,13 +1165,16 @@ mod tests {
         );
         let list = build_element_list(&doc, None);
         let context = selection_context_elements(&doc, &selection);
+        let related_constraints = selection_related_constraints(&doc, &selection);
         assert!(!selection_styles_visible_list(&list, &selection));
         assert_eq!(
             row_style(
                 SceneElement::ConstructionPlane(0),
                 &selection,
                 &context,
-                false
+                &related_constraints,
+                false,
+                &DocumentHealth::default(),
             ),
             RowStyle::Normal
         );
@@ -997,15 +1197,153 @@ mod tests {
         );
         let list = build_element_list(&doc, None);
         let context = selection_context_elements(&doc, &selection);
+        let related_constraints = selection_related_constraints(&doc, &selection);
         assert!(!selection_styles_visible_list(&list, &selection));
         assert_eq!(
             row_style(
                 SceneElement::ConstructionPlane(1),
                 &selection,
                 &context,
-                false
+                &related_constraints,
+                false,
+                &DocumentHealth::default(),
             ),
             RowStyle::Normal
+        );
+    }
+
+    #[test]
+    fn selection_context_includes_constraints_for_selected_line() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 5.0, 0.0));
+        doc.shape_order.push(ShapeKind::Line);
+        crate::constraints::add_distance_constraint(
+            &mut doc,
+            sketch,
+            DistanceTarget::LineLength(0),
+            "5mm".to_string(),
+        )
+        .unwrap();
+
+        let mut selection = SceneSelection::default();
+        crate::selection::click_scene_selection(
+            &mut selection,
+            SceneElement::Line(0),
+            false,
+        );
+        let context = selection_context_elements(&doc, &selection);
+        let related = selection_related_constraints(&doc, &selection);
+        assert!(context.contains(&SceneElement::Constraint(0)));
+        assert!(related.contains(&0));
+    }
+
+    #[test]
+    fn row_style_highlights_related_constraint_when_line_selected() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 5.0, 0.0));
+        doc.shape_order.push(ShapeKind::Line);
+        crate::constraints::add_distance_constraint(
+            &mut doc,
+            sketch,
+            DistanceTarget::LineLength(0),
+            "5mm".to_string(),
+        )
+        .unwrap();
+
+        let mut selection = SceneSelection::default();
+        crate::selection::click_scene_selection(
+            &mut selection,
+            SceneElement::Line(0),
+            false,
+        );
+        let context = selection_context_elements(&doc, &selection);
+        let related = selection_related_constraints(&doc, &selection);
+        let list = build_element_list(&doc, Some(SketchSession { sketch }));
+        let style_selection = selection_styles_visible_list(&list, &selection);
+        let health = DocumentHealth::default();
+        assert_eq!(
+            row_style(
+                SceneElement::Constraint(0),
+                &selection,
+                &context,
+                &related,
+                style_selection,
+                &health,
+            ),
+            RowStyle::RelatedConstraint
+        );
+        assert_eq!(
+            row_style(
+                SceneElement::Line(1),
+                &selection,
+                &context,
+                &related,
+                style_selection,
+                &health,
+            ),
+            RowStyle::Faint
+        );
+    }
+
+    #[test]
+    fn row_style_prefers_invalid_and_unstable_over_selection() {
+        use crate::document_lifecycle::tombstone_element;
+        use crate::model::{Constraint, ConstraintKind, ConstraintLine, Line, ShapeKind};
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.shape_order.push(ShapeKind::Line);
+        let line_a = 0;
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 5.0, 10.0, 5.0));
+        doc.shape_order.push(ShapeKind::Line);
+        let line_b = 1;
+        doc.constraints.push(Constraint {
+            sketch,
+            kind: ConstraintKind::Parallel {
+                line_a: ConstraintLine::Line(line_a),
+                line_b: ConstraintLine::Line(line_b),
+            },
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+        tombstone_element(&mut doc, SceneElement::Line(line_a));
+        let health = crate::document_health::recompute_document_health(&doc);
+        let mut selection = SceneSelection::default();
+        crate::selection::click_scene_selection(
+            &mut selection,
+            SceneElement::Line(line_b),
+            false,
+        );
+        let context = selection_context_elements(&doc, &selection);
+        let related = selection_related_constraints(&doc, &selection);
+        assert_eq!(
+            row_style(
+                SceneElement::Constraint(0),
+                &selection,
+                &context,
+                &related,
+                true,
+                &health,
+            ),
+            RowStyle::Invalid
+        );
+        assert_eq!(
+            row_style(
+                SceneElement::Line(line_b),
+                &selection,
+                &context,
+                &related,
+                true,
+                &health,
+            ),
+            RowStyle::Unstable
         );
     }
 

@@ -302,8 +302,11 @@ impl Camera {
     }
 
     fn camera_axes(&self, forward: Vec3) -> (Vec3, Vec3) {
+        self.camera_axes_with_up(forward, self.view_up_hint())
+    }
+
+    fn camera_axes_with_up(&self, forward: Vec3, up_hint: Vec3) -> (Vec3, Vec3) {
         let forward = forward.normalize_or_zero();
-        let up_hint = self.view_up_hint();
         // Match `Mat4::look_at_rh`: right = cross(forward, up_hint), up = cross(right, forward).
         let mut right = forward.cross(up_hint);
         if right.length_squared() < 1e-8 {
@@ -498,10 +501,31 @@ impl Camera {
     }
 
     /// Camera distance so `corners` around `center` fit in `viewport` when looking along `view_direction`.
+    #[allow(dead_code)] // public helper; sketch framing uses `distance_to_fit_corners_with_up`
     pub fn distance_to_fit_corners(
         &self,
         center: Vec3,
         view_direction: Vec3,
+        corners: &[Vec3],
+        padding_px: f32,
+        viewport: Rect,
+    ) -> f32 {
+        self.distance_to_fit_corners_with_up(
+            center,
+            view_direction,
+            self.view_up_hint(),
+            corners,
+            padding_px,
+            viewport,
+        )
+    }
+
+    /// Like [`Self::distance_to_fit_corners`], but uses an explicit look-at up hint.
+    pub fn distance_to_fit_corners_with_up(
+        &self,
+        center: Vec3,
+        view_direction: Vec3,
+        up_hint: Vec3,
         corners: &[Vec3],
         padding_px: f32,
         viewport: Rect,
@@ -513,7 +537,7 @@ impl Camera {
 
         let aspect = (viewport.width() / viewport.height().max(1.0)).max(0.01);
         let forward = -dir;
-        let (right, up) = self.camera_axes(forward);
+        let (right, up) = self.camera_axes_with_up(forward, up_hint);
 
         let mut distance = self.distance.max(10.0);
         for _ in 0..2 {
@@ -532,6 +556,20 @@ impl Camera {
             distance = (required_half_h / (self.fov_y * 0.5).tan()).clamp(2.0, 50_000.0);
         }
         distance
+    }
+
+    /// Apply a sketch zoom distance, updating an in-flight transition when present.
+    pub fn set_transition_zoom(&mut self, zoom_distance: f32) {
+        let zoom_distance = zoom_distance.clamp(2.0, 50_000.0);
+        if let Some(t) = &mut self.transition {
+            if !t.animate_distance {
+                t.from_distance = self.distance;
+                t.animate_distance = true;
+            }
+            t.to_distance = zoom_distance;
+        } else {
+            self.distance = zoom_distance;
+        }
     }
 
     /// Advance an in-flight view transition. Returns `true` while animating.
@@ -1412,6 +1450,40 @@ mod tests {
         assert!((cam.distance - 120.0).abs() < 0.5);
         let view = (cam.eye() - cam.target).normalize();
         assert!(view.z > 0.95, "should look along +Z normal, got {view:?}");
+    }
+
+    #[test]
+    fn distance_to_fit_corners_respects_explicit_up_hint() {
+        let cam = Camera::default();
+        let viewport = test_viewport();
+        let center = Vec3::ZERO;
+        let corners = [
+            Vec3::new(-150.0, -40.0, 0.0),
+            Vec3::new(150.0, -40.0, 0.0),
+            Vec3::new(150.0, 40.0, 0.0),
+            Vec3::new(-150.0, 40.0, 0.0),
+        ];
+        let view_direction = Vec3::Z;
+        let with_z = cam.distance_to_fit_corners_with_up(
+            center,
+            view_direction,
+            Vec3::Z,
+            &corners,
+            15.0,
+            viewport,
+        );
+        let with_y = cam.distance_to_fit_corners_with_up(
+            center,
+            view_direction,
+            Vec3::Y,
+            &corners,
+            15.0,
+            viewport,
+        );
+        assert!(
+            (with_z - with_y).abs() > 1.0,
+            "wide bounds need different zoom for different roll hints"
+        );
     }
 
     #[test]

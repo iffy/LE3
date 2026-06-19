@@ -591,6 +591,7 @@ mod tests {
         doc.parameters.push(crate::model::Parameter {
             name: "A".to_string(),
             expression: "10mm".to_string(),
+            deleted: false,
         });
         assert!(shows_computed_length_in_doc("A", &doc));
         assert_eq!(computed_length_in_doc("A", &doc), Some(10.0));

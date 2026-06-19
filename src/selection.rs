@@ -1,7 +1,13 @@
 //! Scene element selection from the elements pane and viewport.
 
 use crate::hierarchy::SceneElement;
+use eframe::egui;
 use std::collections::HashSet;
+
+/// Shift+click or ⌘/Ctrl+click adds to the current selection instead of replacing it.
+pub fn additive_click_modifiers(modifiers: &egui::Modifiers) -> bool {
+    modifiers.command || modifiers.shift
+}
 
 /// Objects selected in the elements pane.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -135,5 +141,28 @@ mod tests {
         click_scene_selection(&mut sel, SceneElement::Line(1), true);
         click_scene_selection(&mut sel, SceneElement::Rect(0), true);
         assert_eq!(selection_single(&sel), Some(SceneElement::Line(1)));
+    }
+
+    #[test]
+    fn additive_click_modifiers_command() {
+        let modifiers = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
+        assert!(additive_click_modifiers(&modifiers));
+    }
+
+    #[test]
+    fn additive_click_modifiers_shift() {
+        let modifiers = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert!(additive_click_modifiers(&modifiers));
+    }
+
+    #[test]
+    fn additive_click_modifiers_plain_click() {
+        assert!(!additive_click_modifiers(&egui::Modifiers::default()));
     }
 }

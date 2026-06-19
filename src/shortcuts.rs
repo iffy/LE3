@@ -77,9 +77,10 @@ pub fn tool_shortcut(tool: Tool) -> Option<ShortcutHint> {
         Tool::Sketch => Some(ShortcutHint::plain("S")),
         Tool::Rectangle => Some(ShortcutHint::plain("R")),
         Tool::Line => Some(ShortcutHint::plain("L")),
-        Tool::Circle => Some(ShortcutHint::plain("C")),
+        Tool::Circle => Some(ShortcutHint::plain("O")),
         Tool::ConstructionPlane => Some(ShortcutHint::plain("P")),
         Tool::Dimension => Some(ShortcutHint::plain("D")),
+        Tool::Constraint => Some(ShortcutHint::plain("C")),
         Tool::Select => None,
     }
 }
@@ -102,6 +103,7 @@ pub fn palette_command_shortcut(id: PaletteCommandId) -> Option<ShortcutHint> {
         PaletteCommandId::ToolCircle => tool_shortcut(Tool::Circle),
         PaletteCommandId::ToolPlane => tool_shortcut(Tool::ConstructionPlane),
         PaletteCommandId::ToolDimension => tool_shortcut(Tool::Dimension),
+        PaletteCommandId::ToolConstraint => tool_shortcut(Tool::Constraint),
         PaletteCommandId::CancelOperation => Some(CANCEL_OPERATION),
         PaletteCommandId::CommitRectangle
         | PaletteCommandId::CommitLine
@@ -144,6 +146,40 @@ pub fn action_row(ui: &mut Ui, selected: bool, label: &str, shortcut: Option<Sho
         response
     })
     .inner
+}
+
+/// 1–9 constraint-tool shortcut shown in the context pane.
+pub fn constraint_number_hint(index: u8) -> ShortcutHint {
+    ShortcutHint::plain(match index {
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "?",
+    })
+}
+
+/// Shortcut key right-aligned in a row (palette / constraint-pane style).
+pub fn show_right_aligned_shortcut(
+    ui: &mut Ui,
+    row_width: f32,
+    used_width: f32,
+    item_height: f32,
+    hint: ShortcutHint,
+) {
+    let shortcut_w = (row_width - used_width).max(0.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(shortcut_w, item_height),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            ui.label(shortcut_rich_text(hint));
+        },
+    );
 }
 
 /// Checkbox with shortcut shown to the right of the label.
@@ -202,6 +238,13 @@ mod tests {
     }
 
     #[test]
+    fn constraint_number_hint_maps_digits() {
+        assert_eq!(
+            format_shortcut(constraint_number_hint(3)),
+            "3"
+        );
+    }
+
     fn compact_label_includes_shortcut() {
         assert_eq!(
             compact_label("Sketch", tool_shortcut(Tool::Sketch)),

@@ -30,6 +30,7 @@ fn color32_to_gpu(color: Color32) -> [f32; 4] {
 #[derive(Clone, Debug)]
 pub struct ViewportDimLabel {
     pub world_geom: LinearDimensionWorldGeom,
+    pub color: Color32,
     pub text_vertices: Vec<GpuTextVertex>,
     pub text_indices: Vec<u32>,
 }

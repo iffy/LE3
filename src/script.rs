@@ -1,7 +1,7 @@
-//! Instruction script parser and runner (SPEC §9.3).
+//! Lua script runner and internal instruction dispatch (SPEC §8).
 //!
-//! Scripts are human-readable, one instruction per line. They drive the live UI
-//! via synthetic pointer/keyboard events and headless actions.
+//! Scripts are `.lua` files that call the global `paramcad` API. They drive the
+//! live UI via synthetic pointer/keyboard events and headless actions.
 
 use crate::actions::{
     dim_label_target_in_sketch, Action, AppState, DimLabelAxis, Pane, RectAxis, Tool,
@@ -9,13 +9,16 @@ use crate::actions::{
 use crate::command_palette::{best_match, commands_for_state, PaletteOutcome};
 use crate::constraints::add_distance_constraint;
 use crate::hierarchy::SceneElement;
-use crate::model::{DistanceTarget, FaceId, RectEdge, SketchId};
+use crate::model::{ConstraintLine, ConstraintPoint, DistanceTarget, FaceId, RectEdge, SketchId};
+
 use crate::construction::PlaneDim;
 use crate::camera::{ProjectionMode, StandardView};
 use crate::view_cube::{CubeCornerId, CubeEdgeId};
 
+use crate::lua_script::{load_script, ScriptTickData};
 use eframe::egui::{self, Key, Modifiers, PointerButton};
 use glam::Vec3;
+use mlua::Lua;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -65,6 +68,20 @@ pub enum Instruction {
         target: DistanceTarget,
         expression: String,
     },
+    AddGeometricConstraint(crate::geometric_constraints::GeometricConstraintType),
+    ApplyConstraintShortcut(u8),
+    DragVertex {
+        point: ConstraintPoint,
+        u: f32,
+        v: f32,
+    },
+    DragLineSegment {
+        target: crate::model::ConstraintLine,
+        anchor_u: f32,
+        anchor_v: f32,
+        u: f32,
+        v: f32,
+    },
     SetLineLength { value: String },
     SetCircleDiameter { value: String },
     BeginEditConstructionPlane { index: usize },
@@ -91,6 +108,7 @@ pub enum Instruction {
     SetParameterName { index: usize, name: String },
     SetParameterExpression { index: usize, expression: String },
     DeleteParameter { index: usize },
+    DeleteSelection,
     /// Show/hide the command palette. `None` toggles.
     SetCommandPalette { open: Option<bool> },
     /// Run the best-matching palette command for a query.
@@ -139,6 +157,7 @@ impl Instruction {
             Instruction::Tool(Tool::ConstructionPlane) => "tool plane".to_string(),
             Instruction::Tool(Tool::Sketch) => "tool sketch".to_string(),
             Instruction::Tool(Tool::Dimension) => "tool dimension".to_string(),
+            Instruction::Tool(Tool::Constraint) => "tool constraint".to_string(),
             Instruction::BeginSketch { face } => format!("begin_sketch {}", face_script_name(*face)),
             Instruction::OpenSketch { sketch } => format!("open_sketch {sketch}"),
             Instruction::ExitSketch => "exit_sketch".to_string(),
@@ -153,14 +172,19 @@ impl Instruction {
             }
             Instruction::SelectSceneElement { element, additive } => {
                 let tokens = element_script_tokens(*element);
-                let edge = tokens
-                    .edge
-                    .map(|edge| format!(" {}", edge.script_name()))
-                    .unwrap_or_default();
-                if *additive {
-                    format!("select {} {}{} add", tokens.kind, tokens.index, edge)
+                let target = if let Some(point) = tokens.point {
+                    point_script_tokens(point)
                 } else {
-                    format!("select {} {}{}", tokens.kind, tokens.index, edge)
+                    let edge = tokens
+                        .edge
+                        .map(|edge| format!(" {}", edge.script_name()))
+                        .unwrap_or_default();
+                    format!("{} {}{}", tokens.kind, tokens.index, edge)
+                };
+                if *additive {
+                    format!("select {target} add")
+                } else {
+                    format!("select {target}")
                 }
             }
             Instruction::ClearSceneSelection => "clear_selection".to_string(),
@@ -223,6 +247,29 @@ impl Instruction {
                 };
                 format!("add_constraint {target_name} {expression}")
             }
+            Instruction::AddGeometricConstraint(kind) => {
+                format!("add_geometric_constraint {}", geometric_constraint_script_name(*kind))
+            }
+            Instruction::ApplyConstraintShortcut(index) => {
+                format!("constraint_shortcut {index}")
+            }
+            Instruction::DragVertex { point, u, v } => {
+                format!("drag_vertex {} {} {}", point_script_tokens(*point), u, v)
+            }
+            Instruction::DragLineSegment {
+                target,
+                anchor_u,
+                anchor_v,
+                u,
+                v,
+            } => format!(
+                "drag_line {} {} {} {} {}",
+                constraint_line_script_tokens(*target),
+                anchor_u,
+                anchor_v,
+                u,
+                v
+            ),
             Instruction::BeginEditConstructionPlane { index } => format!("edit_plane {index}"),
             Instruction::CommitConstructionPlane => "commit_plane".to_string(),
             Instruction::SetPlaneOffset { value } => format!("set_dim offset {value}"),
@@ -270,6 +317,7 @@ impl Instruction {
                 format!("parameter value {index} {expression}")
             }
             Instruction::DeleteParameter { index } => format!("parameter delete {index}"),
+            Instruction::DeleteSelection => "delete_selection".to_string(),
             Instruction::SetCommandPalette { open } => {
                 let verb = match open {
                     Some(true) => "show",
@@ -304,636 +352,219 @@ impl Instruction {
             Instruction::Quit => "quit".to_string(),
         }
     }
+
+    /// Format this instruction as a Lua API call (for `--show-commands` logging).
+    pub fn as_lua(&self) -> String {
+        match self {
+            Instruction::New => "paramcad.new()".to_string(),
+            Instruction::Open(path) => format!("paramcad.open({path:?})"),
+            Instruction::Save(None) => "paramcad.save()".to_string(),
+            Instruction::Save(Some(path)) => format!("paramcad.save({path:?})"),
+            Instruction::Clear => "paramcad.clear()".to_string(),
+            Instruction::Undo => "paramcad.undo()".to_string(),
+            Instruction::Tool(tool) => format!("paramcad.tool({:?})", tool_lua_name(*tool)),
+            Instruction::BeginSketch { face } => {
+                let (kind, index) = face_lua_parts(*face);
+                format!("paramcad.begin_sketch({kind:?}, {index})")
+            }
+            Instruction::OpenSketch { sketch } => format!("paramcad.open_sketch({sketch})"),
+            Instruction::ExitSketch => "paramcad.exit_sketch()".to_string(),
+            Instruction::SetElementVisible { element, visible } => {
+                let target = element_lua_ref(*element);
+                let verb = match visible {
+                    Some(true) => "show",
+                    Some(false) => "hide",
+                    None => "toggle",
+                };
+                format!("paramcad.set_visible({target}, {verb:?})")
+            }
+            Instruction::SelectSceneElement { element, additive } => {
+                let target = element_lua_ref(*element);
+                if *additive {
+                    format!("paramcad.select({target}, {{ additive = true }})")
+                } else {
+                    format!("paramcad.select({target})")
+                }
+            }
+            Instruction::ClearSceneSelection => "paramcad.clear_selection()".to_string(),
+            Instruction::SetShapeConstruction { element, construction } => {
+                format!(
+                    "paramcad.set_construction({}, {})",
+                    element_lua_ref(*element),
+                    construction
+                )
+            }
+            Instruction::ApplyConstruction { construction } => {
+                format!("paramcad.apply_construction({construction})")
+            }
+            Instruction::ToggleConstruction => "paramcad.toggle_construction()".to_string(),
+            Instruction::SetElementName { element, name } => {
+                format!(
+                    "paramcad.set_name({}, {name:?})",
+                    element_lua_ref(*element)
+                )
+            }
+            Instruction::FocusElementName => "paramcad.focus_name()".to_string(),
+            Instruction::SetDim { axis, value } => {
+                format!(
+                    "paramcad.set_dim({:?}, {value:?})",
+                    rect_axis_lua_name(*axis)
+                )
+            }
+            Instruction::SetDimLabelOffset { axis, offset } => {
+                format!(
+                    "paramcad.set_dim_label_offset({:?}, {offset})",
+                    dim_label_axis_lua_name(*axis)
+                )
+            }
+            Instruction::BeginEditCommittedDim { axis } => {
+                format!(
+                    "paramcad.edit_dim({:?})",
+                    dim_label_axis_lua_name(*axis)
+                )
+            }
+            Instruction::CommitCommittedDim => "paramcad.commit_dim()".to_string(),
+            Instruction::AddDistanceConstraint { target, expression } => {
+                format!(
+                    "paramcad.add_constraint({}, {expression:?})",
+                    distance_target_lua_ref(target)
+                )
+            }
+            Instruction::AddGeometricConstraint(kind) => {
+                format!(
+                    "paramcad.add_geometric_constraint({:?})",
+                    geometric_constraint_lua_name(*kind)
+                )
+            }
+            Instruction::ApplyConstraintShortcut(index) => {
+                format!("paramcad.constraint_shortcut({index})")
+            }
+            Instruction::DragVertex { point, u, v } => {
+                format!(
+                    "paramcad.drag_vertex({}, {u}, {v})",
+                    constraint_point_lua_ref(*point)
+                )
+            }
+            Instruction::DragLineSegment {
+                target,
+                anchor_u,
+                anchor_v,
+                u,
+                v,
+            } => format!(
+                "paramcad.drag_line({}, {anchor_u}, {anchor_v}, {u}, {v})",
+                constraint_line_lua_ref(*target)
+            ),
+            Instruction::SetLineLength { value } => {
+                format!("paramcad.set_dim(\"length\", {value:?})")
+            }
+            Instruction::SetCircleDiameter { value } => {
+                format!("paramcad.set_dim(\"diameter\", {value:?})")
+            }
+            Instruction::BeginEditConstructionPlane { index } => {
+                format!("paramcad.edit_plane({index})")
+            }
+            Instruction::CommitConstructionPlane => "paramcad.commit_plane()".to_string(),
+            Instruction::SetPlaneOffset { value } => {
+                format!("paramcad.set_dim(\"offset\", {value:?})")
+            }
+            Instruction::SetPlaneAngle { value } => {
+                format!("paramcad.set_dim(\"angle\", {value:?})")
+            }
+            Instruction::FocusDim(axis) => {
+                format!("paramcad.focus_dim({:?})", rect_axis_lua_name(*axis))
+            }
+            Instruction::FocusLineLength => "paramcad.focus_dim(\"length\")".to_string(),
+            Instruction::FocusCircleDiameter => "paramcad.focus_dim(\"diameter\")".to_string(),
+            Instruction::FocusPlaneDim(dim) => {
+                format!("paramcad.focus_dim({:?})", plane_dim_lua_name(*dim))
+            }
+            Instruction::Orbit { dx, dy } => format!("paramcad.orbit({dx}, {dy})"),
+            Instruction::Pan { dx, dy } => format!("paramcad.pan({dx}, {dy})"),
+            Instruction::Zoom { scroll } => format!("paramcad.wheel({scroll})"),
+            Instruction::View(view) => format!("paramcad.view({:?})", view_script_name(*view)),
+            Instruction::ViewEdge(edge) => {
+                format!("paramcad.view(\"edge\", {:?})", edge_script_name(*edge))
+            }
+            Instruction::ViewCorner(corner) => format!(
+                "paramcad.view(\"corner\", {:?})",
+                corner_script_name(*corner)
+            ),
+            Instruction::ViewHome => "paramcad.view_home()".to_string(),
+            Instruction::SetHomeView => "paramcad.set_home_view()".to_string(),
+            Instruction::ProjectionMode(mode) => {
+                format!("paramcad.view({:?})", projection_mode_script_name(*mode))
+            }
+            Instruction::ToggleProjectionMode => "paramcad.toggle_projection()".to_string(),
+            Instruction::SetPane { pane, visible } => {
+                let verb = match visible {
+                    Some(true) => "show",
+                    Some(false) => "hide",
+                    None => "toggle",
+                };
+                format!("paramcad.pane({:?}, {verb:?})", pane.script_name())
+            }
+            Instruction::AddParameter { name, expression } => {
+                format!("paramcad.parameter(\"add\", {name:?}, {expression:?})")
+            }
+            Instruction::SetParameterName { index, name } => {
+                format!("paramcad.parameter(\"name\", {index}, {name:?})")
+            }
+            Instruction::SetParameterExpression { index, expression } => {
+                format!("paramcad.parameter(\"value\", {index}, {expression:?})")
+            }
+            Instruction::DeleteParameter { index } => {
+                format!("paramcad.parameter(\"delete\", {index})")
+            }
+            Instruction::DeleteSelection => "paramcad.delete_selection()".to_string(),
+            Instruction::SetCommandPalette { open } => {
+                let verb = match open {
+                    Some(true) => "show",
+                    Some(false) => "hide",
+                    None => "toggle",
+                };
+                format!("paramcad.palette({verb:?})")
+            }
+            Instruction::RunPaletteCommand { query } => {
+                format!("paramcad.palette(\"run\", {query:?})")
+            }
+            Instruction::Move { x, y } => format!("paramcad.move({x}, {y})"),
+            Instruction::Click { x, y } => format!("paramcad.click({x}, {y})"),
+            Instruction::MoveGround { x, y } => format!("paramcad.move_ground({x}, {y})"),
+            Instruction::ClickGround { x, y } => format!("paramcad.click_ground({x}, {y})"),
+            Instruction::Drag { x0, y0, x1, y1 } => {
+                format!("paramcad.drag({x0}, {y0}, {x1}, {y1})")
+            }
+            Instruction::RightDrag { dx, dy } => format!("paramcad.right_drag({dx}, {dy})"),
+            Instruction::RightDragShift { dx, dy } => {
+                format!("paramcad.right_drag_pan({dx}, {dy})")
+            }
+            Instruction::Scroll { delta } => format!("paramcad.wheel({delta})"),
+            Instruction::Key(key) => format!("paramcad.key({:?})", key_name(*key)),
+            Instruction::KeyDown(key) => format!("paramcad.keydown({:?})", key_name(*key)),
+            Instruction::KeyUp(key) => format!("paramcad.keyup({:?})", key_name(*key)),
+            Instruction::Type(text) => format!("paramcad.type({text:?})"),
+            Instruction::WaitMs(ms) => format!("paramcad.wait_ms({ms})"),
+            Instruction::WaitFrames(n) => format!("paramcad.wait({n})"),
+            Instruction::Screenshot(path) => format!("paramcad.screenshot({path:?})"),
+            Instruction::Quit => "paramcad.quit()".to_string(),
+        }
+    }
 }
 
-/// Parse errors from script files.
+/// Script load / execution errors.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParseError {
-    pub line: usize,
+pub struct ScriptError {
     pub message: String,
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for ScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "line {}: {}", self.line, self.message)
+        write!(f, "{}", self.message)
     }
 }
 
-/// Parse a script from its text content.
-pub fn parse(source: &str) -> Result<Vec<Instruction>, ParseError> {
-    let mut instructions = Vec::new();
-    for (i, raw) in source.lines().enumerate() {
-        let line = raw.trim();
-        let line_no = i + 1;
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        instructions.push(parse_line(line, line_no)?);
-    }
-    Ok(instructions)
-}
-
-/// Parse a script file from disk.
-pub fn parse_file(path: &Path) -> Result<Vec<Instruction>, ParseError> {
-    let source = std::fs::read_to_string(path).map_err(|e| ParseError {
-        line: 0,
-        message: format!("failed to read {}: {e}", path.display()),
-    })?;
-    parse(&source)
-}
-
-fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
-    let err = |msg: &str| ParseError {
-        line: line_no,
-        message: msg.to_string(),
-    };
-
-    let (cmd, rest) = line
-        .split_once(char::is_whitespace)
-        .map(|(c, r)| (c, r.trim()))
-        .unwrap_or((line, ""));
-
-    match cmd.to_ascii_lowercase().as_str() {
-        "new" => Ok(Instruction::New),
-        "clear" => Ok(Instruction::Clear),
-        "undo" => Ok(Instruction::Undo),
-        "quit" | "exit" => Ok(Instruction::Quit),
-
-        "open" => {
-            let path = rest.trim_matches('"');
-            if path.is_empty() {
-                return Err(err("open requires a path"));
-            }
-            Ok(Instruction::Open(path.to_string()))
-        }
-
-        "save" => {
-            if rest.is_empty() {
-                Ok(Instruction::Save(None))
-            } else {
-                Ok(Instruction::Save(Some(rest.trim_matches('"').to_string())))
-            }
-        }
-
-        "tool" => {
-            let name = rest.split_whitespace().next().unwrap_or("");
-            Tool::from_name(name).map(Instruction::Tool).ok_or_else(|| {
-                err(&format!(
-                    "unknown tool '{name}' (expected select, sketch, rectangle, line, circle, dimension, or plane)"
-                ))
-            })
-        }
-
-        "add_constraint" | "addconstraint" | "constraint" => {
-            let mut parts = rest.split_whitespace();
-            let kind = parts
-                .next()
-                .ok_or_else(|| err("add_constraint requires target kind and index"))?;
-            let index = parts
-                .next()
-                .ok_or_else(|| err("add_constraint requires target index"))?
-                .parse::<usize>()
-                .map_err(|_| err("add_constraint index must be an integer"))?;
-            let target = match kind.to_ascii_lowercase().as_str() {
-                "line" | "segment" => DistanceTarget::LineLength(index),
-                "circle" => DistanceTarget::CircleDiameter(index),
-                "rect" | "rectangle" => {
-                    let dim = parts
-                        .next()
-                        .ok_or_else(|| err("add_constraint rect requires width or height"))?;
-                    let expression = parts.collect::<Vec<_>>().join(" ");
-                    if expression.is_empty() {
-                        return Err(err("add_constraint requires expression"));
-                    }
-                    let target = match dim.to_ascii_lowercase().as_str() {
-                        "width" | "w" => DistanceTarget::RectWidth(index),
-                        "height" | "h" => DistanceTarget::RectHeight(index),
-                        other => {
-                            return Err(err(&format!(
-                                "unknown rectangle dimension '{other}' (expected width or height)"
-                            )));
-                        }
-                    };
-                    return Ok(Instruction::AddDistanceConstraint { target, expression });
-                }
-                other => {
-                    return Err(err(&format!(
-                        "unknown constraint target '{other}' (expected line, circle, or rect)"
-                    )));
-                }
-            };
-            let expression = parts.collect::<Vec<_>>().join(" ");
-            if expression.is_empty() {
-                return Err(err("add_constraint requires expression"));
-            }
-            Ok(Instruction::AddDistanceConstraint { target, expression })
-        }
-
-        "begin_sketch" | "beginsketch" => {
-            let mut parts = rest.split_whitespace();
-            let kind = parts
-                .next()
-                .ok_or_else(|| err("begin_sketch requires face kind and index"))?;
-            let index = parts
-                .next()
-                .ok_or_else(|| err("begin_sketch requires face index"))?
-                .parse::<usize>()
-                .map_err(|_| err("begin_sketch index must be an integer"))?;
-            let face = FaceId::from_script(kind, index)
-                .ok_or_else(|| err(&format!("unknown face kind '{kind}'")))?;
-            Ok(Instruction::BeginSketch { face })
-        }
-
-        "open_sketch" | "opensketch" | "edit_sketch" | "editsketch" => {
-            let index = rest
-                .split_whitespace()
-                .next()
-                .ok_or_else(|| err("open_sketch requires sketch index"))?
-                .parse::<usize>()
-                .map_err(|_| err("open_sketch index must be an integer"))?;
-            Ok(Instruction::OpenSketch { sketch: index })
-        }
-
-        "exit_sketch" | "exitsketch" => Ok(Instruction::ExitSketch),
-
-        "edit_plane" | "editplane" => {
-            let index = rest
-                .split_whitespace()
-                .next()
-                .ok_or_else(|| err("edit_plane requires plane index"))?
-                .parse::<usize>()
-                .map_err(|_| err("edit_plane index must be an integer"))?;
-            Ok(Instruction::BeginEditConstructionPlane { index })
-        }
-
-        "commit_plane" | "commitplane" => Ok(Instruction::CommitConstructionPlane),
-
-        "element" => {
-            let mut parts = rest.split_whitespace();
-            let kind = parts
-                .next()
-                .ok_or_else(|| err("element requires kind and index"))?;
-            let index = parts
-                .next()
-                .ok_or_else(|| err("element requires index"))?
-                .parse::<usize>()
-                .map_err(|_| err("element index must be an integer"))?;
-            let element = scene_element_from_script(kind, index)
-                .ok_or_else(|| err(&format!("unknown element kind '{kind}'")))?;
-            let visible = match parts.next().map(|s| s.to_ascii_lowercase()).as_deref() {
-                None | Some("toggle") => None,
-                Some("show") | Some("on") | Some("true") => Some(true),
-                Some("hide") | Some("off") | Some("false") => Some(false),
-                Some(other) => {
-                    return Err(err(&format!(
-                        "unknown element state '{other}' (expected show, hide, or toggle)"
-                    )))
-                }
-            };
-            Ok(Instruction::SetElementVisible { element, visible })
-        }
-
-        "select" | "select_scene" => {
-            let mut parts = rest.split_whitespace();
-            let kind = parts
-                .next()
-                .ok_or_else(|| err("select requires kind and index"))?;
-            let index = parts
-                .next()
-                .ok_or_else(|| err("select requires index"))?
-                .parse::<usize>()
-                .map_err(|_| err("select index must be an integer"))?;
-            let (element, additive) =
-                parse_scene_element_with_tail(kind, index, &mut parts, line_no)?;
-            Ok(Instruction::SelectSceneElement { element, additive })
-        }
-
-        "clear_selection" | "deselect" | "select_clear" => Ok(Instruction::ClearSceneSelection),
-
-        "set_construction" | "construction" => {
-            let mut parts = rest.split_whitespace();
-            let kind = parts
-                .next()
-                .ok_or_else(|| err("set_construction requires kind and index"))?;
-            let index = parts
-                .next()
-                .ok_or_else(|| err("set_construction requires index"))?
-                .parse::<usize>()
-                .map_err(|_| err("set_construction index must be an integer"))?;
-            let (element, tail) =
-                parse_scene_element_with_optional_edge(kind, index, &mut parts, line_no)?;
-            let value = tail.ok_or_else(|| ParseError {
-                line: line_no,
-                message: "set_construction requires true or false".to_string(),
-            })?;
-            let construction = parse_construction_value(value, line_no)?;
-            Ok(Instruction::SetShapeConstruction {
-                element,
-                construction,
-            })
-        }
-
-        "apply_construction" => {
-            let value = rest
-                .split_whitespace()
-                .next()
-                .ok_or_else(|| err("apply_construction requires true or false"))?;
-            let construction = parse_construction_value(value, line_no)?;
-            Ok(Instruction::ApplyConstruction { construction })
-        }
-
-        "toggle_construction" => Ok(Instruction::ToggleConstruction),
-
-        "set_name" | "rename" => {
-            let mut parts = rest.split_whitespace();
-            let kind = parts
-                .next()
-                .ok_or_else(|| err("set_name requires kind and index"))?;
-            let index = parts
-                .next()
-                .ok_or_else(|| err("set_name requires index"))?
-                .parse::<usize>()
-                .map_err(|_| err("set_name index must be an integer"))?;
-            let element = scene_element_from_script(kind, index)
-                .ok_or_else(|| err(&format!("unknown element kind '{kind}'")))?;
-            let name = parts.collect::<Vec<_>>().join(" ");
-            if name.trim().is_empty() {
-                return Err(err("set_name requires a name"));
-            }
-            Ok(Instruction::SetElementName { element, name })
-        }
-
-        "focus_name" | "focus_element_name" => Ok(Instruction::FocusElementName),
-
-        "pane" => {
-            let mut parts = rest.split_whitespace();
-            let name = parts.next().ok_or_else(|| err("pane requires a name"))?;
-            let pane = Pane::from_name(name).ok_or_else(|| {
-                err(&format!(
-                    "unknown pane '{name}' (expected tree, context, parameters, or view_cube)"
-                ))
-            })?;
-            let visible = match parts.next().map(|s| s.to_ascii_lowercase()).as_deref() {
-                None | Some("toggle") => None,
-                Some("show") | Some("on") | Some("true") => Some(true),
-                Some("hide") | Some("off") | Some("false") => Some(false),
-                Some(other) => {
-                    return Err(err(&format!(
-                        "unknown pane state '{other}' (expected show, hide, or toggle)"
-                    )))
-                }
-            };
-            Ok(Instruction::SetPane { pane, visible })
-        }
-
-        "palette" | "command_palette" | "commandpalette" => {
-            let mut parts = rest.split_whitespace();
-            let sub = parts.next().unwrap_or("toggle");
-            match sub.to_ascii_lowercase().as_str() {
-                "show" | "on" | "open" => Ok(Instruction::SetCommandPalette {
-                    open: Some(true),
-                }),
-                "hide" | "off" | "close" => Ok(Instruction::SetCommandPalette {
-                    open: Some(false),
-                }),
-                "toggle" => Ok(Instruction::SetCommandPalette { open: None }),
-                "run" | "exec" | "execute" => {
-                    let query = parts.collect::<Vec<_>>().join(" ");
-                    if query.trim().is_empty() {
-                        return Err(err("palette run requires a query"));
-                    }
-                    Ok(Instruction::RunPaletteCommand { query })
-                }
-                other => Err(err(&format!(
-                    "unknown palette command '{other}' (expected show, hide, toggle, or run)"
-                ))),
-            }
-        }
-
-        "parameter" | "param" => {
-            let (sub, tail) = rest
-                .split_once(char::is_whitespace)
-                .map(|(s, t)| (s, t.trim()))
-                .unwrap_or((rest, ""));
-            match sub.to_ascii_lowercase().as_str() {
-                "add" => {
-                    let (name, expression) = tail
-                        .split_once(char::is_whitespace)
-                        .ok_or_else(|| err("parameter add requires name and expression"))?;
-                    let expression = expression.trim();
-                    if expression.is_empty() {
-                        return Err(err("parameter add requires an expression"));
-                    }
-                    Ok(Instruction::AddParameter {
-                        name: name.to_string(),
-                        expression: expression.to_string(),
-                    })
-                }
-                "name" | "rename" => {
-                    let (index_str, name) = tail
-                        .split_once(char::is_whitespace)
-                        .ok_or_else(|| err("parameter name requires index and name"))?;
-                    let index = index_str
-                        .parse::<usize>()
-                        .map_err(|_| err("parameter name index must be an integer"))?;
-                    let name = name.trim();
-                    if name.is_empty() {
-                        return Err(err("parameter name requires a name"));
-                    }
-                    Ok(Instruction::SetParameterName {
-                        index,
-                        name: name.to_string(),
-                    })
-                }
-                "value" | "expr" | "expression" => {
-                    let (index_str, expression) = tail
-                        .split_once(char::is_whitespace)
-                        .ok_or_else(|| err("parameter value requires index and expression"))?;
-                    let index = index_str
-                        .parse::<usize>()
-                        .map_err(|_| err("parameter value index must be an integer"))?;
-                    let expression = expression.trim();
-                    if expression.is_empty() {
-                        return Err(err("parameter value requires an expression"));
-                    }
-                    Ok(Instruction::SetParameterExpression {
-                        index,
-                        expression: expression.to_string(),
-                    })
-                }
-                "delete" | "del" | "remove" => {
-                    let index = tail
-                        .split_whitespace()
-                        .next()
-                        .ok_or_else(|| err("parameter delete requires index"))?
-                        .parse::<usize>()
-                        .map_err(|_| err("parameter delete index must be an integer"))?;
-                    Ok(Instruction::DeleteParameter { index })
-                }
-                other => Err(err(&format!(
-                    "unknown parameter command '{other}' (expected add, name, value, or delete)"
-                ))),
-            }
-        }
-
-        "edit_dim" | "editdim" => {
-            let axis_name = rest.split_whitespace().next().unwrap_or("");
-            let axis = DimLabelAxis::from_name(axis_name)
-                .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
-            Ok(Instruction::BeginEditCommittedDim { axis })
-        }
-
-        "commit_dim" | "commitdim" => Ok(Instruction::CommitCommittedDim),
-
-        "set_dim_label_offset" | "setdimlabeloffset" | "dim_label_offset" => {
-            let (axis_name, value) = rest
-                .split_once(|c: char| c.is_whitespace())
-                .ok_or_else(|| err("set_dim_label_offset requires axis and offset"))?;
-            let axis = DimLabelAxis::from_name(axis_name.trim())
-                .ok_or_else(|| err(&format!("unknown axis '{}'", axis_name.trim())))?;
-            let offset = value
-                .trim()
-                .parse::<f32>()
-                .map_err(|_| err("set_dim_label_offset offset must be a number"))?;
-            Ok(Instruction::SetDimLabelOffset { axis, offset })
-        }
-
-        "set_dim" | "setdim" => {
-            let (axis_name, value) = rest
-                .split_once(|c: char| c.is_whitespace())
-                .ok_or_else(|| err("set_dim requires axis and value"))?;
-            let axis_name = axis_name.trim();
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(err("set_dim requires a value"));
-            }
-            match axis_name.to_ascii_lowercase().as_str() {
-                "length" | "len" | "l" => Ok(Instruction::SetLineLength {
-                    value: value.to_string(),
-                }),
-                "diameter" | "diam" | "d" => Ok(Instruction::SetCircleDiameter {
-                    value: value.to_string(),
-                }),
-                _ if PlaneDim::from_name(axis_name).is_some() => {
-                    match PlaneDim::from_name(axis_name).unwrap() {
-                        PlaneDim::Offset => Ok(Instruction::SetPlaneOffset {
-                            value: value.to_string(),
-                        }),
-                        PlaneDim::Angle => Ok(Instruction::SetPlaneAngle {
-                            value: value.to_string(),
-                        }),
-                    }
-                }
-                _ => {
-                    let axis = RectAxis::from_name(axis_name)
-                        .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
-                    Ok(Instruction::SetDim {
-                        axis,
-                        value: value.to_string(),
-                    })
-                }
-            }
-        }
-
-        "focus_dim" | "focusdim" => {
-            let axis_name = rest.split_whitespace().next().unwrap_or("");
-            match axis_name.to_ascii_lowercase().as_str() {
-                "length" | "len" | "l" => Ok(Instruction::FocusLineLength),
-                "diameter" | "diam" | "d" => Ok(Instruction::FocusCircleDiameter),
-                _ if PlaneDim::from_name(axis_name).is_some() => {
-                    Ok(Instruction::FocusPlaneDim(PlaneDim::from_name(axis_name).unwrap()))
-                }
-                _ => {
-                    let axis = RectAxis::from_name(axis_name)
-                        .ok_or_else(|| err(&format!("unknown axis '{axis_name}'")))?;
-                    Ok(Instruction::FocusDim(axis))
-                }
-            }
-        }
-
-        "orbit" | "right_drag" | "rightdrag" => {
-            let (dx, dy) = parse_two_floats(rest, &err)?;
-            Ok(Instruction::Orbit { dx, dy })
-        }
-
-        "pan" | "right_drag_shift" | "rightdragshift" => {
-            let (dx, dy) = parse_two_floats(rest, &err)?;
-            Ok(Instruction::Pan { dx, dy })
-        }
-
-        "zoom" | "scroll" => {
-            let delta = parse_one_float(rest, &err)?;
-            Ok(Instruction::Zoom { scroll: delta })
-        }
-
-        "view" => {
-            let mut parts = rest.split_whitespace();
-            let first = parts.next().unwrap_or("");
-            match first {
-                "edge" => {
-                    let name = parts.next().ok_or_else(|| err("view edge requires a name"))?;
-                    CubeEdgeId::from_name(name)
-                        .map(Instruction::ViewEdge)
-                        .ok_or_else(|| err(&format!("unknown cube edge '{name}'")))
-                }
-                "corner" => {
-                    let name = parts.next().ok_or_else(|| err("view corner requires a name"))?;
-                    CubeCornerId::from_name(name)
-                        .map(Instruction::ViewCorner)
-                        .ok_or_else(|| err(&format!("unknown cube corner '{name}'")))
-                }
-                _ => ProjectionMode::from_name(first)
-                    .map(Instruction::ProjectionMode)
-                    .or_else(|| {
-                        StandardView::from_name(first).map(Instruction::View)
-                    })
-                    .ok_or_else(|| err(&format!("unknown view '{first}'"))),
-            }
-        }
-
-        "toggle_projection" | "projection_toggle" | "toggle_view" | "view_toggle" => {
-            Ok(Instruction::ToggleProjectionMode)
-        }
-
-        "view_home" | "home" | "camera_home" => Ok(Instruction::ViewHome),
-
-        "set_home_view" | "sethomeview" | "set_home" => Ok(Instruction::SetHomeView),
-
-        "move" | "mousemove" => {
-            let (x, y) = parse_two_floats(rest, &err)?;
-            Ok(Instruction::Move { x, y })
-        }
-
-        "click" => {
-            let (x, y) = parse_two_floats(rest, &err)?;
-            Ok(Instruction::Click { x, y })
-        }
-
-        "move_ground" | "moveground" => {
-            let (x, y) = parse_two_floats(rest, &err)?;
-            Ok(Instruction::MoveGround { x, y })
-        }
-
-        "click_ground" | "clickground" => {
-            let (x, y) = parse_two_floats(rest, &err)?;
-            Ok(Instruction::ClickGround { x, y })
-        }
-
-        "drag" => {
-            let parts: Vec<f32> = rest
-                .split_whitespace()
-                .map(|s| s.parse::<f32>())
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|_| err("drag requires four numbers: x0 y0 x1 y1"))?;
-            if parts.len() != 4 {
-                return Err(err("drag requires four numbers: x0 y0 x1 y1"));
-            }
-            Ok(Instruction::Drag {
-                x0: parts[0],
-                y0: parts[1],
-                x1: parts[2],
-                y1: parts[3],
-            })
-        }
-
-        "right_drag_rel" => {
-            let (dx, dy) = parse_two_floats(rest, &err)?;
-            Ok(Instruction::RightDrag { dx, dy })
-        }
-
-        "right_drag_pan" => {
-            let (dx, dy) = parse_two_floats(rest, &err)?;
-            Ok(Instruction::RightDragShift { dx, dy })
-        }
-
-        "wheel" => {
-            let delta = parse_one_float(rest, &err)?;
-            Ok(Instruction::Scroll { delta })
-        }
-
-        "key" => {
-            let key_name = rest.split_whitespace().next().unwrap_or("");
-            parse_key(key_name).map(Instruction::Key).map_err(|m| err(&m))
-        }
-
-        "keydown" => {
-            let key_name = rest.split_whitespace().next().unwrap_or("");
-            parse_key(key_name)
-                .map(Instruction::KeyDown)
-                .map_err(|m| err(&m))
-        }
-
-        "keyup" => {
-            let key_name = rest.split_whitespace().next().unwrap_or("");
-            parse_key(key_name)
-                .map(Instruction::KeyUp)
-                .map_err(|m| err(&m))
-        }
-
-        "type" => {
-            let text = parse_type_text(rest);
-            Ok(Instruction::Type(text))
-        }
-
-        "wait" => {
-            if rest.ends_with("ms") {
-                let ms: u64 = rest
-                    .trim_end_matches("ms")
-                    .trim()
-                    .parse()
-                    .map_err(|_| err("wait requires a duration like 100ms or 5"))?;
-                Ok(Instruction::WaitMs(ms))
-            } else {
-                let frames: u32 = rest
-                    .parse()
-                    .map_err(|_| err("wait requires a frame count or duration like 100ms"))?;
-                Ok(Instruction::WaitFrames(frames))
-            }
-        }
-
-        "screenshot" => {
-            let path = rest.trim_matches('"');
-            if path.is_empty() {
-                return Err(err("screenshot requires an output path"));
-            }
-            Ok(Instruction::Screenshot(path.to_string()))
-        }
-
-        _ => Err(err(&format!("unknown instruction '{cmd}'"))),
-    }
-}
-
-fn parse_type_text(rest: &str) -> String {
-    let rest = rest.trim();
-    if (rest.starts_with('"') && rest.ends_with('"')) || (rest.starts_with('\'') && rest.ends_with('\'')) {
-        rest[1..rest.len() - 1].to_string()
-    } else {
-        rest.to_string()
-    }
-}
-
-fn parse_one_float(rest: &str, err: &impl Fn(&str) -> ParseError) -> Result<f32, ParseError> {
-    rest.split_whitespace()
-        .next()
-        .ok_or_else(|| err("expected a number"))?
-        .parse()
-        .map_err(|_| err("expected a number"))
-}
-
-fn parse_two_floats(rest: &str, err: &impl Fn(&str) -> ParseError) -> Result<(f32, f32), ParseError> {
-    let mut parts = rest.split_whitespace();
-    let x: f32 = parts
-        .next()
-        .ok_or_else(|| err("expected two numbers"))?
-        .parse()
-        .map_err(|_| err("expected a number"))?;
-    let y: f32 = parts
-        .next()
-        .ok_or_else(|| err("expected two numbers"))?
-        .parse()
-        .map_err(|_| err("expected a number"))?;
-    Ok((x, y))
-}
+impl std::error::Error for ScriptError {}
 
 /// Map a human-readable key name to an egui [`Key`].
 pub fn parse_key(name: &str) -> Result<Key, String> {
@@ -1000,6 +631,7 @@ struct ElementScriptTokens {
     kind: &'static str,
     index: usize,
     edge: Option<RectEdge>,
+    point: Option<crate::model::ConstraintPoint>,
 }
 
 fn element_script_parts(element: SceneElement) -> (&'static str, usize) {
@@ -1013,127 +645,210 @@ fn element_script_tokens(element: SceneElement) -> ElementScriptTokens {
             kind: "construction_plane",
             index: i,
             edge: None,
+            point: None,
         },
         SceneElement::Sketch(i) => ElementScriptTokens {
             kind: "sketch",
             index: i,
             edge: None,
+            point: None,
         },
         SceneElement::Rect(i) => ElementScriptTokens {
             kind: "rect",
             index: i,
             edge: None,
+            point: None,
         },
         SceneElement::Line(i) => ElementScriptTokens {
             kind: "line",
             index: i,
             edge: None,
+            point: None,
         },
         SceneElement::Circle(i) => ElementScriptTokens {
             kind: "circle",
             index: i,
             edge: None,
+            point: None,
         },
         SceneElement::RectEdge(i, edge) => ElementScriptTokens {
             kind: "rect",
             index: i,
             edge: Some(edge),
+            point: None,
         },
         SceneElement::Constraint(i) => ElementScriptTokens {
             kind: "constraint",
             index: i,
             edge: None,
+            point: None,
+        },
+        SceneElement::Point(point) => ElementScriptTokens {
+            kind: "point",
+            index: 0,
+            edge: None,
+            point: Some(point),
         },
     }
 }
 
-fn parse_construction_value(value: &str, line_no: usize) -> Result<bool, ParseError> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "on" | "yes" | "1" => Ok(true),
-        "false" | "off" | "no" | "0" => Ok(false),
-        other => Err(ParseError {
-            line: line_no,
-            message: format!(
-                "unknown construction value '{other}' (expected true or false)"
-            ),
+fn point_script_tokens(point: crate::model::ConstraintPoint) -> String {
+    use crate::model::{ConstraintPoint, LineEnd};
+    match point {
+        ConstraintPoint::LineEndpoint { line, end } => {
+            let end_name = match end {
+                LineEnd::Start => "start",
+                LineEnd::End => "end",
+            };
+            format!("point line {line} {end_name}")
+        }
+        ConstraintPoint::RectCorner { rect, corner } => {
+            format!("point rect {rect} corner {corner}")
+        }
+        ConstraintPoint::CircleCenter(circle) => format!("point circle {circle} center"),
+    }
+}
+
+fn geometric_constraint_script_name(
+    kind: crate::geometric_constraints::GeometricConstraintType,
+) -> &'static str {
+    use crate::geometric_constraints::GeometricConstraintType;
+    match kind {
+        GeometricConstraintType::Parallel => "parallel",
+        GeometricConstraintType::Perpendicular => "perpendicular",
+        GeometricConstraintType::Coincident => "coincident",
+        GeometricConstraintType::Midpoint => "midpoint",
+        GeometricConstraintType::Horizontal => "horizontal",
+        GeometricConstraintType::Vertical => "vertical",
+    }
+}
+
+fn constraint_line_script_tokens(line: ConstraintLine) -> String {
+    match line {
+        ConstraintLine::Line(index) => format!("line {index}"),
+        ConstraintLine::RectEdge { rect, edge } => {
+            format!("rect {rect} {}", edge.script_name())
+        }
+    }
+}
+
+
+/// Map an applied [`Action`] to a script [`Instruction`] when one exists.
+pub fn instruction_from_action(action: &Action, doc: &crate::model::Document) -> Option<Instruction> {
+    use crate::actions::dim_label_axis_for_target;
+    match action {
+        Action::NewDocument => Some(Instruction::New),
+        Action::Open { path } => Some(Instruction::Open(path.clone())),
+        Action::Save { path } => Some(Instruction::Save(path.clone())),
+        Action::Clear => Some(Instruction::Clear),
+        Action::UndoLast => Some(Instruction::Undo),
+        Action::SetTool(tool) => Some(Instruction::Tool(*tool)),
+        Action::SetRectDimension { axis, value } => Some(Instruction::SetDim {
+            axis: *axis,
+            value: value.clone(),
         }),
-    }
-}
-
-fn is_additive_token(token: &str) -> bool {
-    matches!(
-        token.to_ascii_lowercase().as_str(),
-        "add" | "additive" | "+"
-    )
-}
-
-fn parse_scene_element_with_optional_edge<'a, I>(
-    kind: &str,
-    index: usize,
-    parts: &mut I,
-    line_no: usize,
-) -> Result<(SceneElement, Option<&'a str>), ParseError>
-where
-    I: Iterator<Item = &'a str>,
-{
-    let unknown_kind = || ParseError {
-        line: line_no,
-        message: format!("unknown element kind '{kind}'"),
-    };
-    let next = parts.next();
-    if let Some(token) = next {
-        if token.eq_ignore_ascii_case("edge") {
-            let edge_name = parts.next().ok_or_else(|| ParseError {
-                line: line_no,
-                message: "rectangle edge name required after 'edge'".to_string(),
-            })?;
-            let edge = RectEdge::from_name(edge_name).ok_or_else(|| ParseError {
-                line: line_no,
-                message: format!("unknown rectangle edge '{edge_name}'"),
-            })?;
-            return Ok((SceneElement::RectEdge(index, edge), parts.next()));
+        Action::FocusRectDimension { axis } => Some(Instruction::FocusDim(*axis)),
+        Action::SetLineLength { value } => Some(Instruction::SetLineLength {
+            value: value.clone(),
+        }),
+        Action::FocusLineLength => Some(Instruction::FocusLineLength),
+        Action::SetCircleDiameter { value } => Some(Instruction::SetCircleDiameter {
+            value: value.clone(),
+        }),
+        Action::FocusCircleDiameter => Some(Instruction::FocusCircleDiameter),
+        Action::SetDimLabelOffset { target, offset } => {
+            dim_label_axis_for_target(doc, *target).map(|axis| {
+                Instruction::SetDimLabelOffset {
+                    axis,
+                    offset: *offset,
+                }
+            })
         }
-        if matches!(kind.to_ascii_lowercase().as_str(), "rect" | "rectangle") {
-            if let Some(edge) = RectEdge::from_name(token) {
-                return Ok((SceneElement::RectEdge(index, edge), parts.next()));
-            }
+        Action::BeginEditCommittedDim { target } => {
+            dim_label_axis_for_target(doc, *target).map(|axis| {
+                Instruction::BeginEditCommittedDim { axis }
+            })
         }
-        if is_additive_token(token) {
-            let element = scene_element_from_script(kind, index).ok_or_else(unknown_kind)?;
-            return Ok((element, Some(token)));
+        Action::CommitCommittedDim => Some(Instruction::CommitCommittedDim),
+        Action::BeginEditConstructionPlane { index } => {
+            Some(Instruction::BeginEditConstructionPlane { index: *index })
         }
-        let element = scene_element_from_script(kind, index).ok_or_else(unknown_kind)?;
-        return Ok((element, Some(token)));
-    }
-    let element = scene_element_from_script(kind, index).ok_or_else(unknown_kind)?;
-    Ok((element, None))
-}
-
-fn parse_scene_element_with_tail<'a, I>(
-    kind: &str,
-    index: usize,
-    parts: &mut I,
-    line_no: usize,
-) -> Result<(SceneElement, bool), ParseError>
-where
-    I: Iterator<Item = &'a str>,
-{
-    let (element, tail) =
-        parse_scene_element_with_optional_edge(kind, index, parts, line_no)?;
-    let additive = tail.is_some_and(is_additive_token);
-    Ok((element, additive))
-}
-
-fn scene_element_from_script(kind: &str, index: usize) -> Option<SceneElement> {
-    match kind.to_ascii_lowercase().as_str() {
-        "plane" | "construction_plane" | "constructionplane" => {
-            Some(SceneElement::ConstructionPlane(index))
+        Action::CommitConstructionPlane => Some(Instruction::CommitConstructionPlane),
+        Action::SetPlaneOffset { value } => Some(Instruction::SetPlaneOffset {
+            value: value.clone(),
+        }),
+        Action::SetPlaneAngle { value } => Some(Instruction::SetPlaneAngle {
+            value: value.clone(),
+        }),
+        Action::FocusPlaneDim { dim } => Some(Instruction::FocusPlaneDim(*dim)),
+        Action::BeginSketch { face, .. } => Some(Instruction::BeginSketch { face: *face }),
+        Action::OpenSketch { sketch, .. } => Some(Instruction::OpenSketch { sketch: *sketch }),
+        Action::ExitSketch => Some(Instruction::ExitSketch),
+        Action::SetElementVisible { element, visible } => Some(Instruction::SetElementVisible {
+            element: *element,
+            visible: Some(*visible),
+        }),
+        Action::ToggleElementVisibility(element) => Some(Instruction::SetElementVisible {
+            element: *element,
+            visible: None,
+        }),
+        Action::SetHomeView => Some(Instruction::SetHomeView),
+        Action::SetPaneVisible { pane, visible } => Some(Instruction::SetPane {
+            pane: *pane,
+            visible: Some(*visible),
+        }),
+        Action::TogglePane(pane) => Some(Instruction::SetPane {
+            pane: *pane,
+            visible: None,
+        }),
+        Action::AddParameter { name, expression } => Some(Instruction::AddParameter {
+            name: name.clone(),
+            expression: expression.clone(),
+        }),
+        Action::CommitParameterName { index, name } => Some(Instruction::SetParameterName {
+            index: *index,
+            name: name.clone(),
+        }),
+        Action::CommitParameterExpression { index, expression } => {
+            Some(Instruction::SetParameterExpression {
+                index: *index,
+                expression: expression.clone(),
+            })
         }
-        "sketch" => Some(SceneElement::Sketch(index)),
-        "rect" | "rectangle" => Some(SceneElement::Rect(index)),
-        "line" => Some(SceneElement::Line(index)),
-        "circle" => Some(SceneElement::Circle(index)),
-        "constraint" => Some(SceneElement::Constraint(index)),
+        Action::DeleteParameter { index } => Some(Instruction::DeleteParameter { index: *index }),
+        Action::DeleteSelection => Some(Instruction::DeleteSelection),
+        Action::SetCommandPaletteOpen { open } => Some(Instruction::SetCommandPalette {
+            open: Some(*open),
+        }),
+        Action::ToggleCommandPalette => Some(Instruction::SetCommandPalette { open: None }),
+        Action::ClickSceneElement { element, additive } => Some(Instruction::SelectSceneElement {
+            element: *element,
+            additive: *additive,
+        }),
+        Action::ClearSceneSelection => Some(Instruction::ClearSceneSelection),
+        Action::SetShapeConstruction {
+            element,
+            construction,
+        } => Some(Instruction::SetShapeConstruction {
+            element: *element,
+            construction: *construction,
+        }),
+        Action::ApplyConstruction { construction } => Some(Instruction::ApplyConstruction {
+            construction: *construction,
+        }),
+        Action::ToggleConstruction => Some(Instruction::ToggleConstruction),
+        Action::AddGeometricConstraint(kind) => Some(Instruction::AddGeometricConstraint(*kind)),
+        Action::ApplyConstraintShortcut(index) => Some(Instruction::ApplyConstraintShortcut(*index)),
+        Action::DragVertex { point, u, v } => Some(Instruction::DragVertex {
+            point: *point,
+            u: *u,
+            v: *v,
+        }),
+        Action::CommitElementName { element, name } => Some(Instruction::SetElementName {
+            element: *element,
+            name: name.clone(),
+        }),
+        Action::FocusElementName => Some(Instruction::FocusElementName),
         _ => None,
     }
 }
@@ -1235,6 +950,119 @@ fn key_name(key: Key) -> &'static str {
         Key::Num8 => "8",
         Key::Num9 => "9",
         _ => "?",
+    }
+}
+
+fn tool_lua_name(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Select => "select",
+        Tool::Rectangle => "rectangle",
+        Tool::Line => "line",
+        Tool::Circle => "circle",
+        Tool::ConstructionPlane => "construction_plane",
+        Tool::Sketch => "sketch",
+        Tool::Dimension => "dimension",
+        Tool::Constraint => "constraint",
+    }
+}
+
+fn face_lua_parts(face: FaceId) -> (&'static str, usize) {
+    match face {
+        FaceId::Rect(i) => ("rect", i),
+        FaceId::Circle(i) => ("circle", i),
+        FaceId::ConstructionPlane(i) => ("construction_plane", i),
+    }
+}
+
+fn rect_axis_lua_name(axis: RectAxis) -> &'static str {
+    match axis {
+        RectAxis::Width => "width",
+        RectAxis::Height => "height",
+    }
+}
+
+fn dim_label_axis_lua_name(axis: DimLabelAxis) -> &'static str {
+    match axis {
+        DimLabelAxis::Width => "width",
+        DimLabelAxis::Height => "height",
+        DimLabelAxis::Length => "length",
+    }
+}
+
+fn plane_dim_lua_name(dim: PlaneDim) -> &'static str {
+    match dim {
+        PlaneDim::Offset => "offset",
+        PlaneDim::Angle => "angle",
+    }
+}
+
+fn geometric_constraint_lua_name(
+    kind: crate::geometric_constraints::GeometricConstraintType,
+) -> &'static str {
+    geometric_constraint_script_name(kind)
+}
+
+fn element_lua_ref(element: SceneElement) -> String {
+    let tokens = element_script_tokens(element);
+    if let Some(point) = tokens.point {
+        return format!("{{ kind = \"point\", {} }}", point_lua_fields(point));
+    }
+    if let Some(edge) = tokens.edge {
+        return format!(
+            "{{ kind = \"{}\", index = {}, edge = {:?} }}",
+            tokens.kind, tokens.index, edge.script_name()
+        );
+    }
+    format!("{{ kind = \"{}\", index = {} }}", tokens.kind, tokens.index)
+}
+
+fn point_lua_fields(point: ConstraintPoint) -> String {
+    use crate::model::{ConstraintPoint, LineEnd};
+    match point {
+        ConstraintPoint::LineEndpoint { line, end } => {
+            let end_name = match end {
+                LineEnd::Start => "start",
+                LineEnd::End => "end",
+            };
+            format!("kind = \"line\", index = {line}, end = \"{end_name}\"")
+        }
+        ConstraintPoint::RectCorner { rect, corner } => {
+            format!("kind = \"rect\", index = {rect}, corner = {corner}")
+        }
+        ConstraintPoint::CircleCenter(circle) => {
+            format!("kind = \"circle\", index = {circle}")
+        }
+    }
+}
+
+fn constraint_line_lua_ref(line: ConstraintLine) -> String {
+    match line {
+        ConstraintLine::Line(index) => format!("{{ kind = \"line\", index = {index} }}"),
+        ConstraintLine::RectEdge { rect, edge } => format!(
+            "{{ kind = \"rect\", index = {rect}, edge = {:?} }}",
+            edge.script_name()
+        ),
+    }
+}
+
+fn constraint_point_lua_ref(point: ConstraintPoint) -> String {
+    format!("{{ {} }}", point_lua_fields(point))
+}
+
+fn distance_target_lua_ref(target: &DistanceTarget) -> String {
+    match target {
+        DistanceTarget::LineLength(index) => {
+            format!("{{ kind = \"line\", index = {index} }}")
+        }
+        DistanceTarget::CircleDiameter(index) => {
+            format!("{{ kind = \"circle\", index = {index} }}")
+        }
+        DistanceTarget::RectWidth(index) => {
+            format!("{{ kind = \"rect\", index = {index}, axis = \"width\" }}")
+        }
+        DistanceTarget::RectHeight(index) => {
+            format!("{{ kind = \"rect\", index = {index}, axis = \"height\" }}")
+        }
     }
 }
 
@@ -1369,9 +1197,16 @@ impl SyntheticInput {
     }
 }
 
+struct LuaRunner {
+    lua: Lua,
+    thread: mlua::Thread,
+    finished: bool,
+}
+
 /// Drives a script through the live application, one step at a time.
 pub struct ScriptRunner {
     instructions: Vec<Instruction>,
+    lua: Option<LuaRunner>,
     pc: usize,
     wait_until: Option<Instant>,
     wait_frames_remaining: u32,
@@ -1387,8 +1222,13 @@ pub struct ScriptRunner {
 
 impl ScriptRunner {
     pub fn new(instructions: Vec<Instruction>) -> Self {
+        Self::from_instructions(instructions)
+    }
+
+    pub fn from_instructions(instructions: Vec<Instruction>) -> Self {
         Self {
             instructions,
+            lua: None,
             pc: 0,
             wait_until: None,
             wait_frames_remaining: 0,
@@ -1402,8 +1242,46 @@ impl ScriptRunner {
         }
     }
 
-    pub fn from_file(path: &Path) -> Result<Self, ParseError> {
-        let runner = Self::new(parse_file(path)?);
+    #[cfg(test)]
+    pub fn from_lua_source(source: &str) -> Result<Self, ScriptError> {
+        let lua = Lua::new();
+        crate::lua_script::register_api(&lua).map_err(|e| ScriptError {
+            message: e.to_string(),
+        })?;
+        let func = lua.load(source).into_function().map_err(|e| ScriptError {
+            message: e.to_string(),
+        })?;
+        let thread = lua.create_thread(func).map_err(|e| ScriptError {
+            message: e.to_string(),
+        })?;
+        let mut runner = Self::from_instructions(vec![]);
+        runner.lua = Some(LuaRunner {
+            lua,
+            thread,
+            finished: false,
+        });
+        Ok(runner)
+    }
+
+    pub fn from_file(path: &Path) -> Result<Self, ScriptError> {
+        if path.extension().and_then(|e| e.to_str()) != Some("lua") {
+            return Err(ScriptError {
+                message: format!(
+                    "scripts must use the .lua extension: {}",
+                    path.display()
+                ),
+            });
+        }
+        let lua = Lua::new();
+        let thread = load_script(&lua, path).map_err(|e| ScriptError {
+            message: e.to_string(),
+        })?;
+        let mut runner = Self::from_instructions(vec![]);
+        runner.lua = Some(LuaRunner {
+            lua,
+            thread,
+            finished: false,
+        });
         if runner.verbose {
             println!("Running script: {}", path.display());
             println!("---");
@@ -1411,9 +1289,13 @@ impl ScriptRunner {
         Ok(runner)
     }
 
+    pub fn lua_done(&self) -> bool {
+        self.lua.as_ref().is_some_and(|lua| lua.finished) || self.done
+    }
+
     fn log_instruction(&mut self, instr: &Instruction) {
         if self.verbose && self.logged_pc != Some(self.pc) {
-            println!("{}", instr.as_line());
+            println!("{}", instr.as_lua());
             self.logged_pc = Some(self.pc);
         }
     }
@@ -1425,8 +1307,35 @@ impl ScriptRunner {
             || self.waiting_view_transition
     }
 
+    fn clear_instruction_wait(&mut self) {
+        self.wait_until = None;
+        self.pc += 1;
+        self.logged_pc = None;
+    }
+
+    fn advance_after_wait(&mut self) {
+        if self.lua.is_some() {
+            self.logged_pc = None;
+        } else {
+            self.clear_instruction_wait();
+        }
+    }
+
     /// Advance the script. Returns true if a repaint should be requested.
     pub fn tick(
+        &mut self,
+        state: &mut AppState,
+        synthetic: &mut SyntheticInput,
+        viewport: Option<egui::Rect>,
+        ctx: &egui::Context,
+    ) -> bool {
+        if self.lua.is_some() {
+            return self.tick_lua_mode(state, synthetic, viewport, ctx);
+        }
+        self.tick_instructions(state, synthetic, viewport, ctx)
+    }
+
+    fn tick_lua_mode(
         &mut self,
         state: &mut AppState,
         synthetic: &mut SyntheticInput,
@@ -1442,15 +1351,13 @@ impl ScriptRunner {
                 return true;
             }
             self.wait_until = None;
-            self.pc += 1;
-            self.logged_pc = None;
+            self.advance_after_wait();
         }
 
         if self.wait_frames_remaining > 0 {
             self.wait_frames_remaining -= 1;
             if self.wait_frames_remaining == 0 {
-                self.pc += 1;
-                self.logged_pc = None;
+                self.advance_after_wait();
             }
             return true;
         }
@@ -1460,19 +1367,136 @@ impl ScriptRunner {
                 return true;
             }
             self.waiting_view_transition = false;
-            self.pc += 1;
-            self.logged_pc = None;
+            self.advance_after_wait();
         }
 
         if self.screenshot_pending.is_some() {
-            // Wait for screenshot event to be processed elsewhere.
+            return true;
+        }
+
+        let runner_ptr = self as *mut ScriptRunner;
+        let lua_runner = self.lua.as_mut().unwrap();
+        if lua_runner.finished {
+            self.done = true;
+            return false;
+        }
+
+        lua_runner.lua.set_app_data(ScriptTickData {
+            runner: runner_ptr,
+            state: state as *mut AppState,
+            synthetic: synthetic as *mut SyntheticInput,
+            viewport,
+            ctx: ctx as *const egui::Context as *mut egui::Context,
+        });
+
+        match lua_runner.thread.resume::<()>(()) {
+            Ok(_) => match lua_runner.thread.status() {
+                mlua::ThreadStatus::Finished => {
+                    lua_runner.finished = true;
+                    self.done = true;
+                    if self.verbose {
+                        println!("---");
+                        println!("Script complete.");
+                    }
+                    false
+                }
+                mlua::ThreadStatus::Resumable => true,
+                mlua::ThreadStatus::Running => true,
+                mlua::ThreadStatus::Error => {
+                    self.error = Some("Lua thread error".to_string());
+                    lua_runner.finished = true;
+                    self.done = true;
+                    false
+                }
+            },
+            Err(e) => {
+                self.error = Some(e.to_string());
+                lua_runner.finished = true;
+                self.done = true;
+                false
+            }
+        }
+    }
+
+    pub(crate) fn tick_lua(
+        &mut self,
+        lua: &Lua,
+        thread: &mlua::Thread,
+        state: &mut AppState,
+        synthetic: &mut SyntheticInput,
+        viewport: Option<egui::Rect>,
+        ctx: &egui::Context,
+    ) -> bool {
+        lua.set_app_data(ScriptTickData {
+            runner: self as *mut ScriptRunner,
+            state: state as *mut AppState,
+            synthetic: synthetic as *mut SyntheticInput,
+            viewport,
+            ctx: ctx as *const egui::Context as *mut egui::Context,
+        });
+        match thread.resume::<()>(()) {
+            Ok(_) => match thread.status() {
+                mlua::ThreadStatus::Finished => {
+                    self.done = true;
+                    false
+                }
+                mlua::ThreadStatus::Resumable | mlua::ThreadStatus::Running => true,
+                mlua::ThreadStatus::Error => {
+                    self.error = Some("Lua thread error".to_string());
+                    self.done = true;
+                    false
+                }
+            },
+            Err(e) => {
+                self.error = Some(e.to_string());
+                self.done = true;
+                false
+            }
+        }
+    }
+
+    fn tick_instructions(
+        &mut self,
+        state: &mut AppState,
+        synthetic: &mut SyntheticInput,
+        viewport: Option<egui::Rect>,
+        ctx: &egui::Context,
+    ) -> bool {
+        if self.done {
+            return false;
+        }
+
+        if let Some(until) = self.wait_until {
+            if Instant::now() < until {
+                return true;
+            }
+            self.clear_instruction_wait();
+        }
+
+        if self.wait_frames_remaining > 0 {
+            self.wait_frames_remaining -= 1;
+            if self.wait_frames_remaining == 0 {
+                self.clear_instruction_wait();
+            }
+            return true;
+        }
+
+        if self.waiting_view_transition {
+            if state.cam.is_transitioning() {
+                return true;
+            }
+            self.waiting_view_transition = false;
+            self.clear_instruction_wait();
+        }
+
+        if self.screenshot_pending.is_some() {
             return true;
         }
 
         while self.pc < self.instructions.len() {
             let instr = self.instructions[self.pc].clone();
             self.log_instruction(&instr);
-            match self.execute_one(instr, state, synthetic, viewport, ctx) {
+            match self.execute_instruction(instr, state, synthetic, viewport, ctx) {
                 StepResult::Continue => {
                     self.pc += 1;
                 }
@@ -1492,18 +1516,39 @@ impl ScriptRunner {
         false
     }
 
+    pub(crate) fn execute_instruction(
+        &mut self,
+        instr: Instruction,
+        state: &mut AppState,
+        synthetic: &mut SyntheticInput,
+        viewport: Option<egui::Rect>,
+        ctx: &egui::Context,
+    ) -> StepResult {
+        let result = self.execute_one(instr, state, synthetic, viewport, ctx);
+        if self.should_quit {
+            if let Some(lua_runner) = self.lua.as_mut() {
+                lua_runner.finished = true;
+            }
+            self.done = true;
+            return StepResult::Done;
+        }
+        result
+    }
+
     /// Called when egui delivers a screenshot response for a pending request.
     pub fn on_screenshot(&mut self, image: &egui::ColorImage) -> Result<(), String> {
         let Some(path) = self.screenshot_pending.take() else {
             return Ok(());
         };
         save_screenshot(&path, image)?;
-        self.pc += 1;
+        if self.lua.is_none() {
+            self.pc += 1;
+        }
         Ok(())
     }
 }
 
-enum StepResult {
+pub(crate) enum StepResult {
     Continue,
     Wait,
     Done,
@@ -1661,6 +1706,34 @@ impl ScriptRunner {
                 }
                 StepResult::Continue
             }
+            Instruction::AddGeometricConstraint(kind) => {
+                let _ = state.apply(Action::AddGeometricConstraint(kind));
+                StepResult::Continue
+            }
+            Instruction::ApplyConstraintShortcut(index) => {
+                let _ = state.apply(Action::ApplyConstraintShortcut(index));
+                StepResult::Continue
+            }
+            Instruction::DragVertex { point, u, v } => {
+                let _ = state.apply(Action::DragVertex { point, u, v });
+                StepResult::Continue
+            }
+            Instruction::DragLineSegment {
+                target,
+                anchor_u,
+                anchor_v,
+                u,
+                v,
+            } => {
+                let _ = state.apply(Action::BeginLineDrag {
+                    target,
+                    anchor_u,
+                    anchor_v,
+                });
+                let _ = state.apply(Action::DragLine { u, v });
+                let _ = state.apply(Action::EndLineDrag);
+                StepResult::Continue
+            }
             Instruction::SetLineLength { value } => {
                 let _ = state.apply(Action::SetLineLength { value });
                 StepResult::Continue
@@ -1777,6 +1850,10 @@ impl ScriptRunner {
             }
             Instruction::DeleteParameter { index } => {
                 state.apply(Action::DeleteParameter { index });
+                StepResult::Continue
+            }
+            Instruction::DeleteSelection => {
+                state.apply(Action::DeleteSelection);
                 StepResult::Continue
             }
             Instruction::SetCommandPalette { open } => {
@@ -1920,6 +1997,7 @@ pub struct ScriptOptions {
     pub script_path: Option<String>,
     pub document_path: Option<String>,
     pub exit_on_complete: bool,
+    pub show_commands: bool,
 }
 
 /// Parsed command-line outcome.
@@ -1936,20 +2014,21 @@ pub fn print_usage() {
 LE3 — parametric CAD prototype
 
 Usage:
-  le3 [options] [script.le3script]
+  le3 [options] [script.lua]
 
 Options:
-  --script <path>       Run an instruction script
+  --script <path>       Run a Lua script
   --exit, --exit-on-complete
                         Exit after startup, or after the script finishes
+  --show-commands       Print each user action as a script line on stdout
   -h, --help            Show this help and exit
 
 Examples:
   le3
   le3 --exit
   le3 drawing.le3 --exit
-  le3 --script demo.le3script
-  le3 demo.le3script --exit
+  le3 --script demo.lua
+  le3 demo.lua --exit
 "
     );
 }
@@ -1993,11 +2072,13 @@ fn parse_args_from_vec(args: &[String]) -> ScriptOptions {
             "--exit" | "--exit-on-complete" => {
                 opts.exit_on_complete = true;
             }
+            "--show-commands" => {
+                opts.show_commands = true;
+            }
             arg if !arg.starts_with('-') => {
                 if opts.script_path.is_none()
-                    && (arg.ends_with(".le3script")
-                        || arg.ends_with(".script")
-                        || Path::new(arg).extension().is_some_and(|e| e == "le3script"))
+                    && (arg.ends_with(".lua")
+                        || Path::new(arg).extension().is_some_and(|e| e == "lua"))
                 {
                     opts.script_path = Some(arg.to_string());
                 } else if opts.document_path.is_none()
@@ -2017,63 +2098,7 @@ fn parse_args_from_vec(args: &[String]) -> ScriptOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_basic_instructions() {
-        let script = r#"
-            # setup
-            new
-            tool rectangle
-            click 100 200
-            key enter
-            screenshot out.png
-        "#;
-        let ins = parse(script).unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::New,
-                Instruction::Tool(Tool::Rectangle),
-                Instruction::Click { x: 100.0, y: 200.0 },
-                Instruction::Key(Key::Enter),
-                Instruction::Screenshot("out.png".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_wait_variants() {
-        let ins = parse("wait 100ms\nwait 3").unwrap();
-        assert_eq!(
-            ins,
-            vec![Instruction::WaitMs(100), Instruction::WaitFrames(3)]
-        );
-    }
-
-    #[test]
-    fn parses_type_with_quotes() {
-        let ins = parse(r#"type "12.5""#).unwrap();
-        assert_eq!(ins, vec![Instruction::Type("12.5".to_string())]);
-    }
-
-    #[test]
-    fn parses_open_save_paths() {
-        let ins = parse("open /tmp/test.le3\nsave /tmp/out.le3").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::Open("/tmp/test.le3".to_string()),
-                Instruction::Save(Some("/tmp/out.le3".to_string())),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_error_on_unknown_instruction() {
-        let err = parse("foobar").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains("unknown"));
-    }
+    use crate::model::ConstraintLine;
 
     #[test]
     fn parse_key_names() {
@@ -2089,28 +2114,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_show_commands_flag() {
+        let opts = parse_args(["le3", "--show-commands"]);
+        assert!(opts.show_commands);
+    }
+
+    #[test]
+    fn instruction_from_action_maps_tool_changes() {
+        let state = AppState::default();
+        let instruction =
+            instruction_from_action(&Action::SetTool(Tool::Rectangle), &state.doc).unwrap();
+        assert_eq!(instruction, Instruction::Tool(Tool::Rectangle));
+    }
+
+    #[test]
     fn parse_cli_run_delegates_to_script_options() {
         assert_eq!(
-            parse_cli(["le3", "--script", "test.le3script", "--exit"]),
+            parse_cli(["le3", "--script", "test.lua", "--exit"]),
             CliOutcome::Run(ScriptOptions {
-                script_path: Some("test.le3script".to_string()),
+                script_path: Some("test.lua".to_string()),
                 document_path: None,
                 exit_on_complete: true,
+                show_commands: false,
             })
         );
     }
 
     #[test]
     fn parse_args_finds_script_flag() {
-        let opts = parse_args(["le3", "--script", "test.le3script", "--exit"]);
-        assert_eq!(opts.script_path.as_deref(), Some("test.le3script"));
+        let opts = parse_args(["le3", "--script", "test.lua", "--exit"]);
+        assert_eq!(opts.script_path.as_deref(), Some("test.lua"));
         assert!(opts.exit_on_complete);
     }
 
     #[test]
     fn parse_args_finds_positional_script() {
-        let opts = parse_args(["le3", "demo.le3script"]);
-        assert_eq!(opts.script_path.as_deref(), Some("demo.le3script"));
+        let opts = parse_args(["le3", "demo.lua"]);
+        assert_eq!(opts.script_path.as_deref(), Some("demo.lua"));
     }
 
     #[test]
@@ -2130,16 +2170,15 @@ mod tests {
     }
 
     #[test]
-    fn instruction_as_line_round_trips() {
-        let line = "click 100 200";
-        let ins = parse(line).unwrap().into_iter().next().unwrap();
-        assert_eq!(ins.as_line(), line);
+    fn instruction_as_lua_formats_click() {
+        let ins = Instruction::Click { x: 100.0, y: 200.0 };
+        assert_eq!(ins.as_lua(), "paramcad.click(100, 200)");
     }
 
     #[test]
     fn wait_frames_advances_to_next_instruction() {
-        let script = "wait 2\nclear";
-        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        let mut runner =
+            ScriptRunner::new(vec![Instruction::WaitFrames(2), Instruction::Clear]);
         runner.verbose = false;
         let mut state = AppState::default();
         let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
@@ -2151,235 +2190,64 @@ mod tests {
         let ctx = egui::Context::default();
         let vp = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(960.0, 560.0));
 
-        // Frame 1: start wait 2
         assert!(runner.tick(&mut state, &mut synthetic, Some(vp), &ctx));
         assert_eq!(runner.pc, 0);
         assert_eq!(runner.wait_frames_remaining, 2);
 
-        // Frame 2: 2 -> 1
         assert!(runner.tick(&mut state, &mut synthetic, Some(vp), &ctx));
         assert_eq!(runner.pc, 0);
         assert_eq!(runner.wait_frames_remaining, 1);
 
-        // Frame 3: 1 -> 0, advance past wait
         assert!(runner.tick(&mut state, &mut synthetic, Some(vp), &ctx));
         assert_eq!(runner.pc, 1);
         assert_eq!(runner.wait_frames_remaining, 0);
 
-        // Frame 4: run clear
         runner.tick(&mut state, &mut synthetic, Some(vp), &ctx);
         assert!(state.doc.rects.is_empty());
         assert!(runner.done);
     }
 
     #[test]
-    fn parses_view_commands() {
-        let ins = parse("view front\nview top\nview right").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::View(StandardView::Front),
-                Instruction::View(StandardView::Top),
-                Instruction::View(StandardView::Right),
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_set_home_view_command() {
-        let ins = parse("set_home_view\nset_home").unwrap();
-        assert_eq!(
-            ins,
-            vec![Instruction::SetHomeView, Instruction::SetHomeView]
-        );
-    }
-
-    #[test]
-    fn parses_view_home_command() {
-        let ins = parse("view_home\nhome\ncamera_home").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::ViewHome,
-                Instruction::ViewHome,
-                Instruction::ViewHome,
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_projection_mode_commands() {
-        let ins = parse("view orthographic\nview natural\ntoggle_projection").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::ProjectionMode(ProjectionMode::Orthographic),
-                Instruction::ProjectionMode(ProjectionMode::Natural),
-                Instruction::ToggleProjectionMode,
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_edit_plane_commands() {
-        let ins = parse("edit_plane 1\ncommit_plane").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::BeginEditConstructionPlane { index: 1 },
-                Instruction::CommitConstructionPlane,
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_edit_sketch_alias() {
-        let ins = parse("edit_sketch 2\nopen_sketch 2").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::OpenSketch { sketch: 2 },
-                Instruction::OpenSketch { sketch: 2 },
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_tree_pane_commands() {
-        let ins = parse("pane tree show\npane hierarchy hide\npane dag toggle").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::SetPane {
-                    pane: Pane::Hierarchy,
-                    visible: Some(true),
-                },
-                Instruction::SetPane {
-                    pane: Pane::Hierarchy,
-                    visible: Some(false),
-                },
-                Instruction::SetPane {
-                    pane: Pane::Hierarchy,
-                    visible: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_pane_commands() {
-        let ins = parse("pane view_cube show\npane cube hide\npane hud toggle\npane viewcube")
-            .unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::SetPane {
-                    pane: Pane::ViewCube,
-                    visible: Some(true),
-                },
-                Instruction::SetPane {
-                    pane: Pane::ViewCube,
-                    visible: Some(false),
-                },
-                Instruction::SetPane {
-                    pane: Pane::ViewCube,
-                    visible: None,
-                },
-                Instruction::SetPane {
-                    pane: Pane::ViewCube,
-                    visible: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn pane_command_round_trips_through_as_line() {
-        for line in ["pane view_cube show", "pane view_cube hide", "pane view_cube toggle"] {
-            let ins = parse(line).unwrap();
-            assert_eq!(ins[0].as_line(), line);
+    fn script_drag_line_translates_segment() {
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::Tool(Tool::Line),
+            Instruction::Tool(Tool::Select),
+            Instruction::DragLineSegment {
+                target: ConstraintLine::Line(0),
+                anchor_u: 0.0,
+                anchor_v: 0.0,
+                u: 4.0,
+                v: 0.0,
+            },
+        ]);
+        runner.verbose = false;
+        let mut state = AppState::default();
+        let mut synthetic = SyntheticInput::default();
+        state.apply(crate::actions::Action::BeginSketch {
+            face: FaceId::ConstructionPlane(0),
+            viewport: None,
+        });
+        state.creating_line = Some(crate::actions::CreatingLine {
+            origin: glam::Vec3::ZERO,
+            text: String::new(),
+            last_mouse: glam::Vec3::new(10.0, 0.0, 0.0),
+            user_edited: false,
+            pending_focus: false,
+            construction: false,
+        });
+        state.apply(crate::actions::Action::CommitLine);
+        while !runner.done {
+            runner.tick(
+                &mut state,
+                &mut synthetic,
+                None,
+                &egui::Context::default(),
+            );
         }
-    }
-
-    #[test]
-    fn parses_context_pane_commands() {
-        let ins = parse("pane context show\npane context hide\npane context toggle").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::SetPane {
-                    pane: Pane::Context,
-                    visible: Some(true),
-                },
-                Instruction::SetPane {
-                    pane: Pane::Context,
-                    visible: Some(false),
-                },
-                Instruction::SetPane {
-                    pane: Pane::Context,
-                    visible: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_set_name_commands() {
-        let ins = parse("set_name line 0 Guide\nfocus_name\nrename rect 1 My box").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::SetElementName {
-                    element: SceneElement::Line(0),
-                    name: "Guide".to_string(),
-                },
-                Instruction::FocusElementName,
-                Instruction::SetElementName {
-                    element: SceneElement::Rect(1),
-                    name: "My box".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_apply_and_toggle_construction_commands() {
-        let ins = parse("apply_construction true\ntoggle_construction\napply_construction false")
-            .unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::ApplyConstruction { construction: true },
-                Instruction::ToggleConstruction,
-                Instruction::ApplyConstruction { construction: false },
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_selection_and_construction_commands() {
-        let ins = parse(
-            "select rect 0 bottom\nselect line 1 add\nclear_selection\nset_construction rect 0 top true",
-        )
-        .unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::SelectSceneElement {
-                    element: SceneElement::RectEdge(0, RectEdge::Bottom),
-                    additive: false,
-                },
-                Instruction::SelectSceneElement {
-                    element: SceneElement::Line(1),
-                    additive: true,
-                },
-                Instruction::ClearSceneSelection,
-                Instruction::SetShapeConstruction {
-                    element: SceneElement::RectEdge(0, RectEdge::Top),
-                    construction: true,
-                },
-            ]
-        );
+        let line = &state.doc.lines[0];
+        assert!((line.x0 - 4.0).abs() < 1e-2);
+        assert!((line.y0).abs() < 1e-2);
+        assert!((line.x1 - 14.0).abs() < 1e-2);
     }
 
     #[test]
@@ -2389,8 +2257,17 @@ mod tests {
         state.doc.rects.push(crate::model::Rect::from_local_corners(
             sketch, 0.0, 0.0, 10.0, 5.0,
         ));
-        let script = "select rect 0 bottom\nset_construction rect 0 bottom true\nclear_selection";
-        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::SelectSceneElement {
+                element: SceneElement::RectEdge(0, RectEdge::Bottom),
+                additive: false,
+            },
+            Instruction::SetShapeConstruction {
+                element: SceneElement::RectEdge(0, RectEdge::Bottom),
+                construction: true,
+            },
+            Instruction::ClearSceneSelection,
+        ]);
         runner.verbose = false;
         let mut synthetic = SyntheticInput::default();
         let ctx = egui::Context::default();
@@ -2406,62 +2283,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_parameters_pane_commands() {
-        let ins = parse("pane parameters show\npane params hide\npane param toggle").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::SetPane {
-                    pane: Pane::Parameters,
-                    visible: Some(true),
-                },
-                Instruction::SetPane {
-                    pane: Pane::Parameters,
-                    visible: Some(false),
-                },
-                Instruction::SetPane {
-                    pane: Pane::Parameters,
-                    visible: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_pane() {
-        assert!(parse("pane bogus show").is_err());
-        assert!(parse("pane view_cube sideways").is_err());
-    }
-
-    #[test]
-    fn parses_palette_commands() {
-        assert_eq!(
-            parse("palette").unwrap(),
-            vec![Instruction::SetCommandPalette { open: None }]
-        );
-        let ins = parse("palette show\npalette hide\npalette toggle\npalette run view top")
-            .unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::SetCommandPalette {
-                    open: Some(true),
-                },
-                Instruction::SetCommandPalette {
-                    open: Some(false),
-                },
-                Instruction::SetCommandPalette { open: None },
-                Instruction::RunPaletteCommand {
-                    query: "view top".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn script_rectangle_dimension_uses_parameter_and_updates() {
-        let script = "parameter add A 10mm\ntool rectangle\nset_dim width A\nset_dim height 5";
-        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::AddParameter {
+                name: "A".into(),
+                expression: "10mm".into(),
+            },
+            Instruction::Tool(Tool::Rectangle),
+            Instruction::SetDim {
+                axis: RectAxis::Width,
+                value: "A".into(),
+            },
+            Instruction::SetDim {
+                axis: RectAxis::Height,
+                value: "5".into(),
+            },
+        ]);
         runner.verbose = false;
         let mut state = AppState::default();
         let mut synthetic = SyntheticInput::default();
@@ -2502,7 +2339,9 @@ mod tests {
 
     #[test]
     fn script_palette_run_sets_top_view() {
-        let mut runner = ScriptRunner::new(parse("palette run view top").unwrap());
+        let mut runner = ScriptRunner::new(vec![Instruction::RunPaletteCommand {
+            query: "view top".into(),
+        }]);
         runner.verbose = false;
         let mut state = AppState::default();
         let mut synthetic = SyntheticInput::default();
@@ -2518,35 +2357,45 @@ mod tests {
     }
 
     #[test]
-    fn parses_parameter_commands() {
-        let ins = parse(
-            "parameter add A 5mm\nparameter value 0 A + 5in\nparameter name 0 Len\nparameter delete 1",
-        )
-        .unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::AddParameter {
-                    name: "A".to_string(),
-                    expression: "5mm".to_string(),
-                },
-                Instruction::SetParameterExpression {
-                    index: 0,
-                    expression: "A + 5in".to_string(),
-                },
-                Instruction::SetParameterName {
-                    index: 0,
-                    name: "Len".to_string(),
-                },
-                Instruction::DeleteParameter { index: 1 },
-            ]
-        );
+    fn script_delete_selection_tombstones_line() {
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(crate::model::FaceId::default());
+        state.doc.lines.push(crate::model::Line::from_local_endpoints(
+            sketch, 0.0, 0.0, 5.0, 0.0,
+        ));
+        state.doc.shape_order.push(crate::model::ShapeKind::Line);
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::SelectSceneElement {
+                element: SceneElement::Line(0),
+                additive: false,
+            },
+            Instruction::DeleteSelection,
+        ]);
+        runner.verbose = false;
+        let mut synthetic = SyntheticInput::default();
+        let ctx = egui::Context::default();
+        while !runner.done {
+            runner.tick(&mut state, &mut synthetic, None, &ctx);
+        }
+        assert!(state.doc.lines[0].deleted);
     }
 
     #[test]
     fn script_adds_and_renames_parameters() {
-        let script = "parameter add A 5mm\nparameter add B A+5in\nparameter name 0 Len";
-        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::AddParameter {
+                name: "A".into(),
+                expression: "5mm".into(),
+            },
+            Instruction::AddParameter {
+                name: "B".into(),
+                expression: "A+5in".into(),
+            },
+            Instruction::SetParameterName {
+                index: 0,
+                name: "Len".into(),
+            },
+        ]);
         runner.verbose = false;
         let mut state = AppState::default();
         let mut synthetic = SyntheticInput::default();
@@ -2564,21 +2413,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_view_edge_and_corner_commands() {
-        let ins = parse("view edge front_top\nview corner frt").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::ViewEdge(CubeEdgeId::FrontTop),
-                Instruction::ViewCorner(CubeCornerId::FrontRightTop),
-            ]
-        );
-    }
-
-    #[test]
     fn view_command_waits_until_transition_finishes() {
-        let script = "view front\nclear";
-        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::View(StandardView::Front),
+            Instruction::Clear,
+        ]);
         runner.verbose = false;
         let mut state = AppState::default();
         let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
@@ -2609,74 +2448,12 @@ mod tests {
             }
         }
 
-        assert!(blocked_while_animating, "script should block while the view animates");
+        assert!(
+            blocked_while_animating,
+            "script should block while the view animates"
+        );
         assert!(state.doc.rects.is_empty());
         assert!(runner.done);
-    }
-
-    #[test]
-    fn parses_line_tool_and_length_dim() {
-        let ins = parse("tool line\nset_dim length 25\nfocus_dim length").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::Tool(Tool::Line),
-                Instruction::SetLineLength {
-                    value: "25".to_string()
-                },
-                Instruction::FocusLineLength,
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_begin_sketch_on_circle_face() {
-        let ins = parse("begin_sketch circle 0").unwrap();
-        assert_eq!(
-            ins,
-            vec![Instruction::BeginSketch {
-                face: FaceId::Circle(0),
-            }]
-        );
-    }
-
-    #[test]
-    fn parses_circle_tool_and_diameter_dim() {
-        let ins = parse("tool circle\nset_dim diameter 40\nfocus_dim diameter\nadd_constraint circle 0 40mm")
-            .unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::Tool(Tool::Circle),
-                Instruction::SetCircleDiameter {
-                    value: "40".to_string()
-                },
-                Instruction::FocusCircleDiameter,
-                Instruction::AddDistanceConstraint {
-                    target: DistanceTarget::CircleDiameter(0),
-                    expression: "40mm".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_plane_tool_and_dims() {
-        let ins = parse("tool plane\nset_dim offset 12\nset_dim angle 45\nfocus_dim angle")
-            .unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::Tool(Tool::ConstructionPlane),
-                Instruction::SetPlaneOffset {
-                    value: "12".to_string()
-                },
-                Instruction::SetPlaneAngle {
-                    value: "45".to_string()
-                },
-                Instruction::FocusPlaneDim(PlaneDim::Angle),
-            ]
-        );
     }
 
     #[test]
@@ -2696,8 +2473,16 @@ mod tests {
             construction: false,
         });
         state.apply(crate::actions::Action::CommitRectangle);
-        let script = "edit_dim width\nset_dim width 25mm\ncommit_dim";
-        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::BeginEditCommittedDim {
+                axis: DimLabelAxis::Width,
+            },
+            Instruction::SetDim {
+                axis: RectAxis::Width,
+                value: "25mm".into(),
+            },
+            Instruction::CommitCommittedDim,
+        ]);
         runner.verbose = false;
         let mut synthetic = SyntheticInput::default();
         while !runner.done {
@@ -2710,32 +2495,6 @@ mod tests {
         }
         assert!((state.doc.rects[0].w - 25.0).abs() < 1e-3);
         assert_eq!(state.doc.rects[0].width_expr.as_deref(), Some("25mm"));
-    }
-
-    #[test]
-    fn parses_edit_dim_and_commit_dim() {
-        let ins = parse("edit_dim width\ncommit_dim").unwrap();
-        assert_eq!(
-            ins,
-            vec![
-                Instruction::BeginEditCommittedDim {
-                    axis: DimLabelAxis::Width
-                },
-                Instruction::CommitCommittedDim,
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_set_dim_label_offset() {
-        let ins = parse("set_dim_label_offset width 48").unwrap();
-        assert_eq!(
-            ins,
-            vec![Instruction::SetDimLabelOffset {
-                axis: DimLabelAxis::Width,
-                offset: 48.0,
-            }]
-        );
     }
 
     #[test]
@@ -2756,7 +2515,10 @@ mod tests {
             construction: false,
         });
         state.apply(crate::actions::Action::CommitRectangle);
-        let mut runner = ScriptRunner::new(parse("set_dim_label_offset width 60").unwrap());
+        let mut runner = ScriptRunner::new(vec![Instruction::SetDimLabelOffset {
+            axis: DimLabelAxis::Width,
+            offset: 60.0,
+        }]);
         while !runner.done {
             runner.tick(
                 &mut state,
@@ -2769,23 +2531,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_set_dim_expression_with_spaces() {
-        let ins = parse("set_dim width 2in + 5mm / 2").unwrap();
-        assert_eq!(
-            ins,
-            vec![Instruction::SetDim {
-                axis: RectAxis::Width,
-                value: "2in + 5mm / 2".to_string(),
-            }]
-        );
-    }
-
-    #[test]
     fn script_set_dim_commit_displays_computed_mm_not_expression() {
         use crate::value::format_length_display;
 
-        let script = "tool rectangle\nset_dim width 2in\nset_dim height 5mm";
-        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::Tool(Tool::Rectangle),
+            Instruction::SetDim {
+                axis: RectAxis::Width,
+                value: "2in".into(),
+            },
+            Instruction::SetDim {
+                axis: RectAxis::Height,
+                value: "5mm".into(),
+            },
+        ]);
         runner.verbose = false;
         let mut state = AppState::default();
         let mut synthetic = SyntheticInput::default();
@@ -2823,8 +2582,12 @@ mod tests {
 
     #[test]
     fn runner_set_dim_expression_evaluates_length() {
-        let script = "tool line\nset_dim length 2in + 5mm / 2";
-        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::Tool(Tool::Line),
+            Instruction::SetLineLength {
+                value: "2in + 5mm / 2".into(),
+            },
+        ]);
         runner.verbose = false;
         let mut state = AppState::default();
         let mut synthetic = SyntheticInput::default();
@@ -2863,8 +2626,19 @@ mod tests {
 
     #[test]
     fn runner_executes_headless_actions() {
-        let script = "new\nbegin_sketch construction_plane 0\ntool rectangle\nset_dim width 50\norbit 10 5\nclear";
-        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        let mut runner = ScriptRunner::new(vec![
+            Instruction::New,
+            Instruction::BeginSketch {
+                face: FaceId::ConstructionPlane(0),
+            },
+            Instruction::Tool(Tool::Rectangle),
+            Instruction::SetDim {
+                axis: RectAxis::Width,
+                value: "50".into(),
+            },
+            Instruction::Orbit { dx: 10.0, dy: 5.0 },
+            Instruction::Clear,
+        ]);
         runner.verbose = false;
         let mut state = AppState::default();
         let mut synthetic = SyntheticInput::default();
@@ -2875,10 +2649,15 @@ mod tests {
             .push(crate::model::Rect::from_local_corners(sketch, 0., 0., 1., 1.));
 
         while !runner.done {
-            runner.tick(&mut state, &mut synthetic, Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 40.0),
-                egui::vec2(960.0, 560.0),
-            )), &egui::Context::default());
+            runner.tick(
+                &mut state,
+                &mut synthetic,
+                Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 40.0),
+                    egui::vec2(960.0, 560.0),
+                )),
+                &egui::Context::default(),
+            );
         }
 
         assert!(state.doc.rects.is_empty());

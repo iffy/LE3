@@ -215,6 +215,30 @@ is the source of truth for the model; geometry is derived from it (see §4.4).
 LE3 has a geometric **constraint solver** supporting both 2D (sketch) and 3D constraints,
 modeled on SolveSpace (https://solvespace.com).
 
+### 6.0 Constraint tool (implemented subset)
+
+- **Tool:** Constraint, shortcut **`C`**. Distance/dimensional constraints remain on the
+  **Dimension** tool (`D`).
+- **Selection:** Sketch points (line endpoints, rectangle corners, circle centres), lines,
+  and rectangle edges are selectable in the viewport. Point picks take precedence near
+  vertices within the point pick tolerance.
+- **Context pane:** While the constraint tool is active, the context pane lists geometric
+  constraint types as buttons (text labels for now; icons later).
+  - **Nothing selected:** every type is shown **disabled**, with a hint beside each button
+    describing what must be selected (e.g. `line, line` for Parallel).
+  - **Something selected:** types that cannot work with the current selection are **hidden**.
+    Remaining buttons are **enabled** when the selection satisfies the constraint, or
+    **disabled** with the still-missing selection roles listed.
+  - **Shortcuts:** enabled buttons are numbered **`1`–`9`** top-to-bottom.
+- **Geometric types (v1):**
+  - **Parallel** — `line`, `line`
+  - **Perpendicular** — `line`, `line`
+  - **Coincident** — `point`, `point` or `point`, `line`
+  - **Vertical** — `line`
+  - **Horizontal** — `line`
+- **Scripting:** `tool constraint`; `select point line 0 start`; `add_geometric_constraint
+  parallel` (uses current selection). Circle tool shortcut is **`O`** (`C` is constraint).
+
 ### 6.1 2D sketch constraints (full set)
 Coincident, point-on-entity, parallel, perpendicular, horizontal, vertical, tangent,
 equal, concentric, symmetric, midpoint, and dimensional constraints (distance, length,

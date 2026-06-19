@@ -23,6 +23,7 @@ pub enum PaletteCommandId {
     ToolLine,
     ToolCircle,
     ToolDimension,
+    ToolConstraint,
     ToolPlane,
     ExitSketch,
     CommitRectangle,
@@ -47,6 +48,7 @@ pub enum PaletteCommandId {
     HidePaneContext,
     ShowPaneViewCube,
     HidePaneViewCube,
+    DeleteSelection,
 }
 
 /// What happens when a palette entry is chosen.
@@ -92,6 +94,9 @@ impl PaletteCommand {
             PaletteCommandId::ToolCircle => PaletteOutcome::Action(Action::SetTool(Tool::Circle)),
             PaletteCommandId::ToolDimension => {
                 PaletteOutcome::Action(Action::SetTool(Tool::Dimension))
+            }
+            PaletteCommandId::ToolConstraint => {
+                PaletteOutcome::Action(Action::SetTool(Tool::Constraint))
             }
             PaletteCommandId::ToolPlane => {
                 PaletteOutcome::Action(Action::SetTool(Tool::ConstructionPlane))
@@ -159,6 +164,9 @@ impl PaletteCommand {
                 pane: Pane::ViewCube,
                 visible: false,
             }),
+            PaletteCommandId::DeleteSelection => {
+                PaletteOutcome::Action(Action::DeleteSelection)
+            }
         }
     }
 }
@@ -205,6 +213,16 @@ pub fn commands_for_state(state: &AppState) -> Vec<PaletteCommand> {
         push(&mut out, cmd);
     }
 
+    if !state.scene_selection.is_empty() {
+        push(
+            &mut out,
+            PaletteCommand::new(
+                PaletteCommandId::DeleteSelection,
+                "Delete Selection",
+                "delete selection remove backspace del",
+            ),
+        );
+    }
     if state.sketch_session.is_some() {
         push(
             &mut out,
@@ -362,6 +380,11 @@ const BASE_COMMANDS: &[PaletteCommand] = &[
         PaletteCommandId::ToolDimension,
         "Dimension Tool",
         "dimension tool distance constraint length",
+    ),
+    PaletteCommand::new(
+        PaletteCommandId::ToolConstraint,
+        "Constraint Tool",
+        "constraint tool parallel perpendicular coincident horizontal vertical",
     ),
     PaletteCommand::new(
         PaletteCommandId::ToolPlane,
@@ -545,6 +568,34 @@ mod tests {
         let filtered = filter_commands("new", &cmds);
         assert!(!filtered.is_empty());
         assert_eq!(filtered[0].0.id, PaletteCommandId::NewDocument);
+    }
+
+    #[test]
+    fn delete_selection_only_when_something_selected() {
+        let mut state = AppState::default();
+        assert!(
+            !commands_for_state(&state)
+                .iter()
+                .any(|c| c.id == PaletteCommandId::DeleteSelection)
+        );
+        state.apply(Action::ClickSceneElement {
+            element: crate::hierarchy::SceneElement::Line(0),
+            additive: false,
+        });
+        assert!(
+            commands_for_state(&state)
+                .iter()
+                .any(|c| c.id == PaletteCommandId::DeleteSelection)
+        );
+        assert_eq!(
+            PaletteCommand::new(
+                PaletteCommandId::DeleteSelection,
+                "Delete Selection",
+                "delete selection remove backspace del",
+            )
+            .outcome(),
+            PaletteOutcome::Action(Action::DeleteSelection)
+        );
     }
 
     #[test]

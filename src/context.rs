@@ -1,9 +1,13 @@
 //! Context pane: union of editable properties for the current selection or draw op.
 
+use crate::actions::Tool;
+use crate::document_health::{health_status_label, selection_frozen_summary, DocumentHealth, HealthStatus};
+use crate::geometric_constraints::{constraint_pane_rows, ConstraintPaneRow};
 use crate::hierarchy::SceneElement;
 use crate::model::{Document, RectEdge};
 use crate::names::{element_name, single_nameable_from_selection};
 use crate::selection::SceneSelection;
+use crate::icons::icon_for_constraint;
 use crate::shortcuts;
 use eframe::egui::{self, Key, TextEdit};
 
@@ -13,6 +17,7 @@ pub const PANE_TITLE: &str = "Context";
 pub struct ContextInput<'a> {
     pub doc: &'a Document,
     pub selection: &'a SceneSelection,
+    pub tool: Tool,
     pub draw_rect_construction: Option<bool>,
     pub draw_line_construction: Option<bool>,
     pub draw_circle_construction: Option<bool>,
@@ -31,6 +36,7 @@ pub enum TriState {
 pub struct ContextPaneContent {
     pub name: Option<NameControl>,
     pub construction: Option<ConstructionControl>,
+    pub constraints: Option<Vec<ConstraintPaneRow>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +68,7 @@ pub fn context_pane_content(input: &ContextInput<'_>) -> ContextPaneContent {
                 value: tri_state_from_bool(construction),
                 target_count: 1,
             }),
+            constraints: None,
         };
     }
     if let Some(construction) = input.draw_line_construction {
@@ -71,6 +78,7 @@ pub fn context_pane_content(input: &ContextInput<'_>) -> ContextPaneContent {
                 value: tri_state_from_bool(construction),
                 target_count: 1,
             }),
+            constraints: None,
         };
     }
     if let Some(construction) = input.draw_circle_construction {
@@ -80,16 +88,20 @@ pub fn context_pane_content(input: &ContextInput<'_>) -> ContextPaneContent {
                 value: tri_state_from_bool(construction),
                 target_count: 1,
             }),
+            constraints: None,
         };
     }
 
     let targets = construction_targets_from_selection(input.selection);
+    let constraints = (input.tool == Tool::Constraint)
+        .then(|| constraint_pane_rows(input.selection));
     ContextPaneContent {
         name,
         construction: (!targets.is_empty()).then(|| ConstructionControl {
             value: construction_tri_state(input.doc, &targets),
             target_count: targets.len(),
         }),
+        constraints,
     }
 }
 
@@ -260,43 +272,117 @@ pub fn show_pane(
     ctx: &egui::Context,
     content: &ContextPaneContent,
     pane_state: &mut ContextPaneState,
+    health: &DocumentHealth,
+    selection: &SceneSelection,
     on_name_committed: &mut impl FnMut(SceneElement, String),
     on_construction_changed: &mut impl FnMut(bool),
+    on_constraint_clicked: &mut impl FnMut(crate::geometric_constraints::GeometricConstraintType),
 ) {
     ui.heading(PANE_TITLE);
     ui.separator();
 
+    let frozen = selection_frozen_summary(health, selection);
+    if let Some((status, reason)) = &frozen {
+        let color = match status {
+            HealthStatus::Invalid => egui::Color32::from_rgb(220, 80, 80),
+            HealthStatus::Unstable => egui::Color32::from_rgb(255, 180, 60),
+            HealthStatus::Healthy => egui::Color32::from_gray(140),
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "{} — editing frozen",
+                health_status_label(*status).to_uppercase()
+            ))
+            .color(color)
+            .strong(),
+        );
+        ui.label(
+            egui::RichText::new(reason.as_str())
+                .color(egui::Color32::from_gray(140))
+                .size(11.0),
+        );
+        ui.add_space(4.0);
+    }
+
+    let controls_enabled = frozen.is_none();
     let mut any_control = false;
 
     if let Some(control) = &content.name {
         any_control = true;
         ui.label(shortcuts::compact_label("Name", Some(shortcuts::FOCUS_ELEMENT_NAME)));
         let id = egui::Id::new(("element_name", control.element));
-        let output = TextEdit::singleline(&mut pane_state.name_draft)
-            .id(id)
-            .desired_width(f32::INFINITY)
-            .show(ui);
-        let response = &output.response;
-        let should_select_all = pane_state.focus_name_field;
-        if should_select_all {
-            response.request_focus();
-        }
-        if (should_select_all && response.has_focus()) || response.gained_focus() {
-            let len = pane_state.name_draft.chars().count();
-            let mut state = output.state;
-            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                egui::text::CCursor::default(),
-                egui::text::CCursor::new(len),
-            )));
-            state.store(ctx, id);
-            pane_state.focus_name_field = false;
-        }
-        let enter = ui.input(|i| i.key_pressed(Key::Enter));
-        if (enter && response.has_focus()) || response.lost_focus() {
-            on_name_committed(control.element, pane_state.name_draft.clone());
-            if enter && response.has_focus() {
-                ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+        let mut committed = false;
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            let output = TextEdit::singleline(&mut pane_state.name_draft)
+                .id(id)
+                .desired_width(f32::INFINITY)
+                .show(ui);
+            let response = &output.response;
+            let should_select_all = pane_state.focus_name_field;
+            if should_select_all {
+                response.request_focus();
             }
+            if (should_select_all && response.has_focus()) || response.gained_focus() {
+                let len = pane_state.name_draft.chars().count();
+                let mut state = output.state;
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::default(),
+                    egui::text::CCursor::new(len),
+                )));
+                state.store(ctx, id);
+                pane_state.focus_name_field = false;
+            }
+            let enter = ui.input(|i| i.key_pressed(Key::Enter));
+            if (enter && response.has_focus()) || response.lost_focus() {
+                committed = true;
+                if enter && response.has_focus() {
+                    ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+                }
+            }
+        });
+        if committed {
+            on_name_committed(control.element, pane_state.name_draft.clone());
+        }
+        ui.add_space(4.0);
+    }
+
+    if let Some(rows) = &content.constraints {
+        any_control = true;
+        ui.label("Constraints");
+        for row in rows {
+            ui.horizontal(|ui| {
+                let row_w = ui.available_width();
+                let enabled = controls_enabled && row.enabled;
+                let response = ui
+                    .add_enabled(
+                        enabled,
+                        egui::ImageButton::new(crate::icons::sized_texture(
+                            ui.ctx(),
+                            icon_for_constraint(row.kind),
+                        ))
+                        .frame(true),
+                    )
+                    .on_hover_text(row.kind.label());
+                if let Some(shortcut) = row.shortcut {
+                    shortcuts::show_right_aligned_shortcut(
+                        ui,
+                        row_w,
+                        response.rect.width(),
+                        response.rect.height(),
+                        shortcuts::constraint_number_hint(shortcut),
+                    );
+                }
+                if enabled && response.clicked() {
+                    on_constraint_clicked(row.kind);
+                }
+                if !row.enabled && !row.missing.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("needs {}", row.missing.join(", ")))
+                            .color(egui::Color32::from_gray(140))
+                            .size(11.0),
+                    );
+                }
+            });
         }
         ui.add_space(4.0);
     }
@@ -308,16 +394,18 @@ pub fn show_pane(
             _ => "Construction",
         };
         let mut checked = control.value == TriState::On;
-        if shortcuts::checkbox_with_shortcut(
-            ui,
-            &mut checked,
-            label,
-            Some(shortcuts::TOGGLE_CONSTRUCTION),
-        )
-        .changed()
-        {
-            on_construction_changed(checked);
-        }
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            if shortcuts::checkbox_with_shortcut(
+                ui,
+                &mut checked,
+                label,
+                Some(shortcuts::TOGGLE_CONSTRUCTION),
+            )
+            .changed()
+            {
+                on_construction_changed(checked);
+            }
+        });
         if control.target_count > 1 {
             ui.label(
                 egui::RichText::new(format!("{} items", control.target_count))
@@ -346,6 +434,7 @@ mod tests {
         ContextInput {
             doc,
             selection,
+            tool: Tool::Select,
             draw_rect_construction: None,
             draw_line_construction: None,
             draw_circle_construction: None,
@@ -360,6 +449,7 @@ mod tests {
             ContextPaneContent {
                 name: None,
                 construction: None,
+                constraints: None,
             }
         );
     }
@@ -381,6 +471,7 @@ mod tests {
                     value: TriState::Off,
                     target_count: 2,
                 }),
+                constraints: None,
             }
         );
     }
@@ -413,6 +504,7 @@ mod tests {
         let content = context_pane_content(&ContextInput {
             doc: &doc,
             selection: &SceneSelection::default(),
+            tool: Tool::Select,
             draw_rect_construction: Some(true),
             draw_line_construction: None,
             draw_circle_construction: None,
@@ -425,6 +517,7 @@ mod tests {
                     value: TriState::On,
                     target_count: 1,
                 }),
+                constraints: None,
             }
         );
     }
@@ -446,6 +539,7 @@ mod tests {
                     value: TriState::Off,
                     target_count: 1,
                 }),
+                constraints: None,
             }
         );
     }
@@ -456,6 +550,7 @@ mod tests {
         let content = context_pane_content(&ContextInput {
             doc: &doc,
             selection: &SceneSelection::default(),
+            tool: Tool::Select,
             draw_rect_construction: Some(false),
             draw_line_construction: None,
             draw_circle_construction: None,
@@ -476,6 +571,7 @@ mod tests {
         let content = context_pane_content(&ContextInput {
             doc: &doc,
             selection: &sel,
+            tool: Tool::Select,
             draw_rect_construction: Some(true),
             draw_line_construction: None,
             draw_circle_construction: None,
@@ -490,7 +586,25 @@ mod tests {
                     value: TriState::On,
                     target_count: 1,
                 }),
+                constraints: None,
             }
+        );
+    }
+
+    #[test]
+    fn constraint_tool_shows_constraint_rows() {
+        let doc = Document::default();
+        let content = context_pane_content(&ContextInput {
+            doc: &doc,
+            selection: &SceneSelection::default(),
+            tool: Tool::Constraint,
+            draw_rect_construction: None,
+            draw_line_construction: None,
+            draw_circle_construction: None,
+        });
+        assert_eq!(
+            content.constraints.as_ref().map(|rows| rows.len()),
+            Some(crate::geometric_constraints::GeometricConstraintType::ALL.len())
         );
     }
 

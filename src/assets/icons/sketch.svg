@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- pencil body, tip at bottom-left -->
+  <path d="M5 27 L11 25 L25 11 L21 7 L7 21 Z" />
+  <!-- band separating the sharpened tip -->
+  <line x1="11" y1="25" x2="7" y2="21" />
+</svg>
