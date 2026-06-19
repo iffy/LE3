@@ -12,6 +12,7 @@
 
 mod actions;
 mod camera;
+mod command_palette;
 mod construction;
 mod dimensions;
 mod face;
@@ -30,6 +31,7 @@ use actions::{
     Action, AppState, CreatingLine, CreatingRect, DimLabelTarget, Pane, RectAxis, SketchSession,
     Tool,
 };
+use command_palette::{commands_for_state, filter_commands, show_palette, PaletteOutcome};
 use hierarchy::SceneElement;
 use construction::{
     angle_from_axis_plane_hit, axis_angle_handle, axis_gizmo_hit, axis_normal,
@@ -56,7 +58,7 @@ use glam::Vec3;
 use model::ConstructionPlane;
 use script::{ScriptRunner, SyntheticInput};
 use std::path::Path;
-use value::{eval_length_mm, format_length_display, shows_computed_length};
+use value::{computed_length_in_doc, format_length_display, shows_computed_length_in_doc};
 
 fn main() -> eframe::Result<()> {
     let script_opts = script::parse_args(std::env::args());
@@ -218,7 +220,29 @@ impl App {
             .sync_pane_checks(|pane| self.state.panes.is_visible(pane));
     }
 
+    fn dispatch_palette_outcome(&mut self, outcome: PaletteOutcome) {
+        match outcome {
+            PaletteOutcome::Action(action) => {
+                self.state.apply(action);
+            }
+            PaletteOutcome::OpenFile => self.open(),
+            PaletteOutcome::SaveFile => self.save(),
+            PaletteOutcome::SaveFileAs => self.save_as(),
+        }
+        self.state.command_palette.close_palette();
+    }
+
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| {
+            i.key_pressed(egui::Key::P) && (i.modifiers.command || i.modifiers.ctrl)
+        }) {
+            self.state.apply(Action::ToggleCommandPalette);
+        }
+
+        if self.state.command_palette.open {
+            return;
+        }
+
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.state.apply(Action::CancelOperation);
         }
@@ -440,6 +464,26 @@ impl eframe::App for App {
                 }
             });
         });
+
+        if self.state.command_palette.open {
+            let commands = commands_for_state(&self.state);
+            let matches = filter_commands(&self.state.command_palette.query, &commands);
+            let mut outcome = None;
+            egui::TopBottomPanel::bottom("command_palette")
+                .resizable(false)
+                .exact_height(280.0)
+                .frame(
+                    egui::Frame::default()
+                        .fill(theme::palette_console_fill())
+                        .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
+                )
+                .show(ctx, |ui| {
+                    outcome = show_palette(ui, &mut self.state.command_palette, &matches);
+                });
+            if let Some(chosen) = outcome {
+                self.dispatch_palette_outcome(chosen);
+            }
+        }
 
         egui::TopBottomPanel::bottom("status")
             .frame(theme::panel_frame())
@@ -821,6 +865,7 @@ fn show_sketch_dimension_field(
     ctx: &egui::Context,
     id: egui::Id,
     text: &mut String,
+    doc: &model::Document,
     is_focus_target: bool,
     pending_focus: &mut bool,
     user_edited: bool,
@@ -843,7 +888,8 @@ fn show_sketch_dimension_field(
         .inner_margin(egui::Margin::symmetric(5.0, 3.0))
         .rounding(3.0);
 
-    let computed = eval_length_mm(text).filter(|_| shows_computed_length(text));
+    let computed =
+        computed_length_in_doc(text, doc).filter(|_| shows_computed_length_in_doc(text, doc));
     let text_width = dim_input_text_width(text);
 
     let output = frame
@@ -1814,6 +1860,7 @@ impl App {
                             ctx,
                             id_w,
                             &mut cr.texts[0],
+                            &self.state.doc,
                             cr.focused == 0,
                             &mut cr.pending_focus,
                             cr.user_edited[0],
@@ -1831,6 +1878,7 @@ impl App {
                             ctx,
                             id_h,
                             &mut cr.texts[1],
+                            &self.state.doc,
                             cr.focused == 1,
                             &mut cr.pending_focus,
                             cr.user_edited[1],
@@ -1892,6 +1940,7 @@ impl App {
                             ctx,
                             id_len,
                             &mut cl.text,
+                            &self.state.doc,
                             true,
                             &mut cl.pending_focus,
                             cl.user_edited,
@@ -1939,6 +1988,7 @@ impl App {
                             ctx,
                             id_offset,
                             &mut cp.offset_text,
+                            &self.state.doc,
                             cp.focused == PlaneDim::Offset,
                             &mut cp.pending_focus,
                             cp.user_edited_offset,
@@ -1957,6 +2007,7 @@ impl App {
                                 ctx,
                                 id_angle,
                                 &mut cp.angle_text,
+                                &self.state.doc,
                                 cp.focused == PlaneDim::Angle,
                                 &mut cp.pending_focus,
                                 cp.user_edited_angle,

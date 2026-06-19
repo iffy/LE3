@@ -5,6 +5,9 @@ use eframe::egui::{self, style::WidgetVisuals, Color32, Rounding, Stroke, Theme,
 /// Viewport background (`main::col::BG`).
 pub const VIEWPORT_BG: Color32 = Color32::from_gray(28);
 
+/// Command palette console background.
+const PALETTE_CONSOLE_BG: Color32 = Color32::from_rgb(22, 24, 30);
+
 /// Slightly lifted surface for chrome panels (toolbar, hierarchy, status).
 const PANEL_BG: Color32 = Color32::from_gray(32);
 
@@ -96,6 +99,11 @@ pub fn visuals() -> egui::Visuals {
     v.error_fg_color = Color32::from_rgb(220, 90, 90);
 
     v
+}
+
+/// Command palette console fill.
+pub fn palette_console_fill() -> Color32 {
+    PALETTE_CONSOLE_BG
 }
 
 /// Panel chrome frame (toolbar, status bar, side panes).

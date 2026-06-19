@@ -1,7 +1,7 @@
 //! Architectural-style linear dimension graphics for sketch edit mode.
 
 use eframe::egui::epaint::{Mesh, Shape, TextShape, Vertex};
-use eframe::egui::{self, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 use glam::Vec3;
 
 pub const OFFSET: f32 = 20.0;
@@ -89,26 +89,6 @@ pub fn outward_perpendicular(pa: Pos2, pb: Pos2, interior: Pos2) -> Vec2 {
     }
 }
 
-/// Preferred label side for a bare segment (matches live line-dimension placement).
-#[cfg(test)]
-pub fn preferred_outward_perpendicular(pa: Pos2, pb: Pos2) -> Vec2 {
-    let mid = pa.lerp(pb, 0.5);
-    let prefer = egui::vec2(-1.0, -1.0).normalized();
-    let delta = pb - pa;
-    if delta.length_sq() < 1e-4 {
-        return -prefer;
-    }
-    let dir = delta.normalized();
-    let perp_a = Vec2::new(-dir.y, dir.x);
-    let perp_b = Vec2::new(dir.y, -dir.x);
-    let outward = if perp_a.dot(prefer) >= perp_b.dot(prefer) {
-        perp_a
-    } else {
-        perp_b
-    };
-    outward_perpendicular(pa, pb, mid - outward)
-}
-
 #[cfg(test)]
 pub fn linear_dimension_geom(
     pa: Pos2,
@@ -132,13 +112,6 @@ pub fn linear_dimension_geom(
         along,
         outward,
     }
-}
-
-#[cfg(test)]
-pub fn line_dimension_geom(pa: Pos2, pb: Pos2, offset: f32) -> LinearDimensionGeom {
-    let outward = preferred_outward_perpendicular(pa, pb);
-    let mid = pa.lerp(pb, 0.5);
-    linear_dimension_geom(pa, pb, mid - outward, offset)
 }
 
 /// Outward perpendicular in sketch (u, v) coordinates.

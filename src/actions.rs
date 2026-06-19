@@ -22,8 +22,8 @@ use crate::view_cube::{self, CubeCornerId, CubeEdgeId};
 use crate::model::{ConstructionPlane, Document, FaceId, Line, Rect, ShapeKind};
 use crate::face::SketchFrame;
 use crate::parameters::{
-    add_parameter, delete_parameter, set_parameter_expression, set_parameter_name,
-    ParametersPaneState,
+    add_parameter, delete_parameter, recompute_document_geometry, set_parameter_expression,
+    set_parameter_name, ParametersPaneState,
 };
 use crate::value::parse_positive_length_or_in_doc;
 use eframe::egui;
@@ -90,8 +90,16 @@ impl CreatingRect {
         let (mu, mv) = world_to_local(frame, self.last_mouse);
         let du = mu - ou;
         let dv = mv - ov;
-        let w = parse_positive_length_or_in_doc(&self.texts[0], doc, du.abs());
-        let h = parse_positive_length_or_in_doc(&self.texts[1], doc, dv.abs());
+        let w = if self.user_edited[0] {
+            parse_positive_length_or_in_doc(&self.texts[0], doc, du.abs())
+        } else {
+            du.abs()
+        };
+        let h = if self.user_edited[1] {
+            parse_positive_length_or_in_doc(&self.texts[1], doc, dv.abs())
+        } else {
+            dv.abs()
+        };
         let su = if du < 0.0 { -1.0 } else { 1.0 };
         let sv = if dv < 0.0 { -1.0 } else { 1.0 };
         crate::face::local_to_world(frame, ou + su * w, ov + sv * h)
@@ -121,7 +129,11 @@ impl CreatingLine {
         let du = mu - ou;
         let dv = mv - ov;
         let dist = (du * du + dv * dv).sqrt();
-        let len = parse_positive_length_or_in_doc(&self.text, doc, dist);
+        let len = if self.user_edited {
+            parse_positive_length_or_in_doc(&self.text, doc, dist)
+        } else {
+            dist
+        };
         if dist < 1e-6 {
             return crate::face::local_to_world(frame, ou + len, ov);
         }
@@ -256,6 +268,8 @@ pub enum Action {
     CommitParameterName { index: usize, name: String },
     CommitParameterExpression { index: usize, expression: String },
     DeleteParameter { index: usize },
+    SetCommandPaletteOpen { open: bool },
+    ToggleCommandPalette,
 }
 
 /// A toggleable UI pane (SPEC §11.1).
@@ -427,6 +441,35 @@ pub struct SketchSession {
     pub sketch: SketchId,
 }
 
+/// Transient UI state for the command palette (SPEC §11.2).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CommandPaletteState {
+    pub open: bool,
+    pub query: String,
+    pub selected: usize,
+    pub request_focus: bool,
+    /// Previous query text; used to reset selection when the filter changes.
+    pub prior_query: String,
+}
+
+impl CommandPaletteState {
+    pub fn open_palette(&mut self) {
+        self.open = true;
+        self.query.clear();
+        self.prior_query.clear();
+        self.selected = 0;
+        self.request_focus = true;
+    }
+
+    pub fn close_palette(&mut self) {
+        self.open = false;
+        self.query.clear();
+        self.prior_query.clear();
+        self.selected = 0;
+        self.request_focus = false;
+    }
+}
+
 /// Application state that actions mutate.
 pub struct AppState {
     pub doc: Document,
@@ -439,6 +482,7 @@ pub struct AppState {
     pub creating_plane: Option<CreatingConstructionPlane>,
     pub panes: PaneVisibility,
     pub parameters_pane: ParametersPaneState,
+    pub command_palette: CommandPaletteState,
     pub element_visibility: ElementVisibility,
     pub status: String,
 }
@@ -456,6 +500,7 @@ impl Default for AppState {
             creating_plane: None,
             panes: PaneVisibility::default(),
             parameters_pane: ParametersPaneState::default(),
+            command_palette: CommandPaletteState::default(),
             element_visibility: ElementVisibility::default(),
             status: String::new(),
         }
@@ -501,7 +546,11 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::Open { path } => match crate::storage::open(&path) {
-                Ok(doc) => {
+                Ok(mut doc) => {
+                    if let Err(e) = recompute_document_geometry(&mut doc) {
+                        self.status = format!("Open failed: {e}");
+                        return ActionResult::Err(e);
+                    }
                     let n_rects = doc.rects.len();
                     let n_lines = doc.lines.len();
                     self.doc = doc;
@@ -678,9 +727,17 @@ impl AppState {
                 rect.width_expr = cr.user_edited[0].then(|| cr.texts[0].clone());
                 rect.height_expr = cr.user_edited[1].then(|| cr.texts[1].clone());
                 if rect.w > 0.5 && rect.h > 0.5 {
-                    let (w, h) = (rect.w, rect.h);
                     self.doc.rects.push(rect);
                     self.doc.shape_order.push(ShapeKind::Rect);
+                    if let Err(e) = recompute_document_geometry(&mut self.doc) {
+                        self.doc.rects.pop();
+                        self.doc.shape_order.pop();
+                        self.creating_rect = Some(cr);
+                        self.status = e.clone();
+                        return ActionResult::Err(e);
+                    }
+                    let rect = self.doc.rects.last().unwrap();
+                    let (w, h) = (rect.w, rect.h);
                     self.status = format!("Added rectangle ({w:.1} × {h:.1} mm)");
                     ActionResult::Ok
                 } else {
@@ -723,9 +780,16 @@ impl AppState {
                 line.length_locked = cl.user_edited;
                 line.length_expr = cl.user_edited.then(|| cl.text.clone());
                 if line.length() > 0.5 {
-                    let len = line.length();
                     self.doc.lines.push(line);
                     self.doc.shape_order.push(ShapeKind::Line);
+                    if let Err(e) = recompute_document_geometry(&mut self.doc) {
+                        self.doc.lines.pop();
+                        self.doc.shape_order.pop();
+                        self.creating_line = Some(cl);
+                        self.status = e.clone();
+                        return ActionResult::Err(e);
+                    }
+                    let len = self.doc.lines.last().unwrap().length();
                     self.status = format!("Added line ({:.1} mm)", len);
                     ActionResult::Ok
                 } else {
@@ -1008,6 +1072,24 @@ impl AppState {
                         ActionResult::Err(e)
                     }
                 }
+            }
+            Action::SetCommandPaletteOpen { open } => {
+                if open {
+                    self.command_palette.open_palette();
+                    self.status = "Command palette".to_string();
+                } else {
+                    self.command_palette.close_palette();
+                }
+                ActionResult::Ok
+            }
+            Action::ToggleCommandPalette => {
+                if self.command_palette.open {
+                    self.command_palette.close_palette();
+                } else {
+                    self.command_palette.open_palette();
+                    self.status = "Command palette".to_string();
+                }
+                ActionResult::Ok
             }
             Action::SetPaneVisible { pane, visible } => {
                 self.panes.set(pane, visible);
@@ -1384,6 +1466,47 @@ mod tests {
         let rect = &state.doc.rects[0];
         assert!(!rect.width_locked);
         assert!(!rect.height_locked);
+    }
+
+    #[test]
+    fn commit_rectangle_with_parameter_reference() {
+        let mut state = AppState::default();
+        add_parameter(&mut state.doc, "A".to_string(), "10mm".to_string()).unwrap();
+        begin_default_sketch(&mut state);
+        state.creating_rect = Some(CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["A".to_string(), "5".to_string()],
+            focused: 0,
+            last_mouse: Vec3::new(100.0, 5.0, 0.0),
+            user_edited: [true, true],
+            pending_focus: false,
+        });
+        state.apply(Action::CommitRectangle);
+        let rect = &state.doc.rects[0];
+        assert!((rect.w - 10.0).abs() < 1e-3);
+        assert_eq!(rect.width_expr.as_deref(), Some("A"));
+
+        set_parameter_expression(&mut state.doc, 0, "20mm".to_string()).unwrap();
+        assert!((state.doc.rects[0].w - 20.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn rect_end_point_uses_parameter_reference() {
+        let mut doc = Document::default();
+        add_parameter(&mut doc, "A".to_string(), "10mm".to_string()).unwrap();
+        let cr = CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["A".to_string(), "".to_string()],
+            focused: 0,
+            last_mouse: Vec3::new(100.0, 4.0, 0.0),
+            user_edited: [true, false],
+            pending_focus: false,
+        };
+        let frame = xy_frame();
+        let end = cr.end_point(&frame, &doc);
+        assert!((end.x - 10.0).abs() < 1e-3);
+        // Height is unconstrained, so it follows the mouse.
+        assert!((end.y - 4.0).abs() < 1e-3);
     }
 
     #[test]
@@ -1892,6 +2015,16 @@ mod tests {
         assert!(!state.panes.is_visible(Pane::ViewCube));
         state.apply(Action::TogglePane(Pane::ViewCube));
         assert!(state.panes.is_visible(Pane::ViewCube));
+    }
+
+    #[test]
+    fn toggle_command_palette_opens_and_closes() {
+        let mut state = AppState::default();
+        assert!(!state.command_palette.open);
+        state.apply(Action::ToggleCommandPalette);
+        assert!(state.command_palette.open);
+        state.apply(Action::SetCommandPaletteOpen { open: false });
+        assert!(!state.command_palette.open);
     }
 
     #[test]

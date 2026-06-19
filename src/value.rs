@@ -88,6 +88,15 @@ fn identifier_at(text: &str, start: usize) -> Option<(&str, usize)> {
     Some((&text[start..start + len], len))
 }
 
+/// Evaluated length for display above a dimension field, using document parameters.
+pub fn computed_length_in_doc(text: &str, doc: &Document) -> Option<f32> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    eval_length_mm_in_doc(t, doc).or_else(|| eval_length_mm(t))
+}
+
 /// Whether the text uses expression syntax (operators, parentheses, or units) and
 /// should show a computed value above the input field.
 pub fn shows_computed_length(text: &str) -> bool {
@@ -103,6 +112,21 @@ pub fn shows_computed_length(text: &str) -> bool {
         return true;
     }
     has_length_unit_suffix(t)
+}
+
+/// Whether to show a computed value above a dimension field in the document context.
+pub fn shows_computed_length_in_doc(text: &str, doc: &Document) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if shows_computed_length(t) {
+        return true;
+    }
+    if is_valid_parameter_name(t) {
+        return eval_length_mm_in_doc(t, doc).is_some();
+    }
+    computed_length_in_doc(t, doc).is_some()
 }
 
 /// Format a length in millimetres for display above an expression field.
@@ -125,18 +149,10 @@ pub fn parse_length_or_in_doc(text: &str, doc: &Document, fallback: f32) -> f32 
         .unwrap_or(fallback)
 }
 
-/// Parse a positive length expression, falling back when empty/invalid/non-positive.
-pub fn parse_positive_length_or(text: &str, fallback: f32) -> f32 {
-    eval_length_mm(text)
-        .filter(|v| *v > 0.0)
-        .unwrap_or(fallback)
-}
-
 /// Parse a positive length expression with parameters.
 pub fn parse_positive_length_or_in_doc(text: &str, doc: &Document, fallback: f32) -> f32 {
-    eval_length_mm_in_doc(text, doc)
-        .filter(|v| *v > 0.0)
-        .unwrap_or(fallback)
+    let v = parse_length_or_in_doc(text, doc, fallback);
+    if v > 0.0 { v } else { fallback }
 }
 
 fn has_length_unit_suffix(text: &str) -> bool {
@@ -432,9 +448,10 @@ mod tests {
 
     #[test]
     fn parse_positive_length_or_rejects_non_positive() {
-        assert!((parse_positive_length_or("0", 9.0) - 9.0).abs() < 1e-4);
-        assert!((parse_positive_length_or("-3", 9.0) - 9.0).abs() < 1e-4);
-        assert!((parse_positive_length_or("2in", 9.0) - 50.8).abs() < 1e-3);
+        let doc = Document::default();
+        assert!((parse_positive_length_or_in_doc("0", &doc, 9.0) - 9.0).abs() < 1e-4);
+        assert!((parse_positive_length_or_in_doc("-3", &doc, 9.0) - 9.0).abs() < 1e-4);
+        assert!((parse_positive_length_or_in_doc("2in", &doc, 9.0) - 50.8).abs() < 1e-3);
     }
 
     #[test]
@@ -450,6 +467,17 @@ mod tests {
         assert!((v - 53.3).abs() < 1e-3);
         // Stored text is preserved by callers; re-evaluating yields the same value.
         assert!((eval_length_mm(expr).unwrap() - v).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shows_computed_length_in_doc_for_parameter_name() {
+        let mut doc = Document::default();
+        doc.parameters.push(crate::model::Parameter {
+            name: "A".to_string(),
+            expression: "10mm".to_string(),
+        });
+        assert!(shows_computed_length_in_doc("A", &doc));
+        assert_eq!(computed_length_in_doc("A", &doc), Some(10.0));
     }
 
     #[test]

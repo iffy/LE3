@@ -1,6 +1,6 @@
 //! Document parameters: named length expressions that drive sketch dimensions.
 
-use crate::model::{Document, Parameter, Rect};
+use crate::model::{Document, Parameter};
 use crate::value::{eval_length_mm_in_doc, is_valid_parameter_name, substitute_parameter_name};
 
 pub const PANE_TITLE: &str = "Parameters";
@@ -19,17 +19,25 @@ pub struct ParametersPaneState {
     pub draft: String,
     pub new_name: String,
     pub new_value: String,
+    /// Focus the new-parameter name field on the next frame.
+    pub focus_new_name: bool,
+    /// Focus the new-parameter value field on the next frame.
+    pub focus_new_value: bool,
+    /// Focus the active edit cell once after [`begin_edit`].
+    pub editing_focus: bool,
 }
 
 impl ParametersPaneState {
     pub fn begin_edit(&mut self, cell: ParameterEditCell, current: &str) {
         self.editing = Some(cell);
         self.draft = current.to_string();
+        self.editing_focus = true;
     }
 
     pub fn cancel_edit(&mut self) {
         self.editing = None;
         self.draft.clear();
+        self.editing_focus = false;
     }
 }
 
@@ -40,9 +48,7 @@ pub fn parameter_index_by_name(doc: &Document, name: &str) -> Option<usize> {
 }
 
 pub fn duplicate_parameter_name(doc: &Document, name: &str, except: Option<usize>) -> bool {
-    doc.parameters.iter().enumerate().any(|(i, p)| {
-        except.is_some_and(|e| e == i) == false && p.name == name
-    })
+    parameter_index_by_name(doc, name).is_some_and(|i| except != Some(i))
 }
 
 /// Rename `old` to `new` in every expression that references it.
@@ -241,9 +247,13 @@ pub fn show_pane(
                         if editing_name {
                             let response = ui.add(
                                 TextEdit::singleline(&mut state.draft)
+                                    .id(ui.id().with("name").with(index))
                                     .desired_width(f32::INFINITY),
                             );
-                            response.request_focus();
+                            if state.editing_focus {
+                                response.request_focus();
+                                state.editing_focus = false;
+                            }
                             if enter && response.has_focus() {
                                 apply(crate::actions::Action::CommitParameterName {
                                     index,
@@ -263,9 +273,13 @@ pub fn show_pane(
                         if editing_value {
                             let response = ui.add(
                                 TextEdit::singleline(&mut state.draft)
+                                    .id(ui.id().with("value").with(index))
                                     .desired_width(f32::INFINITY),
                             );
-                            response.request_focus();
+                            if state.editing_focus {
+                                response.request_focus();
+                                state.editing_focus = false;
+                            }
                             if enter && response.has_focus() {
                                 apply(crate::actions::Action::CommitParameterExpression {
                                     index,
@@ -289,31 +303,54 @@ pub fn show_pane(
                 let mut commit_new = false;
                 let name_response = ui.add(
                     TextEdit::singleline(&mut state.new_name)
+                        .id(ui.id().with("new_param_name"))
                         .hint_text("name")
                         .desired_width(f32::INFINITY),
                 );
+                if state.focus_new_name {
+                    name_response.request_focus();
+                    state.focus_new_name = false;
+                }
                 let value_response = ui.add(
                     TextEdit::singleline(&mut state.new_value)
+                        .id(ui.id().with("new_param_value"))
                         .hint_text("value")
                         .desired_width(f32::INFINITY),
                 );
-                if enter
-                    && (value_response.has_focus() || name_response.has_focus())
+                if state.focus_new_value {
+                    value_response.request_focus();
+                    state.focus_new_value = false;
+                }
+
+                if name_response.gained_focus() || value_response.gained_focus() {
+                    state.cancel_edit();
+                }
+
+                if enter && name_response.has_focus() {
+                    if !state.new_name.trim().is_empty() && state.new_value.trim().is_empty() {
+                        state.focus_new_value = true;
+                    } else if !state.new_name.trim().is_empty()
+                        && !state.new_value.trim().is_empty()
+                    {
+                        commit_new = true;
+                    }
+                } else if enter
+                    && value_response.has_focus()
+                    && !state.new_name.trim().is_empty()
+                    && !state.new_value.trim().is_empty()
                 {
                     commit_new = true;
                 }
                 ui.end_row();
 
-                if commit_new
-                    && !state.new_name.trim().is_empty()
-                    && !state.new_value.trim().is_empty()
-                {
+                if commit_new {
                     apply(crate::actions::Action::AddParameter {
                         name: state.new_name.clone(),
                         expression: state.new_value.clone(),
                     });
                     state.new_name.clear();
                     state.new_value.clear();
+                    state.focus_new_name = true;
                 }
             });
     });
@@ -323,11 +360,22 @@ pub fn show_pane(
 mod tests {
     use super::*;
     use crate::model::{Document, FaceId, ShapeKind};
+    use crate::Rect;
 
     fn doc_with_param_a() -> Document {
         let mut doc = Document::default();
         add_parameter(&mut doc, "A".to_string(), "5mm".to_string()).unwrap();
         doc
+    }
+
+    #[test]
+    fn add_multiple_parameters_in_sequence() {
+        let mut doc = Document::default();
+        add_parameter(&mut doc, "A".to_string(), "5mm".to_string()).unwrap();
+        add_parameter(&mut doc, "B".to_string(), "A + 5in".to_string()).unwrap();
+        add_parameter(&mut doc, "width".to_string(), "2 * B".to_string()).unwrap();
+        assert_eq!(doc.parameters.len(), 3);
+        assert_eq!(doc.parameters[2].expression, "2 * B");
     }
 
     #[test]

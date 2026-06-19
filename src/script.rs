@@ -6,6 +6,7 @@
 use crate::actions::{
     dim_label_target_in_sketch, Action, AppState, DimLabelAxis, Pane, RectAxis, Tool,
 };
+use crate::command_palette::{best_match, commands_for_state, PaletteOutcome};
 use crate::hierarchy::SceneElement;
 use crate::model::{FaceId, SketchId};
 use crate::construction::PlaneDim;
@@ -60,6 +61,10 @@ pub enum Instruction {
     SetParameterName { index: usize, name: String },
     SetParameterExpression { index: usize, expression: String },
     DeleteParameter { index: usize },
+    /// Show/hide the command palette. `None` toggles.
+    SetCommandPalette { open: Option<bool> },
+    /// Run the best-matching palette command for a query.
+    RunPaletteCommand { query: String },
 
     // Synthetic input (viewport-local pixel coordinates)
     Move { x: f32, y: f32 },
@@ -177,6 +182,15 @@ impl Instruction {
                 format!("parameter value {index} {expression}")
             }
             Instruction::DeleteParameter { index } => format!("parameter delete {index}"),
+            Instruction::SetCommandPalette { open } => {
+                let verb = match open {
+                    Some(true) => "show",
+                    Some(false) => "hide",
+                    None => "toggle",
+                };
+                format!("palette {verb}")
+            }
+            Instruction::RunPaletteCommand { query } => format!("palette run {query}"),
             Instruction::Move { x, y } => format!("move {x} {y}"),
             Instruction::Click { x, y } => format!("click {x} {y}"),
             Instruction::MoveGround { x, y } => format!("move_ground {x} {y}"),
@@ -364,6 +378,30 @@ fn parse_line(line: &str, line_no: usize) -> Result<Instruction, ParseError> {
                 }
             };
             Ok(Instruction::SetPane { pane, visible })
+        }
+
+        "palette" | "command_palette" | "commandpalette" => {
+            let mut parts = rest.split_whitespace();
+            let sub = parts.next().unwrap_or("toggle");
+            match sub.to_ascii_lowercase().as_str() {
+                "show" | "on" | "open" => Ok(Instruction::SetCommandPalette {
+                    open: Some(true),
+                }),
+                "hide" | "off" | "close" => Ok(Instruction::SetCommandPalette {
+                    open: Some(false),
+                }),
+                "toggle" => Ok(Instruction::SetCommandPalette { open: None }),
+                "run" | "exec" | "execute" => {
+                    let query = parts.collect::<Vec<_>>().join(" ");
+                    if query.trim().is_empty() {
+                        return Err(err("palette run requires a query"));
+                    }
+                    Ok(Instruction::RunPaletteCommand { query })
+                }
+                other => Err(err(&format!(
+                    "unknown palette command '{other}' (expected show, hide, toggle, or run)"
+                ))),
+            }
         }
 
         "parameter" | "param" => {
@@ -1336,6 +1374,32 @@ impl ScriptRunner {
                 state.apply(Action::DeleteParameter { index });
                 StepResult::Continue
             }
+            Instruction::SetCommandPalette { open } => {
+                match open {
+                    Some(true) => state.apply(Action::SetCommandPaletteOpen { open: true }),
+                    Some(false) => state.apply(Action::SetCommandPaletteOpen { open: false }),
+                    None => state.apply(Action::ToggleCommandPalette),
+                };
+                StepResult::Continue
+            }
+            Instruction::RunPaletteCommand { query } => {
+                let commands = commands_for_state(state);
+                if let Some(cmd) = best_match(&query, &commands) {
+                    match cmd.outcome() {
+                        PaletteOutcome::Action(action) => {
+                            state.apply(action);
+                        }
+                        PaletteOutcome::OpenFile | PaletteOutcome::SaveFile
+                        | PaletteOutcome::SaveFileAs => {
+                            state.status =
+                                "Palette file commands require the GUI".to_string();
+                        }
+                    }
+                } else {
+                    state.status = format!("No palette command matches '{query}'");
+                }
+                StepResult::Continue
+            }
 
             Instruction::Move { x, y } => {
                 let Some(vp) = viewport else {
@@ -1765,6 +1829,89 @@ mod tests {
     fn rejects_unknown_pane() {
         assert!(parse("pane bogus show").is_err());
         assert!(parse("pane view_cube sideways").is_err());
+    }
+
+    #[test]
+    fn parses_palette_commands() {
+        assert_eq!(
+            parse("palette").unwrap(),
+            vec![Instruction::SetCommandPalette { open: None }]
+        );
+        let ins = parse("palette show\npalette hide\npalette toggle\npalette run view top")
+            .unwrap();
+        assert_eq!(
+            ins,
+            vec![
+                Instruction::SetCommandPalette {
+                    open: Some(true),
+                },
+                Instruction::SetCommandPalette {
+                    open: Some(false),
+                },
+                Instruction::SetCommandPalette { open: None },
+                Instruction::RunPaletteCommand {
+                    query: "view top".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn script_rectangle_dimension_uses_parameter_and_updates() {
+        let script = "parameter add A 10mm\ntool rectangle\nset_dim width A\nset_dim height 5";
+        let mut runner = ScriptRunner::new(parse(script).unwrap());
+        runner.verbose = false;
+        let mut state = AppState::default();
+        let mut synthetic = SyntheticInput::default();
+        state.apply(crate::actions::Action::BeginSketch {
+            face: FaceId::ConstructionPlane(0),
+            viewport: None,
+        });
+        state.creating_rect = Some(crate::actions::CreatingRect {
+            origin: glam::Vec3::ZERO,
+            texts: [String::new(), String::new()],
+            last_mouse: glam::Vec3::new(100.0, 5.0, 0.0),
+            focused: 0,
+            user_edited: [false, false],
+            pending_focus: false,
+        });
+
+        while !runner.done {
+            runner.tick(
+                &mut state,
+                &mut synthetic,
+                None,
+                &egui::Context::default(),
+            );
+        }
+
+        state.apply(crate::actions::Action::CommitRectangle);
+        assert_eq!(state.doc.rects.len(), 1);
+        assert!((state.doc.rects[0].w - 10.0).abs() < 1e-3);
+        assert_eq!(state.doc.rects[0].width_expr.as_deref(), Some("A"));
+
+        state.apply(crate::actions::Action::CommitParameterExpression {
+            index: 0,
+            expression: "20mm".to_string(),
+        });
+        assert!((state.doc.rects[0].w - 20.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn script_palette_run_sets_top_view() {
+        let mut runner = ScriptRunner::new(parse("palette run view top").unwrap());
+        runner.verbose = false;
+        let mut state = AppState::default();
+        let mut synthetic = SyntheticInput::default();
+        while !runner.done {
+            runner.tick(
+                &mut state,
+                &mut synthetic,
+                None,
+                &egui::Context::default(),
+            );
+        }
+        assert!(state.cam.is_transitioning());
     }
 
     #[test]

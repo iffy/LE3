@@ -409,6 +409,7 @@ impl Camera {
         });
     }
 
+    #[cfg(test)]
     pub fn home_view(&self) -> HomeView {
         self.home
     }
