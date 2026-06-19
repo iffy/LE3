@@ -7,8 +7,9 @@ mod scene;
 pub use dim_labels::{build_planar_label_mesh, ViewportDimLabel};
 pub use renderer::paint_viewport;
 pub use scene::{
-    ViewportHoverHighlight, ViewportPalette, ViewportPlaneGizmo, ViewportPlanePreview,
-    ViewportScene, ViewportSceneInput, GRID_EXTENT, GRID_STEP, SKETCH_DIMMED,
+    fill_color, sketch_ground_color, ViewportHoverHighlight, ViewportPalette,
+    ViewportPlaneGizmo, ViewportPlanePreview, ViewportScene, ViewportSceneInput,
+    DEFAULT_CONSTRUCTION_PLANE_OPACITY, GRID_EXTENT, GRID_STEP, SKETCH_DIMMED,
 };
 
 use eframe::CreationContext;

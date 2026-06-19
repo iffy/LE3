@@ -5,7 +5,7 @@ use crate::camera::Camera;
 use crate::construction::{
     axis_angle_handle, axis_normal, axis_reference_perp, gizmo_display_offset, global_axis_segment,
     plane_corners, AxisGizmoHit, AXIS_ANGLE_GIZMO_RADIUS_MM, CONSTRUCTION_DASH_GAP_PX,
-    CONSTRUCTION_DASH_LENGTH_PX, CONSTRUCTION_RGBA, FACE_HOVER_FILL_MULTIPLIER,
+    CONSTRUCTION_DASH_LENGTH_PX, CONSTRUCTION_RGBA, FACE_HOVER_FILL_MULTIPLIER, PLANE_FILL_RGBA,
     GIZMO_HANDLE_HOVER_RGBA, PLANE_DISPLAY_HALF, PickTargetKind, PlaneEditDependentPreview,
     PlaneReference,
 };
@@ -28,14 +28,18 @@ use glam::{Mat4, Quat, Vec3};
 
 pub const GRID_EXTENT: f32 = 200.0;
 pub const GRID_STEP: f32 = 20.0;
-/// Brightness multiplier for geometry outside the active sketch (grid, other sketches, planes).
+/// Brightness multiplier for geometry outside the active sketch (other sketches, planes).
 pub const SKETCH_DIMMED: f32 = 0.50;
+/// Ground grid and world axes stay readable while sketching.
+pub const SKETCH_GROUND_DIMMED: f32 = 0.82;
 pub const CIRCLE_SEGMENTS: usize = 96;
 
-/// Fill opacity for substantial sketch faces (matches CPU `draw_world_quad`).
-pub const SOLID_FILL_OPACITY: f32 = 0.25;
-/// Fill opacity for construction geometry (matches CPU `draw_construction_plane`).
-pub const CONSTRUCTION_FILL_OPACITY: f32 = 0.18;
+/// Fill opacity for substantial sketch faces (brighter than CPU painter for wgpu alpha blend).
+pub const SOLID_FILL_OPACITY: f32 = 0.45;
+/// Fill opacity for all-construction sketch shapes (rectangles, circles).
+pub const CONSTRUCTION_FILL_OPACITY: f32 = 0.42;
+/// Default semi-transparent fill for construction planes.
+pub const DEFAULT_CONSTRUCTION_PLANE_OPACITY: f32 = 0.30;
 /// Lift plane fills slightly toward the camera so they win over the ground grid.
 pub const PLANE_FILL_DEPTH_BIAS: f32 = 0.02;
 /// Base depth lift for sketch shape fills toward the camera.
@@ -44,6 +48,8 @@ pub const SHAPE_FILL_DEPTH_BIAS_BASE: f32 = 0.04;
 pub const SHAPE_FILL_DEPTH_BIAS_STEP: f32 = 0.008;
 /// In-progress previews render above committed geometry.
 pub const PREVIEW_FILL_DEPTH_BIAS: f32 = 0.2;
+/// Lift construction-plane hover fills above the plane surface (avoids z-fighting).
+const HOVER_PLANE_DEPTH_LIFT: f32 = 0.02;
 
 const GIZMO_OFFSET_STROKE_PX: f32 = 2.5;
 const GIZMO_OFFSET_STROKE_HOVER_PX: f32 = 4.0;
@@ -71,7 +77,12 @@ use crate::gpu_viewport::dim_labels::GpuTextVertex;
 #[derive(Clone, Debug, Default)]
 pub struct ViewportScene {
     pub vertices: Vec<GpuVertex>,
+    /// Ground grid, sketch fills, and standalone lines (drawn first).
     pub indices: Vec<u32>,
+    /// Construction-plane fills (drawn after sketch fills, without depth write).
+    pub plane_fill_indices: Vec<u32>,
+    /// Strokes, selection, hover, and previews (drawn on top of plane fills).
+    pub overlay_indices: Vec<u32>,
     pub text_vertices: Vec<GpuTextVertex>,
     pub text_indices: Vec<u32>,
     pub view_proj: Mat4,
@@ -91,6 +102,8 @@ pub struct ViewportPalette {
     pub preview: Color32,
     pub construction: Color32,
     pub dim_edge_highlight: Color32,
+    pub construction_plane_fill: Color32,
+    pub construction_plane_opacity: f32,
 }
 
 impl Default for ViewportPalette {
@@ -106,7 +119,9 @@ impl Default for ViewportPalette {
             line_stroke: Color32::from_rgb(180, 140, 240),
             preview: Color32::from_rgb(240, 200, 120),
             construction: CONSTRUCTION_RGBA,
-            dim_edge_highlight: Color32::from_rgb(255, 186, 84),
+            dim_edge_highlight: Color32::from_rgb(255, 205, 88),
+            construction_plane_fill: PLANE_FILL_RGBA,
+            construction_plane_opacity: DEFAULT_CONSTRUCTION_PLANE_OPACITY,
         }
     }
 }
@@ -177,6 +192,49 @@ impl ViewportScene {
             &input.palette,
         );
 
+        for (ri, rect) in input.doc.rects.iter().enumerate() {
+            if !input
+                .element_visibility
+                .effective_visible(input.doc, SceneElement::Rect(ri))
+            {
+                continue;
+            }
+            let dim = input.sketch_session.is_some_and(|s| {
+                !sketch_rect_is_active(input.doc, s, ri, rect.sketch)
+            });
+            mesh.push_rect_fill(
+                input.doc,
+                rect,
+                ri,
+                input.cam,
+                sketch_color(input.palette.rect_line, dim),
+                sketch_color(input.palette.construction, dim),
+                shape_fill_depth_bias(ri),
+            );
+        }
+
+        for (ci, circle) in input.doc.circles.iter().enumerate() {
+            if !input
+                .element_visibility
+                .effective_visible(input.doc, SceneElement::Circle(ci))
+            {
+                continue;
+            }
+            let dim = input.sketch_session.is_some_and(|s| {
+                !sketch_circle_is_active(input.doc, s, ci, circle.sketch)
+            });
+            mesh.push_circle_fill(
+                input.doc,
+                circle,
+                ci,
+                input.cam,
+                sketch_color(input.palette.rect_line, dim),
+                sketch_color(input.palette.construction, dim),
+                shape_fill_depth_bias(ci),
+            );
+        }
+
+        let mut plane_draws: Vec<(usize, ConstructionPlane, Color32, f32)> = Vec::new();
         for (i, plane) in input.doc.construction_planes.iter().enumerate() {
             if !input
                 .element_visibility
@@ -191,40 +249,17 @@ impl ViewportScene {
             let color = if active {
                 input.palette.dim_edge_highlight
             } else {
-                sketch_color(input.palette.construction, sketch_dimmed)
+                input.palette.construction_plane_fill
             };
-            mesh.push_plane(
-                plane,
-                i,
-                color,
-                input.cam,
-                input.viewport,
-                &vp,
-            );
+            plane_draws.push((i, plane.clone(), color, plane_camera_depth(plane, input.cam)));
         }
-
-        for (ri, rect) in input.doc.rects.iter().enumerate() {
-            if !input
-                .element_visibility
-                .effective_visible(input.doc, SceneElement::Rect(ri))
-            {
-                continue;
-            }
-            let dim = input.sketch_session.is_some_and(|s| {
-                !sketch_rect_is_active(input.doc, s, ri, rect.sketch)
-            });
-            mesh.push_rect(
-                input.doc,
-                rect,
-                ri,
-                input.cam,
-                input.viewport,
-                &vp,
-                sketch_color(input.palette.rect_line, dim),
-                sketch_color(input.palette.construction, dim),
-                shape_fill_depth_bias(ri),
-            );
+        plane_draws.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        mesh.set_index_layer(MeshIndexLayer::PlaneFill);
+        let plane_opacity = input.palette.construction_plane_opacity;
+        for (i, plane, color, _) in plane_draws {
+            mesh.push_plane(&plane, i, color, plane_opacity, input.cam);
         }
+        mesh.set_index_layer(MeshIndexLayer::Base);
 
         for (li, line) in input.doc.lines.iter().enumerate() {
             if !input
@@ -256,6 +291,27 @@ impl ViewportScene {
             }
         }
 
+        mesh.set_index_layer(MeshIndexLayer::Overlay);
+        for (ri, rect) in input.doc.rects.iter().enumerate() {
+            if !input
+                .element_visibility
+                .effective_visible(input.doc, SceneElement::Rect(ri))
+            {
+                continue;
+            }
+            let dim = input.sketch_session.is_some_and(|s| {
+                !sketch_rect_is_active(input.doc, s, ri, rect.sketch)
+            });
+            mesh.push_rect_strokes(
+                input.doc,
+                rect,
+                input.cam,
+                input.viewport,
+                &vp,
+                sketch_color(input.palette.rect_line, dim),
+                sketch_color(input.palette.construction, dim),
+            );
+        }
         for (ci, circle) in input.doc.circles.iter().enumerate() {
             if !input
                 .element_visibility
@@ -266,7 +322,7 @@ impl ViewportScene {
             let dim = input.sketch_session.is_some_and(|s| {
                 !sketch_circle_is_active(input.doc, s, ci, circle.sketch)
             });
-            mesh.push_circle(
+            mesh.push_circle_strokes(
                 input.doc,
                 circle,
                 ci,
@@ -275,7 +331,6 @@ impl ViewportScene {
                 &vp,
                 sketch_color(input.palette.rect_line, dim),
                 sketch_color(input.palette.construction, dim),
-                shape_fill_depth_bias(ci),
             );
         }
 
@@ -289,7 +344,12 @@ impl ViewportScene {
         );
 
         if let Some(face) = input.active_sketch_face {
-            mesh.push_face_highlight(input.doc, face, input.palette.dim_edge_highlight);
+            mesh.push_face_highlight(
+                input.doc,
+                face,
+                input.palette.dim_edge_highlight,
+                input.cam,
+            );
         }
 
         if let Some(rect) = input.preview_rect.as_ref() {
@@ -402,13 +462,37 @@ impl ViewportScene {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MeshIndexLayer {
+    #[default]
+    Base,
+    PlaneFill,
+    Overlay,
+}
+
 pub(crate) struct SceneMesh<'a> {
     scene: &'a mut ViewportScene,
+    index_layer: MeshIndexLayer,
 }
 
 impl<'a> SceneMesh<'a> {
     fn new(scene: &'a mut ViewportScene) -> Self {
-        Self { scene }
+        Self {
+            scene,
+            index_layer: MeshIndexLayer::Base,
+        }
+    }
+
+    fn set_index_layer(&mut self, layer: MeshIndexLayer) {
+        self.index_layer = layer;
+    }
+
+    fn indices_mut(&mut self) -> &mut Vec<u32> {
+        match self.index_layer {
+            MeshIndexLayer::Base => &mut self.scene.indices,
+            MeshIndexLayer::PlaneFill => &mut self.scene.plane_fill_indices,
+            MeshIndexLayer::Overlay => &mut self.scene.overlay_indices,
+        }
     }
 
     fn push_vertex(&mut self, position: Vec3, color: Color32) {
@@ -423,7 +507,8 @@ impl<'a> SceneMesh<'a> {
         self.push_vertex(a, color);
         self.push_vertex(b, color);
         self.push_vertex(c, color);
-        self.scene.indices.extend_from_slice(&[base, base + 1, base + 2]);
+        self.indices_mut()
+            .extend_from_slice(&[base, base + 1, base + 2]);
     }
 
     fn push_quad_fill(&mut self, fill_corners: [Vec3; 4], fill: Color32) {
@@ -431,6 +516,7 @@ impl<'a> SceneMesh<'a> {
         self.push_triangle(fill_corners[0], fill_corners[2], fill_corners[3], fill);
     }
 
+    #[allow(dead_code)]
     fn push_quad(
         &mut self,
         corners: [Vec3; 4],
@@ -502,8 +588,7 @@ impl<'a> SceneMesh<'a> {
                 color: gpu,
             });
         }
-        self.scene
-            .indices
+        self.indices_mut()
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
@@ -523,7 +608,7 @@ impl<'a> SceneMesh<'a> {
             } else {
                 palette.grid
             };
-            let color = sketch_color(base, dim);
+            let color = sketch_ground_color(base, dim);
             self.push_line_segment(
                 Vec3::new(-e, t, 0.0),
                 Vec3::new(e, t, 0.0),
@@ -547,7 +632,7 @@ impl<'a> SceneMesh<'a> {
         self.push_line_segment(
             Vec3::ZERO,
             Vec3::new(e, 0.0, 0.0),
-            sketch_color(palette.x_axis, dim),
+            sketch_ground_color(palette.x_axis, dim),
             2.0,
             cam,
             viewport,
@@ -556,7 +641,7 @@ impl<'a> SceneMesh<'a> {
         self.push_line_segment(
             Vec3::ZERO,
             Vec3::new(0.0, e, 0.0),
-            sketch_color(palette.y_axis, dim),
+            sketch_ground_color(palette.y_axis, dim),
             2.0,
             cam,
             viewport,
@@ -565,7 +650,7 @@ impl<'a> SceneMesh<'a> {
         self.push_line_segment(
             Vec3::ZERO,
             Vec3::new(0.0, 0.0, e),
-            sketch_color(palette.z_axis, dim),
+            sketch_ground_color(palette.z_axis, dim),
             2.0,
             cam,
             viewport,
@@ -573,14 +658,12 @@ impl<'a> SceneMesh<'a> {
         );
     }
 
-    fn push_rect(
+    fn push_rect_fill(
         &mut self,
         doc: &Document,
         rect: &ModelRect,
         _index: usize,
         cam: &Camera,
-        viewport: UiRect,
-        view_proj: &Mat4,
         solid: Color32,
         construction: Color32,
         fill_depth_bias: f32,
@@ -591,62 +674,67 @@ impl<'a> SceneMesh<'a> {
         let Some(frame) = sketch_geometry_frame(doc, rect.sketch) else {
             return;
         };
-        let fill_corners = offset_corners_toward_camera(corners, frame.normal, cam.eye(), fill_depth_bias);
+        let fill_corners =
+            offset_corners_toward_camera(corners, frame.normal, cam.eye(), fill_depth_bias);
         let all_construction = rect.all_edges_construction();
         let has_solid_edge = rect.construction_edges.iter().any(|&c| !c);
         if all_construction {
-            self.push_quad(
-                corners,
+            self.push_quad_fill(
                 fill_corners,
                 fill_color(construction, CONSTRUCTION_FILL_OPACITY),
-                construction,
-                1.5,
-                true,
-                cam,
-                viewport,
-                view_proj,
             );
-        } else if has_solid_edge && rect.has_mixed_edge_construction() {
-            self.push_quad_fill(fill_corners, fill_color(solid, SOLID_FILL_OPACITY));
-            for (edge_index, (a, b)) in rect_edge_segments(doc, rect).into_iter().enumerate() {
-                let edge = RectEdge::from_index(edge_index);
-                if rect.edge_construction(edge) {
-                    self.push_dashed_line_segment(
-                        a,
-                        b,
-                        construction,
-                        1.5,
-                        cam,
-                        viewport,
-                        view_proj,
-                    );
-                } else {
-                    self.push_line_segment(a, b, solid, 1.5, cam, viewport, view_proj);
-                }
-            }
         } else if has_solid_edge {
-            self.push_quad(
-                corners,
-                fill_corners,
-                fill_color(solid, SOLID_FILL_OPACITY),
-                solid,
-                1.5,
-                false,
-                cam,
-                viewport,
-                view_proj,
-            );
+            self.push_quad_fill(fill_corners, fill_color(solid, SOLID_FILL_OPACITY));
         }
     }
 
-    fn push_circle(
+    fn push_rect_strokes(
+        &mut self,
+        doc: &Document,
+        rect: &ModelRect,
+        cam: &Camera,
+        viewport: UiRect,
+        view_proj: &Mat4,
+        solid: Color32,
+        construction: Color32,
+    ) {
+        let all_construction = rect.all_edges_construction();
+        let has_solid_edge = rect.construction_edges.iter().any(|&c| !c);
+        if !all_construction && !has_solid_edge {
+            return;
+        }
+        for (edge_index, (a, b)) in rect_edge_segments(doc, rect).into_iter().enumerate() {
+            let edge = RectEdge::from_index(edge_index);
+            if rect.edge_construction(edge) {
+                self.push_dashed_line_segment(a, b, construction, 1.5, cam, viewport, view_proj);
+            } else {
+                self.push_line_segment(a, b, solid, 1.5, cam, viewport, view_proj);
+            }
+        }
+    }
+
+    fn push_rect(
+        &mut self,
+        doc: &Document,
+        rect: &ModelRect,
+        index: usize,
+        cam: &Camera,
+        viewport: UiRect,
+        view_proj: &Mat4,
+        solid: Color32,
+        construction: Color32,
+        fill_depth_bias: f32,
+    ) {
+        self.push_rect_fill(doc, rect, index, cam, solid, construction, fill_depth_bias);
+        self.push_rect_strokes(doc, rect, cam, viewport, view_proj, solid, construction);
+    }
+
+    fn push_circle_fill(
         &mut self,
         doc: &Document,
         circle: &Circle,
         _index: usize,
         cam: &Camera,
-        viewport: UiRect,
-        view_proj: &Mat4,
         solid: Color32,
         construction: Color32,
         fill_depth_bias: f32,
@@ -662,35 +750,68 @@ impl<'a> SceneMesh<'a> {
             eye,
             fill_depth_bias,
         );
-        if circle.construction {
-            let fill = fill_color(construction, CONSTRUCTION_FILL_OPACITY);
-            for window in perimeter.windows(2) {
-                let a = offset_toward_camera(window[0], frame.normal, eye, fill_depth_bias);
-                let b = offset_toward_camera(window[1], frame.normal, eye, fill_depth_bias);
-                self.push_triangle(center, a, b, fill);
-            }
-            for window in perimeter.windows(2) {
+        let fill = if circle.construction {
+            fill_color(construction, CONSTRUCTION_FILL_OPACITY)
+        } else {
+            fill_color(solid, SOLID_FILL_OPACITY)
+        };
+        for window in perimeter.windows(2) {
+            let a = offset_toward_camera(window[0], frame.normal, eye, fill_depth_bias);
+            let b = offset_toward_camera(window[1], frame.normal, eye, fill_depth_bias);
+            self.push_triangle(center, a, b, fill);
+        }
+    }
+
+    fn push_circle_strokes(
+        &mut self,
+        doc: &Document,
+        circle: &Circle,
+        _index: usize,
+        cam: &Camera,
+        viewport: UiRect,
+        view_proj: &Mat4,
+        solid: Color32,
+        construction: Color32,
+    ) {
+        let Some(perimeter) = circle_world_perimeter(doc, circle, CIRCLE_SEGMENTS) else {
+            return;
+        };
+        let stroke = if circle.construction {
+            construction
+        } else {
+            solid
+        };
+        for window in perimeter.windows(2) {
+            if circle.construction {
                 self.push_dashed_line_segment(
                     window[0],
                     window[1],
-                    construction,
+                    stroke,
                     1.5,
                     cam,
                     viewport,
                     view_proj,
                 );
-            }
-        } else {
-            let fill = fill_color(solid, SOLID_FILL_OPACITY);
-            for window in perimeter.windows(2) {
-                let a = offset_toward_camera(window[0], frame.normal, eye, fill_depth_bias);
-                let b = offset_toward_camera(window[1], frame.normal, eye, fill_depth_bias);
-                self.push_triangle(center, a, b, fill);
-            }
-            for window in perimeter.windows(2) {
-                self.push_line_segment(window[0], window[1], solid, 1.5, cam, viewport, view_proj);
+            } else {
+                self.push_line_segment(window[0], window[1], stroke, 1.5, cam, viewport, view_proj);
             }
         }
+    }
+
+    fn push_circle(
+        &mut self,
+        doc: &Document,
+        circle: &Circle,
+        index: usize,
+        cam: &Camera,
+        viewport: UiRect,
+        view_proj: &Mat4,
+        solid: Color32,
+        construction: Color32,
+        fill_depth_bias: f32,
+    ) {
+        self.push_circle_fill(doc, circle, index, cam, solid, construction, fill_depth_bias);
+        self.push_circle_strokes(doc, circle, index, cam, viewport, view_proj, solid, construction);
     }
 
     fn push_plane_outline(
@@ -772,25 +893,15 @@ impl<'a> SceneMesh<'a> {
         plane: &ConstructionPlane,
         index: usize,
         color: Color32,
+        opacity: f32,
         cam: &Camera,
-        viewport: UiRect,
-        view_proj: &Mat4,
     ) {
         let corners = plane_corners(plane, PLANE_DISPLAY_HALF);
         let fill_bias = plane_fill_depth_bias(index);
         let eye = cam.eye();
         let fill_corners = offset_corners_toward_camera(corners, plane.normal, eye, fill_bias);
-        let fill = fill_color(color, CONSTRUCTION_FILL_OPACITY);
-        self.push_triangle(fill_corners[0], fill_corners[1], fill_corners[2], fill);
-        self.push_triangle(fill_corners[0], fill_corners[2], fill_corners[3], fill);
-        for (a, b) in [
-            (corners[0], corners[1]),
-            (corners[1], corners[2]),
-            (corners[2], corners[3]),
-            (corners[3], corners[0]),
-        ] {
-            self.push_line_segment(a, b, color, 1.5, cam, viewport, view_proj);
-        }
+        let fill = fill_color(color, opacity);
+        self.push_quad_fill(fill_corners, fill);
     }
 
     fn push_selection(
@@ -891,8 +1002,36 @@ impl<'a> SceneMesh<'a> {
         }
     }
 
-    fn push_face_highlight(&mut self, doc: &Document, face: FaceId, color: Color32) {
-        self.push_sketch_face_hover(doc, face, color, 0.12);
+    fn push_face_highlight(
+        &mut self,
+        doc: &Document,
+        face: FaceId,
+        color: Color32,
+        cam: &Camera,
+    ) {
+        match face {
+            FaceId::ConstructionPlane(index) => {
+                if let Some(plane) = doc.construction_planes.get(index) {
+                    self.push_construction_plane_hover_fill(plane, index, color, 0.12, cam);
+                }
+            }
+            _ => self.push_sketch_face_hover(doc, face, color, 0.12),
+        }
+    }
+
+    fn push_construction_plane_hover_fill(
+        &mut self,
+        plane: &ConstructionPlane,
+        index: usize,
+        color: Color32,
+        fill_multiplier: f32,
+        cam: &Camera,
+    ) {
+        let corners = plane_corners(plane, PLANE_DISPLAY_HALF);
+        let bias = plane_fill_depth_bias(index) + HOVER_PLANE_DEPTH_LIFT;
+        let fill_corners =
+            offset_corners_toward_camera(corners, plane.normal, cam.eye(), bias);
+        self.push_quad_fill(fill_corners, color.gamma_multiply(fill_multiplier));
     }
 
     fn push_sketch_face_hover(
@@ -926,13 +1065,7 @@ impl<'a> SceneMesh<'a> {
                     }
                 }
             }
-            FaceId::ConstructionPlane(index) => {
-                if let Some(plane) = doc.construction_planes.get(index) {
-                    let corners = plane_corners(plane, PLANE_DISPLAY_HALF);
-                    self.push_triangle(corners[0], corners[1], corners[2], fill);
-                    self.push_triangle(corners[0], corners[2], corners[3], fill);
-                }
-            }
+            FaceId::ConstructionPlane(_) => {}
         }
     }
 
@@ -947,18 +1080,31 @@ impl<'a> SceneMesh<'a> {
     ) {
         let project = |w: Vec3| cam.project(w, viewport, view_proj);
         match hover {
-            ViewportHoverHighlight::SketchFace(face) => {
-                self.push_sketch_face_hover(doc, *face, color, FACE_HOVER_FILL_MULTIPLIER);
-                self.push_sketch_face_hover_border(
-                    doc,
-                    *face,
-                    color,
-                    2.0,
-                    cam,
-                    viewport,
-                    view_proj,
-                );
-            }
+            ViewportHoverHighlight::SketchFace(face) => match *face {
+                FaceId::ConstructionPlane(index) => {
+                    if let Some(plane) = doc.construction_planes.get(index) {
+                        self.push_construction_plane_hover_fill(
+                            plane,
+                            index,
+                            color,
+                            FACE_HOVER_FILL_MULTIPLIER,
+                            cam,
+                        );
+                    }
+                }
+                _ => {
+                    self.push_sketch_face_hover(doc, *face, color, FACE_HOVER_FILL_MULTIPLIER);
+                    self.push_sketch_face_hover_border(
+                        doc,
+                        *face,
+                        color,
+                        2.0,
+                        cam,
+                        viewport,
+                        view_proj,
+                    );
+                }
+            },
             ViewportHoverHighlight::PickTarget(kind) => {
                 self.push_pick_target_highlight(
                     doc,
@@ -1017,19 +1163,7 @@ impl<'a> SceneMesh<'a> {
                     }
                 }
             }
-            FaceId::ConstructionPlane(index) => {
-                if let Some(plane) = doc.construction_planes.get(index) {
-                    let corners = plane_corners(plane, PLANE_DISPLAY_HALF);
-                    for (a, b) in [
-                        (corners[0], corners[1]),
-                        (corners[1], corners[2]),
-                        (corners[2], corners[3]),
-                        (corners[3], corners[0]),
-                    ] {
-                        self.push_line_segment(a, b, color, width, cam, viewport, view_proj);
-                    }
-                }
-            }
+            FaceId::ConstructionPlane(_) => {}
         }
     }
 
@@ -1089,21 +1223,15 @@ impl<'a> SceneMesh<'a> {
                 }
             }
             PickTargetKind::ConstructionPlane(index) => {
-                self.push_sketch_face_hover(
-                    doc,
-                    FaceId::ConstructionPlane(*index),
-                    color,
-                    FACE_HOVER_FILL_MULTIPLIER,
-                );
-                self.push_sketch_face_hover_border(
-                    doc,
-                    FaceId::ConstructionPlane(*index),
-                    color,
-                    2.0,
-                    cam,
-                    viewport,
-                    view_proj,
-                );
+                if let Some(plane) = doc.construction_planes.get(*index) {
+                    self.push_construction_plane_hover_fill(
+                        plane,
+                        *index,
+                        color,
+                        FACE_HOVER_FILL_MULTIPLIER,
+                        cam,
+                    );
+                }
             }
             PickTargetKind::Ground(p) => {
                 push_ground_hover_marker(self, *p, color, cam, viewport, view_proj, project);
@@ -1194,6 +1322,12 @@ pub fn shape_fill_depth_bias(index: usize) -> f32 {
 
 pub fn plane_fill_depth_bias(index: usize) -> f32 {
     PLANE_FILL_DEPTH_BIAS - index as f32 * SHAPE_FILL_DEPTH_BIAS_STEP * 0.25
+}
+
+fn plane_camera_depth(plane: &ConstructionPlane, cam: &Camera) -> f32 {
+    let corners = plane_corners(plane, PLANE_DISPLAY_HALF);
+    let center = (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25;
+    (cam.eye() - center).length()
 }
 
 pub fn offset_toward_camera(pos: Vec3, normal: Vec3, eye: Vec3, bias: f32) -> Vec3 {
@@ -1718,6 +1852,14 @@ fn sketch_color(color: Color32, dim: bool) -> Color32 {
     }
 }
 
+pub fn sketch_ground_color(color: Color32, in_sketch: bool) -> Color32 {
+    if in_sketch {
+        color.gamma_multiply(SKETCH_GROUND_DIMMED)
+    } else {
+        color
+    }
+}
+
 fn sketch_rect_is_active(
     doc: &Document,
     session: SketchSession,
@@ -1946,7 +2088,7 @@ mod tests {
             hover_color: Color32::WHITE,
         });
         assert!(
-            with_preview.indices.len() > base.indices.len(),
+            with_preview.overlay_indices.len() > base.overlay_indices.len(),
             "plane creation preview should add outline triangles"
         );
     }
@@ -1998,9 +2140,11 @@ mod tests {
             )),
             hover_color: crate::construction::PICK_HOVER_RGBA,
         });
-        assert!(
-            with_hover.indices.len() > base.indices.len(),
-            "hover highlight should add triangles on top of the base scene"
+        let hover_indices =
+            with_hover.overlay_indices.len() - base.overlay_indices.len();
+        assert_eq!(
+            hover_indices, 6,
+            "construction-plane hover should add only a biased fill quad"
         );
     }
 
@@ -2153,6 +2297,25 @@ mod tests {
     }
 
     #[test]
+    fn construction_planes_render_fill_without_edge_strokes() {
+        use crate::hierarchy::SceneElement;
+
+        let mut hidden = AppState::default();
+        hidden
+            .element_visibility
+            .set_visible(SceneElement::ConstructionPlane(0), false);
+
+        let with_plane = build_scene_for_doc(&AppState::default());
+        let without_plane = build_scene_for_doc(&hidden);
+        let plane_indices =
+            with_plane.plane_fill_indices.len() - without_plane.plane_fill_indices.len();
+        assert_eq!(
+            plane_indices, 6,
+            "each construction plane should add only two fill triangles"
+        );
+    }
+
+    #[test]
     fn mixed_construction_rect_skips_solid_stroke_on_construction_edges() {
         let mut all_solid = AppState::default();
         commit_test_rectangle(&mut all_solid);
@@ -2273,11 +2436,29 @@ mod tests {
     }
 
     #[test]
-    fn solid_fill_matches_cpu_opacity() {
+    fn sketch_ground_stays_brighter_than_other_dimmed_geometry() {
+        let base = Color32::from_rgb(120, 170, 240);
+        let ground = sketch_ground_color(base, true);
+        let other = sketch_color(base, true);
+        assert!(ground.r() > other.r());
+        assert!(ground.r() < base.r());
+    }
+
+    #[test]
+    fn plane_fill_is_more_transparent_than_sketch_construction_fill() {
+        let base = PLANE_FILL_RGBA;
+        let plane = fill_color(base, DEFAULT_CONSTRUCTION_PLANE_OPACITY);
+        let sketch = fill_color(base, CONSTRUCTION_FILL_OPACITY);
+        assert!(plane.a() < sketch.a());
+    }
+
+    #[test]
+    fn solid_fill_is_brighter_than_cpu_painter() {
         let base = Color32::from_rgb(120, 170, 240);
         let cpu_fill = base.gamma_multiply(0.25);
         let gpu_fill = fill_color(base, SOLID_FILL_OPACITY);
-        assert_eq!(gpu_fill, cpu_fill);
+        assert!(gpu_fill.a() > cpu_fill.a());
+        assert!(gpu_fill.r() > cpu_fill.r());
     }
 
     #[test]

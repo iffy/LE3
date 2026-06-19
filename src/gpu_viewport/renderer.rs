@@ -22,6 +22,7 @@ pub struct ViewportGpuResources {
     target_format: wgpu::TextureFormat,
     msaa_sample_count: u32,
     scene_pipeline: wgpu::RenderPipeline,
+    scene_transparent_pipeline: wgpu::RenderPipeline,
     text_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
@@ -191,6 +192,58 @@ impl ViewportGpuResources {
             multiview: None,
             cache: None,
         });
+
+        let scene_transparent_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("le3_viewport_scene_transparent_pipeline"),
+                layout: Some(&scene_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<GpuVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                        ],
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: multisample_state(msaa_sample_count),
+                multiview: None,
+                cache: None,
+            });
 
         let text_texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -376,6 +429,7 @@ impl ViewportGpuResources {
             target_format,
             msaa_sample_count,
             scene_pipeline,
+            scene_transparent_pipeline,
             text_pipeline,
             blit_pipeline,
             uniform_buffer,
@@ -603,7 +657,11 @@ impl ViewportGpuResources {
         }
 
         let vertex_bytes = (scene.vertices.len() * std::mem::size_of::<GpuVertex>()) as u64;
-        let index_bytes = (scene.indices.len() * std::mem::size_of::<u32>()) as u64;
+        let base_index_count = scene.indices.len();
+        let plane_fill_index_count = scene.plane_fill_indices.len();
+        let overlay_index_count = scene.overlay_indices.len();
+        let total_index_count = base_index_count + plane_fill_index_count + overlay_index_count;
+        let index_bytes = (total_index_count * std::mem::size_of::<u32>()) as u64;
         let text_vertex_bytes =
             (scene.text_vertices.len() * std::mem::size_of::<GpuTextVertex>()) as u64;
         let text_index_bytes = (scene.text_indices.len() * std::mem::size_of::<u32>()) as u64;
@@ -624,8 +682,16 @@ impl ViewportGpuResources {
                 bytemuck::cast_slice(&scene.vertices),
             );
         }
-        if !scene.indices.is_empty() {
-            queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&scene.indices));
+        if total_index_count > 0 {
+            let mut combined_indices = Vec::with_capacity(total_index_count);
+            combined_indices.extend_from_slice(&scene.indices);
+            combined_indices.extend_from_slice(&scene.plane_fill_indices);
+            combined_indices.extend_from_slice(&scene.overlay_indices);
+            queue.write_buffer(
+                &self.index_buffer,
+                0,
+                bytemuck::cast_slice(&combined_indices),
+            );
         }
         if !scene.text_vertices.is_empty() {
             queue.write_buffer(
@@ -685,15 +751,28 @@ impl ViewportGpuResources {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if !scene.indices.is_empty() {
-                pass.set_pipeline(&self.scene_pipeline);
+            if total_index_count > 0 {
                 pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 pass.set_index_buffer(
                     self.index_buffer.slice(..),
                     wgpu::IndexFormat::Uint32,
                 );
-                pass.draw_indexed(0..scene.indices.len() as u32, 0, 0..1);
+                let base_end = base_index_count as u32;
+                let plane_end = (base_index_count + plane_fill_index_count) as u32;
+                let total_end = total_index_count as u32;
+                if base_end > 0 {
+                    pass.set_pipeline(&self.scene_pipeline);
+                    pass.draw_indexed(0..base_end, 0, 0..1);
+                }
+                if plane_end > base_end {
+                    pass.set_pipeline(&self.scene_transparent_pipeline);
+                    pass.draw_indexed(base_end..plane_end, 0, 0..1);
+                }
+                if total_end > plane_end {
+                    pass.set_pipeline(&self.scene_pipeline);
+                    pass.draw_indexed(plane_end..total_end, 0, 0..1);
+                }
             }
             if !scene.text_indices.is_empty() {
                 if let Some(font_bind_group) = self.font_bind_group.lock().unwrap().as_ref() {

@@ -24,6 +24,7 @@ mod gpu_viewport;
 mod hierarchy;
 mod names;
 mod parameters;
+
 mod model;
 mod native_menu;
 mod script;
@@ -983,6 +984,8 @@ fn build_viewport_scene_input<'a>(
             preview: col::PREVIEW,
             construction: col::CONSTRUCTION,
             dim_edge_highlight: col::DIM_EDGE_HIGHLIGHT,
+            construction_plane_fill: construction::PLANE_FILL_RGBA,
+            construction_plane_opacity: gpu_viewport::DEFAULT_CONSTRUCTION_PLANE_OPACITY,
         },
         sketch_session,
         selection,
@@ -3728,10 +3731,18 @@ fn draw_construction_plane(
     let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
     let Some(pts) = pts else { return };
     if fill {
+        let plane_color = if color == col::CONSTRUCTION {
+            construction::PLANE_FILL_RGBA
+        } else {
+            color
+        };
         painter.add(egui::Shape::convex_polygon(
-            pts.clone(),
-            color.gamma_multiply(0.18),
-            egui::Stroke::new(1.5, color),
+            pts,
+            gpu_viewport::fill_color(
+                plane_color,
+                gpu_viewport::DEFAULT_CONSTRUCTION_PLANE_OPACITY,
+            ),
+            egui::Stroke::NONE,
         ));
     } else {
         painter.add(egui::Shape::closed_line(
@@ -3862,7 +3873,7 @@ fn draw_ground(
         } else {
             col::GRID
         };
-        let color = sketch_color(base, dim);
+        let color = gpu_viewport::sketch_ground_color(base, dim);
         line(Vec3::new(-e, t, 0.0), Vec3::new(e, t, 0.0), color, 1.0);
         line(Vec3::new(t, -e, 0.0), Vec3::new(t, e, 0.0), color, 1.0);
         t += GRID_STEP;
@@ -3871,19 +3882,19 @@ fn draw_ground(
     line(
         Vec3::ZERO,
         Vec3::new(e, 0.0, 0.0),
-        sketch_color(col::X_AXIS, dim),
+        gpu_viewport::sketch_ground_color(col::X_AXIS, dim),
         2.0,
     );
     line(
         Vec3::ZERO,
         Vec3::new(0.0, e, 0.0),
-        sketch_color(col::Y_AXIS, dim),
+        gpu_viewport::sketch_ground_color(col::Y_AXIS, dim),
         2.0,
     );
     line(
         Vec3::ZERO,
         Vec3::new(0.0, 0.0, e),
-        sketch_color(col::Z_AXIS, dim),
+        gpu_viewport::sketch_ground_color(col::Z_AXIS, dim),
         2.0,
     );
 }

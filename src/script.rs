@@ -95,7 +95,6 @@ pub enum Instruction {
     SetCommandPalette { open: Option<bool> },
     /// Run the best-matching palette command for a query.
     RunPaletteCommand { query: String },
-
     // Synthetic input (viewport-local pixel coordinates)
     Move { x: f32, y: f32 },
     Click { x: f32, y: f32 },
@@ -280,6 +279,7 @@ impl Instruction {
                 format!("palette {verb}")
             }
             Instruction::RunPaletteCommand { query } => format!("palette run {query}"),
+
             Instruction::Move { x, y } => format!("move {x} {y}"),
             Instruction::Click { x, y } => format!("click {x} {y}"),
             Instruction::MoveGround { x, y } => format!("move_ground {x} {y}"),
