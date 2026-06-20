@@ -2100,6 +2100,7 @@ fn draw_committed_dim_layouts<Project>(
     health: &document_health::DocumentHealth,
     angle_gizmo_constraint: Option<DimLabelTarget>,
     hovered_angle_gizmo: Option<DimLabelTarget>,
+    viewport: egui::Rect,
 ) where
     Project: Fn(Vec3) -> Option<egui::Pos2>,
 {
@@ -2114,12 +2115,27 @@ fn draw_committed_dim_layouts<Project>(
         {
             let show_gizmo = angle_gizmo_constraint == Some(layout.target);
             let gizmo_hovered = show_gizmo && hovered_angle_gizmo == Some(layout.target);
+            // Keep the angle annotation/gizmo on screen: if the lines' meeting point projects
+            // outside the viewport, slide the whole annotation to the padded edge.
+            let offset = project(display.center)
+                .map(|c| {
+                    dimensions::angle_gizmo_viewport_offset(c, viewport, ANGLE_GIZMO_VIEWPORT_PAD)
+                })
+                .unwrap_or(egui::Vec2::ZERO);
+            let shifted_arc;
+            let arc_ref = if offset == egui::Vec2::ZERO {
+                arc_geom
+            } else {
+                shifted_arc = arc_geom.translated(offset);
+                &shifted_arc
+            };
+            let project_shifted = |w: Vec3| project(w).map(|p| p + offset);
             draw_angle_constraint_annotation(
                 painter,
-                project,
+                &project_shifted,
                 display,
                 layout.world_geom.outward_world,
-                arc_geom,
+                arc_ref,
                 &layout.label,
                 color,
                 layout.angle_radius_world,
@@ -2138,11 +2154,15 @@ fn draw_committed_dim_layouts<Project>(
     }
 }
 
+/// Padding (px) keeping the clamped angle gizmo clear of the viewport edge.
+const ANGLE_GIZMO_VIEWPORT_PAD: f32 = 48.0;
+
 fn angle_gizmo_hit_target(
     layouts: &[CommittedDimLayout],
     pointer: egui::Pos2,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
     angle_gizmo_constraint: Option<DimLabelTarget>,
+    viewport: egui::Rect,
 ) -> Option<DimLabelTarget> {
     let active = angle_gizmo_constraint?;
     layouts.iter().rev().find_map(|layout| {
@@ -2150,8 +2170,13 @@ fn angle_gizmo_hit_target(
             return None;
         }
         let display = layout.angle_display.as_ref()?;
+        // Match the on-screen clamping used when drawing, so the handle stays grabbable.
+        let offset = project(display.center)
+            .map(|c| dimensions::angle_gizmo_viewport_offset(c, viewport, ANGLE_GIZMO_VIEWPORT_PAD))
+            .unwrap_or(egui::Vec2::ZERO);
+        let project_shifted = |w: Vec3| project(w).map(|p| p + offset);
         let handle = angle_gizmo_handle_world(display, layout.angle_radius_world);
-        angle_gizmo_handle_hit(pointer, project, handle).then_some(layout.target)
+        angle_gizmo_handle_hit(pointer, &project_shifted, handle).then_some(layout.target)
     })
 }
 
@@ -2451,7 +2476,7 @@ fn handle_angle_gizmo_drag(
         if let Some(pos) = pointer {
             let project = |w: glam::Vec3| cam.project(w, viewport, vp);
             if let Some(target) =
-                angle_gizmo_hit_target(layouts, pos, &project, Some(angle_gizmo_constraint))
+                angle_gizmo_hit_target(layouts, pos, &project, Some(angle_gizmo_constraint), viewport)
             {
                 if document_health::require_constraint_editable(
                     &state.document_health,
@@ -2800,6 +2825,7 @@ impl App {
                 pp,
                 &project,
                 angle_gizmo_constraint,
+                viewport,
             )
             .is_some()
             {
@@ -3616,6 +3642,7 @@ impl App {
                             pp,
                             &project,
                             angle_gizmo_constraint,
+                            viewport,
                         )
                     })
                     .or(self.angle_gizmo_drag.map(|d| d.constraint_id));
@@ -3628,6 +3655,7 @@ impl App {
                         &self.state.document_health,
                         angle_gizmo_constraint,
                         hovered_angle_gizmo,
+                        viewport,
                     );
                 } else {
                     let arc_layouts: Vec<_> = layouts
@@ -3644,6 +3672,7 @@ impl App {
                             &self.state.document_health,
                             angle_gizmo_constraint,
                             hovered_angle_gizmo,
+                            viewport,
                         );
                     }
                 }
@@ -3674,14 +3703,43 @@ impl App {
                         rotation_sign: _,
                     }) = edit.target.dimension_target(&self.state.doc)
                     {
-                        angle_constraint_display(&self.state.doc, line_a, line_b).and_then(
-                            |display| {
-                                project(display.center).map(|pc| dim_input_layout_centered_on(
-                                    egui::Rect::from_center_size(pc, dim_input_size_for_text(&edit.text)),
-                                    &edit.text,
-                                ))
-                            },
-                        )
+                        // Place the input inside the angle (on the bisector), not on the vertex
+                        // where it would overlap both lines.
+                        sketch_session
+                            .and_then(|s| sketch_geometry_frame(&self.state.doc, s.sketch))
+                            .zip(angle_constraint_display(&self.state.doc, line_a, line_b))
+                            .and_then(|(frame, display)| {
+                                let radius_world = pixels_to_world_distance(
+                                    &project,
+                                    display.center,
+                                    display.dir_a,
+                                    effective_arc_dim_offset(None),
+                                );
+                                let label_outset_world = pixels_to_world_distance(
+                                    &project,
+                                    display.center,
+                                    display.dir_a,
+                                    LABEL_OUTSET,
+                                );
+                                arc_dimension_world_geom(
+                                    display.center,
+                                    display.dir_a,
+                                    display.dir_b,
+                                    frame.normal,
+                                    radius_world,
+                                    label_outset_world,
+                                )
+                                .and_then(|wg| project(wg.label_center))
+                                .map(|pc| {
+                                    dim_input_layout_centered_on(
+                                        egui::Rect::from_center_size(
+                                            pc,
+                                            dim_input_size_for_text(&edit.text),
+                                        ),
+                                        &edit.text,
+                                    )
+                                })
+                            })
                     } else {
                         None
                     };

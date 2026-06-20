@@ -227,7 +227,8 @@ pub fn set_constraint_dim_offset(doc: &mut Document, index: ConstraintId, offset
 pub fn find_distance_constraint(doc: &Document, target: DistanceTarget) -> Option<ConstraintId> {
     let target = normalize_distance_target(target);
     doc.constraints.iter().position(|c| {
-        matches!(&c.kind, ConstraintKind::Distance { target: t } if normalize_distance_target(*t) == target)
+        !c.deleted
+            && matches!(&c.kind, ConstraintKind::Distance { target: t } if normalize_distance_target(*t) == target)
     })
 }
 
@@ -238,14 +239,15 @@ pub fn find_angle_constraint(
 ) -> Option<ConstraintId> {
     let (line_a, line_b) = normalize_line_pair(line_a, line_b);
     doc.constraints.iter().position(|c| {
-        matches!(
-            c.kind,
-            ConstraintKind::Angle {
-                line_a: a,
-                line_b: b,
-                ..
-            } if a == line_a && b == line_b
-        )
+        !c.deleted
+            && matches!(
+                c.kind,
+                ConstraintKind::Angle {
+                    line_a: a,
+                    line_b: b,
+                    ..
+                } if a == line_a && b == line_b
+            )
     })
 }
 

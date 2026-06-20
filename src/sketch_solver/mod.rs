@@ -12,7 +12,7 @@ mod system;
 
 pub use bridge::{
     sketch_conflicting_constraints, sketch_dof_remaining, sketch_line_vertex_drag_blocked,
-    solve_document_sketches,
+    sketch_point_movable, solve_document_sketches,
 };
 
 #[cfg(test)]

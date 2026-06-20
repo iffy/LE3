@@ -66,21 +66,76 @@ impl SketchBridge {
         if self.hold_references {
             return;
         }
+        // Reference geometry must stay put while the movable side is dragged. Holds were
+        // dropped for the whole sketch (hold_references = false during drag), so re-pin the
+        // reference of each direction/distance constraint when its movable side is the one
+        // being dragged. Coincident anchors are intentionally left free so they still follow.
         for constraint in &doc.constraints {
             if constraint.deleted || constraint.sketch != self.sketch {
                 continue;
             }
-            let ConstraintKind::Distance {
-                target:
-                    DistanceTarget::PointPointDistance { anchor, mover, .. },
-            } = constraint.kind
-            else {
-                continue;
-            };
-            if pinned.contains(&mover) && !pinned.contains(&anchor) {
-                let _ = self.anchor_point(anchor, REFERENCE_HOLD_WEIGHT);
-            } else if pinned.contains(&anchor) && !pinned.contains(&mover) {
-                let _ = self.anchor_point(mover, REFERENCE_HOLD_WEIGHT);
+            match constraint.kind {
+                ConstraintKind::Distance {
+                    target: DistanceTarget::PointPointDistance { anchor, mover, .. },
+                } => {
+                    if pinned.contains(&mover) && !pinned.contains(&anchor) {
+                        let _ = self.anchor_point(anchor, REFERENCE_HOLD_WEIGHT);
+                    } else if pinned.contains(&anchor) && !pinned.contains(&mover) {
+                        let _ = self.anchor_point(mover, REFERENCE_HOLD_WEIGHT);
+                    }
+                }
+                ConstraintKind::Distance {
+                    target: DistanceTarget::PointLineDistance { point, line, .. },
+                } => self.hold_reference_when_point_dragged(line, point, &pinned),
+                ConstraintKind::Midpoint { point, line } => {
+                    self.hold_reference_when_point_dragged(line, point, &pinned)
+                }
+                ConstraintKind::Distance {
+                    target: DistanceTarget::LineLineDistance { line_a, line_b, .. },
+                }
+                | ConstraintKind::Parallel { line_a, line_b }
+                | ConstraintKind::Perpendicular { line_a, line_b }
+                | ConstraintKind::Angle { line_a, line_b, .. } => {
+                    let (reference, movable) = parallel_reference_and_movable(line_a, line_b);
+                    self.hold_reference_when_movable_dragged(reference, movable, &pinned);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Hold a constraint's reference line if the dragged geometry is the movable line (and the
+    /// reference itself isn't being dragged).
+    fn hold_reference_when_movable_dragged(
+        &mut self,
+        reference: ConstraintLine,
+        movable: ConstraintLine,
+        pinned: &HashSet<ConstraintPoint>,
+    ) {
+        let reference_points = line_endpoint_points(reference);
+        let movable_points = line_endpoint_points(movable);
+        let movable_dragged = movable_points.iter().any(|p| pinned.contains(p));
+        let reference_dragged = reference_points.iter().any(|p| pinned.contains(p));
+        if movable_dragged && !reference_dragged {
+            for point in reference_points {
+                let _ = self.anchor_point(point, REFERENCE_HOLD_WEIGHT);
+            }
+        }
+    }
+
+    /// Hold a reference line if the dragged geometry is the constrained point (and the line
+    /// itself isn't being dragged).
+    fn hold_reference_when_point_dragged(
+        &mut self,
+        line: ConstraintLine,
+        point: ConstraintPoint,
+        pinned: &HashSet<ConstraintPoint>,
+    ) {
+        let reference_points = line_endpoint_points(line);
+        let reference_dragged = reference_points.iter().any(|p| pinned.contains(p));
+        if pinned.contains(&point) && !reference_dragged {
+            for reference_point in reference_points {
+                let _ = self.anchor_point(reference_point, REFERENCE_HOLD_WEIGHT);
             }
         }
     }
@@ -170,6 +225,7 @@ impl SketchBridge {
             for corner in 0..4u8 {
                 self.ensure_rect_corner(doc, index, corner)?;
             }
+            self.add_rect_rigidity(index)?;
         }
         for (index, circle) in doc.circles.iter().enumerate() {
             if circle.deleted || circle.sketch != self.sketch {
@@ -211,6 +267,41 @@ impl SketchBridge {
         let (u, v) = point_uv(doc, point)?;
         let (u_id, v_id) = self.system.add_point(u as f64, v as f64, false);
         self.point_vars.insert(point, (u_id, v_id));
+        Ok(())
+    }
+
+    /// A `Rect` is stored axis-aligned (x, y, w, h), so its four solver corners must stay a
+    /// rigid axis-aligned rectangle: bottom/top edges horizontal, left/right edges vertical.
+    /// Without this the corners drift independently — a corner moved by a constraint detaches
+    /// from the rest of the rectangle, and `apply_rect_corners`' bounding box collapses it.
+    fn add_rect_rigidity(&mut self, rect: usize) -> Result<(), String> {
+        let corner_vars = |corner: u8| ConstraintPoint::RectCorner { rect, corner };
+        let (c0x, c0y) = self.point_vars(corner_vars(0))?;
+        let (c1x, c1y) = self.point_vars(corner_vars(1))?;
+        let (c2x, c2y) = self.point_vars(corner_vars(2))?;
+        let (c3x, c3y) = self.point_vars(corner_vars(3))?;
+        // Bottom and top edges horizontal.
+        self.system.add_equation(Equation::Horizontal {
+            y0: c0y,
+            y1: c1y,
+            weight: DEFAULT_WEIGHT,
+        });
+        self.system.add_equation(Equation::Horizontal {
+            y0: c3y,
+            y1: c2y,
+            weight: DEFAULT_WEIGHT,
+        });
+        // Left and right edges vertical.
+        self.system.add_equation(Equation::Vertical {
+            x0: c0x,
+            x1: c3x,
+            weight: DEFAULT_WEIGHT,
+        });
+        self.system.add_equation(Equation::Vertical {
+            x0: c1x,
+            x1: c2x,
+            weight: DEFAULT_WEIGHT,
+        });
         Ok(())
     }
 
@@ -658,6 +749,19 @@ pub fn sketch_dof_remaining(doc: &Document, sketch: SketchId) -> Result<i32, Str
     Ok(dof_remaining(&bridge.system))
 }
 
+/// Whether a sketch point can still move under the current constraints (reference geometry held).
+pub fn sketch_point_movable(
+    doc: &Document,
+    sketch: SketchId,
+    point: ConstraintPoint,
+) -> Result<bool, String> {
+    let bridge = SketchBridge::from_document(doc, sketch, true)?;
+    match bridge.point_solver_vars(point) {
+        Ok((u, v)) => Ok(vars_can_move_together(&bridge.system, &[u, v])),
+        Err(_) => Ok(false),
+    }
+}
+
 /// Whether a sketch line's endpoints still have any freedom to move.
 pub fn sketch_line_vertex_drag_blocked(
     doc: &Document,
@@ -717,6 +821,29 @@ fn sketches_to_solve(doc: &Document, pins: &[(ConstraintPoint, (f32, f32))]) -> 
     let mut ordered: Vec<SketchId> = sketches.into_iter().collect();
     ordered.sort_unstable();
     ordered
+}
+
+/// The two endpoint points that define a constraint line (line endpoints or rect-edge corners).
+fn line_endpoint_points(line: ConstraintLine) -> [ConstraintPoint; 2] {
+    match line {
+        ConstraintLine::Line(index) => [
+            ConstraintPoint::LineEndpoint {
+                line: index,
+                end: LineEnd::Start,
+            },
+            ConstraintPoint::LineEndpoint {
+                line: index,
+                end: LineEnd::End,
+            },
+        ],
+        ConstraintLine::RectEdge { rect, edge } => {
+            let (c0, c1) = edge.corner_indices();
+            [
+                ConstraintPoint::RectCorner { rect, corner: c0 },
+                ConstraintPoint::RectCorner { rect, corner: c1 },
+            ]
+        }
+    }
 }
 
 fn point_sketch(doc: &Document, point: ConstraintPoint) -> Option<SketchId> {
@@ -803,6 +930,111 @@ mod tests {
 
     fn solve_bridge(doc: &mut Document, _sketch: SketchId) {
         solve_document_sketches(doc, &[]).expect("solve");
+    }
+
+    /// A rectangle has 4 degrees of freedom (x, y, w, h), not 8 — its corners are not
+    /// four independent points. The solver must keep it rigid/axis-aligned.
+    #[test]
+    fn free_rectangle_reports_four_dof() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 6.0));
+        assert_eq!(sketch_dof_remaining(&doc, sketch).unwrap(), 4);
+    }
+
+    /// When a constraint pulls one rectangle corner, the rectangle must stay rigid so the
+    /// corner actually tracks what it is tied to (here, a coincident line endpoint).
+    #[test]
+    fn solver_keeps_rect_rigid_when_corner_pulled_by_coincidence() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 6.0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 10.0, 6.0, 16.0, 6.0));
+        doc.shape_order.push(crate::model::ShapeKind::Rect);
+        doc.shape_order.push(crate::model::ShapeKind::Line);
+
+        let corner2 = ConstraintPoint::RectCorner { rect: 0, corner: 2 };
+        let line_start = ConstraintPoint::LineEndpoint {
+            line: 0,
+            end: LineEnd::Start,
+        };
+        let mut sel = SceneSelection::default();
+        click_scene_selection(&mut sel, SceneElement::Point(corner2), false);
+        click_scene_selection(&mut sel, SceneElement::Point(line_start), true);
+        add_geometric_constraint_from_selection(
+            &mut doc,
+            sketch,
+            GeometricConstraintType::Coincident,
+            &sel,
+        )
+        .unwrap();
+        let mut sel = SceneSelection::default();
+        click_scene_selection(&mut sel, SceneElement::Line(0), false);
+        add_geometric_constraint_from_selection(
+            &mut doc,
+            sketch,
+            GeometricConstraintType::Horizontal,
+            &sel,
+        )
+        .unwrap();
+
+        // Pull the far line endpoint down; the near end (and the rect corner) must follow.
+        let line_end = ConstraintPoint::LineEndpoint {
+            line: 0,
+            end: LineEnd::End,
+        };
+        let pins = [(line_end, (16.0_f32, 3.0_f32))];
+        solve_document_sketches(&mut doc, &pins).unwrap();
+
+        let (lsu, lsv) = point_uv(&doc, line_start).unwrap();
+        let (c2u, c2v) = point_uv(&doc, corner2).unwrap();
+        assert!(
+            (c2u - lsu).abs() < 0.1 && (c2v - lsv).abs() < 0.1,
+            "rect corner detached from coincident line start: corner=({c2u},{c2v}) line_start=({lsu},{lsv})"
+        );
+        assert!((c2v - 3.0).abs() < 0.3, "rect corner should follow to v=3, got {c2v}");
+    }
+
+    /// Dragging the movable line of a parallel pair must not drag the reference line.
+    #[test]
+    fn drag_parallel_movable_does_not_move_reference() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 100.0, 0.0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 40.0, 100.0, 40.0));
+        doc.shape_order.push(crate::model::ShapeKind::Line);
+        doc.shape_order.push(crate::model::ShapeKind::Line);
+        let mut sel = SceneSelection::default();
+        click_scene_selection(&mut sel, SceneElement::Line(0), false);
+        click_scene_selection(&mut sel, SceneElement::Line(1), true);
+        add_geometric_constraint_from_selection(
+            &mut doc,
+            sketch,
+            GeometricConstraintType::Parallel,
+            &sel,
+        )
+        .unwrap();
+
+        let pins = [(
+            ConstraintPoint::LineEndpoint {
+                line: 1,
+                end: LineEnd::End,
+            },
+            (100.0_f32, 80.0_f32),
+        )];
+        solve_document_sketches(&mut doc, &pins).unwrap();
+
+        let a = &doc.lines[0];
+        assert!(
+            a.x0.abs() < 0.5 && a.y0.abs() < 0.5 && (a.x1 - 100.0).abs() < 0.5 && a.y1.abs() < 0.5,
+            "reference line A drifted to ({},{})-({},{})",
+            a.x0,
+            a.y0,
+            a.x1,
+            a.y1
+        );
     }
 
     #[test]

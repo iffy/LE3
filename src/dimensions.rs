@@ -645,6 +645,20 @@ pub struct ArcDimensionGeom {
     pub end_tangent: Vec2,
 }
 
+impl ArcDimensionGeom {
+    /// Shift every screen point by `offset` (tangents are directions and stay unchanged).
+    pub fn translated(&self, offset: Vec2) -> Self {
+        Self {
+            center: self.center + offset,
+            start: self.start + offset,
+            end: self.end + offset,
+            label_center: self.label_center + offset,
+            start_tangent: self.start_tangent,
+            end_tangent: self.end_tangent,
+        }
+    }
+}
+
 pub fn arc_dimension_world_geom(
     center: Vec3,
     dir_a: Vec3,
@@ -771,6 +785,20 @@ pub fn angle_gizmo_handle_world(
     radius_world: f32,
 ) -> Vec3 {
     display.center + display.dir_b * radius_world
+}
+
+/// Screen-space translation that brings `anchor` inside `viewport` (shrunk by `pad`), keeping
+/// the angle gizmo grabbable when the lines' meeting point is off-screen. Returns a zero offset
+/// when the anchor is already comfortably inside the viewport.
+pub fn angle_gizmo_viewport_offset(anchor: Pos2, viewport: Rect, pad: f32) -> Vec2 {
+    let min = viewport.min + Vec2::splat(pad);
+    let max = viewport.max - Vec2::splat(pad);
+    // Degenerate viewport: nothing sensible to clamp to.
+    if min.x > max.x || min.y > max.y {
+        return Vec2::ZERO;
+    }
+    let clamped = Pos2::new(anchor.x.clamp(min.x, max.x), anchor.y.clamp(min.y, max.y));
+    clamped - anchor
 }
 
 pub fn angle_gizmo_handle_hit(
@@ -991,6 +1019,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn angle_gizmo_offset_zero_when_anchor_inside() {
+        let viewport = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+        let offset = angle_gizmo_viewport_offset(Pos2::new(400.0, 300.0), viewport, 24.0);
+        assert!(offset.length() < 1e-6, "offset={offset:?}");
+    }
+
+    #[test]
+    fn angle_gizmo_offset_clamps_offscreen_anchor_to_padded_edge() {
+        let viewport = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+        let pad = 24.0;
+        // Anchor far off the left and below the bottom.
+        let anchor = Pos2::new(-500.0, 5000.0);
+        let offset = angle_gizmo_viewport_offset(anchor, viewport, pad);
+        let placed = anchor + offset;
+        assert!((placed.x - pad).abs() < 1e-3, "x={}", placed.x);
+        assert!((placed.y - (600.0 - pad)).abs() < 1e-3, "y={}", placed.y);
+    }
 
     #[test]
     fn outward_perpendicular_points_away_from_interior() {

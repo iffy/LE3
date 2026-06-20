@@ -1,12 +1,14 @@
 //! Drag sketch vertices and line segments in the viewport while satisfying active constraints.
 
 use crate::constraints::{
-    constraint_evaluated_length, find_distance_constraint, solve_document_constraints_with_pins,
+    constraint_evaluated_angle, constraint_evaluated_length, find_distance_constraint,
+    solve_document_constraints_with_pins,
 };
 use crate::model::RectEdge;
 use crate::construction::point_sketch;
 use crate::geometric_constraints::{
-    line_uv_endpoints, point_uv, set_line_uv_endpoints, set_point_uv, translate_line,
+    line_direction_uv, line_uv_endpoints, point_uv, set_line_uv_endpoints, set_point_uv,
+    translate_line,
 };
 use crate::hierarchy::SceneElement;
 use crate::model::{
@@ -524,6 +526,12 @@ fn project_drag_uv(
                 projected_u = pu;
                 projected_v = pv;
             }
+            if let Some((pu, pv)) =
+                project_endpoint_onto_direction(doc, line_index, end, projected_u, projected_v)?
+            {
+                projected_u = pu;
+                projected_v = pv;
+            }
             Ok((projected_u, projected_v))
         }
         _ => {
@@ -538,13 +546,117 @@ fn project_drag_uv(
     }
 }
 
+/// The unit direction a line's `start -> end` must have because of a direction constraint
+/// (parallel/perpendicular/angle), oriented to match the line's current direction.
+fn constrained_line_direction(doc: &Document, line_index: usize) -> Option<(f32, f32)> {
+    let this = ConstraintLine::Line(line_index);
+    let (cur_du, cur_dv) = line_direction_uv(doc, this)?;
+    for (index, constraint) in doc.constraints.iter().enumerate() {
+        if constraint.deleted {
+            continue;
+        }
+        let candidates: Vec<(f32, f32)> = match constraint.kind {
+            ConstraintKind::Parallel { line_a, line_b } => {
+                let Some(reference) = direction_reference(this, line_a, line_b) else {
+                    continue;
+                };
+                let (rdu, rdv) = line_direction_uv(doc, reference)?;
+                vec![(rdu, rdv), (-rdu, -rdv)]
+            }
+            ConstraintKind::Perpendicular { line_a, line_b } => {
+                let Some(reference) = direction_reference(this, line_a, line_b) else {
+                    continue;
+                };
+                let (rdu, rdv) = line_direction_uv(doc, reference)?;
+                vec![(-rdv, rdu), (rdv, -rdu)]
+            }
+            ConstraintKind::Angle { line_a, line_b, .. } => {
+                let Some(reference) = direction_reference(this, line_a, line_b) else {
+                    continue;
+                };
+                let (rdu, rdv) = line_direction_uv(doc, reference)?;
+                let angle = constraint_evaluated_angle(doc, index)?;
+                let (cos, sin) = (angle.cos(), angle.sin());
+                let rot_pos = (rdu * cos - rdv * sin, rdu * sin + rdv * cos);
+                let rot_neg = (rdu * cos + rdv * sin, -rdu * sin + rdv * cos);
+                vec![
+                    rot_pos,
+                    rot_neg,
+                    (-rot_pos.0, -rot_pos.1),
+                    (-rot_neg.0, -rot_neg.1),
+                ]
+            }
+            _ => continue,
+        };
+        // The line currently satisfies the constraint, so pick the candidate direction that
+        // best matches the current orientation (resolving the parallel/perp/angle sign).
+        return candidates.into_iter().max_by(|a, b| {
+            let da = a.0 * cur_du + a.1 * cur_dv;
+            let db = b.0 * cur_du + b.1 * cur_dv;
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    None
+}
+
+fn direction_reference(
+    this: ConstraintLine,
+    line_a: ConstraintLine,
+    line_b: ConstraintLine,
+) -> Option<ConstraintLine> {
+    if line_a == this {
+        Some(line_b)
+    } else if line_b == this {
+        Some(line_a)
+    } else {
+        None
+    }
+}
+
+/// If the dragged endpoint's line has a direction constraint and the other endpoint is fixed,
+/// slide the target along the constrained ray (so the drag can't override the direction).
+fn project_endpoint_onto_direction(
+    doc: &Document,
+    line_index: usize,
+    end: LineEnd,
+    u: f32,
+    v: f32,
+) -> Result<Option<(f32, f32)>, String> {
+    let Some((dir_u, dir_v)) = constrained_line_direction(doc, line_index) else {
+        return Ok(None);
+    };
+    let Some(sketch) = doc.lines.get(line_index).map(|line| line.sketch) else {
+        return Ok(None);
+    };
+    let other = ConstraintPoint::LineEndpoint {
+        line: line_index,
+        end: match end {
+            LineEnd::Start => LineEnd::End,
+            LineEnd::End => LineEnd::Start,
+        },
+    };
+    // Only constrain the drag when the other endpoint cannot move; otherwise the solver keeps
+    // the direction by moving that endpoint and the dragged end should follow the cursor.
+    if crate::sketch_solver::sketch_point_movable(doc, sketch, other).unwrap_or(true) {
+        return Ok(None);
+    }
+    let (ox, ov) = point_uv(doc, other)?;
+    // The ray runs from the fixed endpoint toward the dragged one along the line direction.
+    let (ray_u, ray_v) = match end {
+        LineEnd::End => (dir_u, dir_v),
+        LineEnd::Start => (-dir_u, -dir_v),
+    };
+    let t = ((u - ox) * ray_u + (v - ov) * ray_v).max(1e-3);
+    Ok(Some((ox + ray_u * t, ov + ray_v * t)))
+}
+
 fn coincident_group(doc: &Document, sketch: SketchId, seed: ConstraintPoint) -> Vec<ConstraintPoint> {
     let mut group = vec![seed];
     let mut changed = true;
     while changed {
         changed = false;
         for constraint in &doc.constraints {
-            if constraint.sketch != sketch {
+            if constraint.deleted || constraint.sketch != sketch {
                 continue;
             }
             let ConstraintKind::Coincident { a, b } = constraint.kind else {
@@ -660,7 +772,7 @@ fn project_endpoint_with_length(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constraints::{add_distance_constraint, solve_document_constraints};
+    use crate::constraints::{add_angle_constraint, add_distance_constraint, solve_document_constraints};
     use crate::model::RectEdge;
     use crate::geometric_constraints::{
         add_geometric_constraint_from_selection, line_direction_uv, GeometricConstraintType,
@@ -1887,6 +1999,125 @@ mod tests {
             (point_point_distance_mm(&doc, rect_top_left, line_vertex) - 45.0).abs() < EPS,
             "distance to line vertex must stay 45mm, got {}",
             point_point_distance_mm(&doc, rect_top_left, line_vertex)
+        );
+    }
+
+    fn line_top_edge_angle(doc: &Document) -> f32 {
+        let (ldu, ldv) = line_direction_uv(doc, ConstraintLine::Line(0)).unwrap();
+        let (tdu, tdv) = line_direction_uv(
+            doc,
+            ConstraintLine::RectEdge {
+                rect: 0,
+                edge: RectEdge::Top,
+            },
+        )
+        .unwrap();
+        (ldu * tdu + ldv * tdv).clamp(-1.0, 1.0).acos()
+    }
+
+    /// Regression: with one end of the line coincident to a rect corner and a 45° angle to the
+    /// rect edge, dragging the free end must keep the angle — it must not slide off freely.
+    #[test]
+    fn drag_angle_constrained_line_end_preserves_angle() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 40.0, 40.0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 40.0, 40.0, 80.0, 80.0));
+        doc.shape_order.push(crate::model::ShapeKind::Rect);
+        doc.shape_order.push(crate::model::ShapeKind::Line);
+
+        let corner2 = ConstraintPoint::RectCorner { rect: 0, corner: 2 };
+        let line_start = ConstraintPoint::LineEndpoint {
+            line: 0,
+            end: LineEnd::Start,
+        };
+        let mut sel = SceneSelection::default();
+        click_scene_selection(&mut sel, SceneElement::Point(corner2), false);
+        click_scene_selection(&mut sel, SceneElement::Point(line_start), true);
+        add_geometric_constraint_from_selection(
+            &mut doc,
+            sketch,
+            GeometricConstraintType::Coincident,
+            &sel,
+        )
+        .unwrap();
+        add_angle_constraint(
+            &mut doc,
+            sketch,
+            ConstraintLine::RectEdge {
+                rect: 0,
+                edge: RectEdge::Top,
+            },
+            ConstraintLine::Line(0),
+            "45 deg".to_string(),
+        )
+        .unwrap();
+
+        let angle_before = line_top_edge_angle(&doc);
+        // Drag the free end far off the 45° ray.
+        drag_point(
+            &mut doc,
+            sketch,
+            ConstraintPoint::LineEndpoint {
+                line: 0,
+                end: LineEnd::End,
+            },
+            80.0,
+            45.0,
+        )
+        .unwrap();
+        let angle_after = line_top_edge_angle(&doc);
+        assert!(
+            (angle_after - angle_before).abs() < 2.0_f32.to_radians(),
+            "angle drifted from {} to {} deg",
+            angle_before.to_degrees(),
+            angle_after.to_degrees()
+        );
+    }
+
+    /// Regression: after deleting a coincident constraint, the two vertices must no longer
+    /// move together.
+    #[test]
+    fn deleted_coincident_constraint_no_longer_couples_vertices() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 10.0, 0.0, 10.0, 8.0));
+        doc.shape_order.push(crate::model::ShapeKind::Line);
+        doc.shape_order.push(crate::model::ShapeKind::Line);
+
+        let p0 = ConstraintPoint::LineEndpoint {
+            line: 0,
+            end: LineEnd::End,
+        };
+        let p1 = ConstraintPoint::LineEndpoint {
+            line: 1,
+            end: LineEnd::Start,
+        };
+        let mut sel = SceneSelection::default();
+        click_scene_selection(&mut sel, SceneElement::Point(p0), false);
+        click_scene_selection(&mut sel, SceneElement::Point(p1), true);
+        let id = add_geometric_constraint_from_selection(
+            &mut doc,
+            sketch,
+            GeometricConstraintType::Coincident,
+            &sel,
+        )
+        .unwrap();
+
+        // Delete the coincident constraint.
+        crate::document_lifecycle::tombstone_element(&mut doc, SceneElement::Constraint(id));
+
+        let partner_before = point_uv(&doc, p1).unwrap();
+        drag_point(&mut doc, sketch, p0, 5.0, 5.0).unwrap();
+        let partner_after = point_uv(&doc, p1).unwrap();
+
+        assert!(
+            (partner_after.0 - partner_before.0).abs() < EPS
+                && (partner_after.1 - partner_before.1).abs() < EPS,
+            "partner vertex moved with a deleted coincident constraint: {partner_before:?} -> {partner_after:?}"
         );
     }
 
