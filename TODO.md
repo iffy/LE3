@@ -1,14 +1,16 @@
 # Ready to do
 
+[ ] Extrude. Add an extrude tool (use the extrude icon). Once the tool is selected, you can click faces within the same plane to toggle whether they are included in the extrusion or not. Highlight selectable faces on hover. When one or more faces are selected, a single gizmo should appear with an arrow pointing normal to the plane. You can drag the gizmo handle to extrude the face to that point. You should be able to extrude in either the positive or negative direction. There should also be a text input you can use to set the extrusion distance (using expressions and variables). If only the gizmo is used, there are no constraints. An extrusion will create a 3D solid. In the elements pane, there will be an "Extrusion" element that represents the action of extruding. Double-clicking it (or right-click > Edit) lets you edit the extrusion. While dditing an extrusion, you can toggle which faces are part of the extrusion by clicking on them and you can adjust the extrusion length using the gizmo or text input. Also make it so that I can extrude to an object (vertex, face, plane). The UI for this is, once I click the gizmo to start dragging, I can drag to some object (with snapping hover). If I let go, constrain the extrusion to that vertex/face/plane. The extrusion should only happen normal to the faces being extruded. If I extrude to a plane/face, the extrusion should go to the extended version of that plane/face in space. 
+
 # Needs description
 
 [ ] Snap to offset places (dashed lines)
 [ ] Let me right click a Sketch to export to DXF. In the context pane, show options like "include construction lines".
-[ ] Extrude
 [ ] STL export
 [ ] Step export
 [ ] Technical drawings
 [ ] Click lines multiple times to draw polygon (after snapping). Let me choose relative angles from last line (or from horizontal/vertical)
+[ ] Click drag lines to make curves
 
 # Done
 
