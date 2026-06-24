@@ -1,0 +1,1 @@
+Face picking (Sketch/Rectangle/Line/Circle/Extrude hover and click) now prefers the face nearest the camera when several overlap under the cursor, so it no longer selects the hidden back face of an extruded body (#18).

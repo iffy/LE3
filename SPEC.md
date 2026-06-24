@@ -86,6 +86,9 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
   offset along the extrusion normal — and the geometry drawn there behaves exactly like any
   other sketch. Such a sketch (and anything built from it) nests under, and depends on, the
   extrusion whose face it sits on. A solid cap occludes the datum plane behind it for picking.
+  When several faces project onto the cursor (e.g. the near and far faces of a solid), face
+  picking resolves to the one nearest the camera, so a hover/click never selects a face hidden
+  behind the body.
 - Sketch entities: line, arc, circle, ellipse, spline, point, and construction-geometry
   variants. Convenience primitives (e.g. **rectangle**, drawn as four constrained lines)
   may be offered as tools that emit the underlying entities.

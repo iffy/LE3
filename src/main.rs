@@ -646,6 +646,7 @@ impl App {
                             origin,
                             normal,
                             faces,
+                            self.state.cam.eye(),
                         ) {
                             self.pending_extrude_target = Some(target);
                             self.state.apply(Action::SetExtrudeDistance { distance: dist });
@@ -682,7 +683,7 @@ impl App {
         // Click toggles the face under the cursor (highlighted via the GPU hover).
         if primary_pressed {
             if let Some(pp) = pointer_screen {
-                if let Some(face) = pick_extrude_face(pp, project, &self.state.doc) {
+                if let Some(face) = pick_extrude_face(pp, project, &self.state.doc, self.state.cam.eye()) {
                     self.state.apply(Action::ToggleExtrudeFace { face });
                 }
             }
@@ -1323,10 +1324,10 @@ fn resolve_viewport_hover_highlight(
     }
     let pp = pointer_screen?;
     match tool {
-        Tool::Sketch => pick_sketch_face(pp, project, doc)
+        Tool::Sketch => pick_sketch_face(pp, project, doc, cam.eye())
             .map(gpu_viewport::ViewportHoverHighlight::SketchFace),
         Tool::Rectangle | Tool::Line | Tool::Circle if sketch_session.is_none() => {
-            pick_sketch_face(pp, project, doc)
+            pick_sketch_face(pp, project, doc, cam.eye())
                 .map(gpu_viewport::ViewportHoverHighlight::SketchFace)
         }
         Tool::ConstructionPlane if !creating_plane => {
@@ -2601,8 +2602,9 @@ fn pick_extrude_face(
     pp: egui::Pos2,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
     doc: &model::Document,
+    eye: Vec3,
 ) -> Option<model::ExtrudeFace> {
-    match pick_sketch_face(pp, project, doc)? {
+    match pick_sketch_face(pp, project, doc, eye)? {
         FaceId::Rect(i) => Some(model::ExtrudeFace::Rect(i)),
         FaceId::Circle(i) => Some(model::ExtrudeFace::Circle(i)),
         FaceId::ConstructionPlane(_) | FaceId::ExtrudeCap { .. } | FaceId::ExtrudeSide { .. } => {
@@ -2642,6 +2644,7 @@ fn pick_extrude_target(
     base: Vec3,
     normal: Vec3,
     exclude: &[model::ExtrudeFace],
+    eye: Vec3,
 ) -> Option<(model::ExtrudeTarget, f32)> {
     use model::ExtrudeTarget;
     const VERTEX_RADIUS_PX: f32 = 12.0;
@@ -2662,7 +2665,7 @@ fn pick_extrude_target(
     let target = if let Some((_, t)) = best {
         t
     } else {
-        match pick_sketch_face(pp, project, doc)? {
+        match pick_sketch_face(pp, project, doc, eye)? {
             FaceId::Rect(i) if !exclude.contains(&model::ExtrudeFace::Rect(i)) => {
                 ExtrudeTarget::Face(model::ExtrudeFace::Rect(i))
             }
@@ -3493,14 +3496,14 @@ impl App {
         if self.state.tool == Tool::Sketch {
             if let Some(pp) = pointer_screen {
                 if ui.input(|i| i.pointer.primary_pressed()) {
-                    if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
+                    if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc, self.state.cam.eye()) {
                         self.state.apply(Action::BeginSketch {
                             face,
                             viewport: Some(viewport),
                         });
                     }
                 } else if !self.gpu_viewport && !suppress_hover_highlight {
-                    if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
+                    if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc, self.state.cam.eye()) {
                         draw_face_highlight(
                             &painter,
                             &project,
@@ -3517,14 +3520,14 @@ impl App {
             if self.state.sketch_session.is_none() {
                 if let Some(pp) = pointer_screen {
                     if ui.input(|i| i.pointer.primary_pressed()) {
-                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
+                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc, self.state.cam.eye()) {
                             self.state.apply(Action::BeginSketch {
                                 face,
                                 viewport: Some(viewport),
                             });
                         }
                     } else if !self.gpu_viewport && !suppress_hover_highlight {
-                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
+                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc, self.state.cam.eye()) {
                             draw_face_highlight(
                                 &painter,
                                 &project,
@@ -3616,14 +3619,14 @@ impl App {
             if self.state.sketch_session.is_none() {
                 if let Some(pp) = pointer_screen {
                     if ui.input(|i| i.pointer.primary_pressed()) {
-                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
+                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc, self.state.cam.eye()) {
                             self.state.apply(Action::BeginSketch {
                                 face,
                                 viewport: Some(viewport),
                             });
                         }
                     } else if !self.gpu_viewport && !suppress_hover_highlight {
-                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
+                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc, self.state.cam.eye()) {
                             draw_face_highlight(
                                 &painter,
                                 &project,
@@ -3695,14 +3698,14 @@ impl App {
             if self.state.sketch_session.is_none() {
                 if let Some(pp) = pointer_screen {
                     if ui.input(|i| i.pointer.primary_pressed()) {
-                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
+                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc, self.state.cam.eye()) {
                             self.state.apply(Action::BeginSketch {
                                 face,
                                 viewport: Some(viewport),
                             });
                         }
                     } else if !self.gpu_viewport && !suppress_hover_highlight {
-                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc) {
+                        if let Some(face) = pick_sketch_face(pp, &project, &self.state.doc, self.state.cam.eye()) {
                             draw_face_highlight(
                                 &painter,
                                 &project,
@@ -4075,7 +4078,7 @@ impl App {
         if self.state.tool == Tool::Extrude {
             if self.extrude_gizmo_drag.is_none() {
                 hover_highlight = pointer_screen
-                    .and_then(|pp| pick_extrude_face(pp, &project, doc))
+                    .and_then(|pp| pick_extrude_face(pp, &project, doc, cam.eye()))
                     .map(|f| gpu_viewport::ViewportHoverHighlight::SketchFace(extrude_face_id(f)));
             }
             if let Some(ce) = self.state.creating_extrusion.as_ref() {

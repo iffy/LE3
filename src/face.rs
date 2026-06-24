@@ -645,31 +645,60 @@ pub fn face_label(_doc: &Document, face: FaceId) -> String {
     }
 }
 
+/// Screen-distance band within which two face picks count as "the same depth
+/// under the cursor", so the nearer (camera-facing) one is preferred. This is
+/// what keeps a hovered solid from selecting its hidden back face.
+const FACE_PICK_DEPTH_TIE_PX: f32 = 0.5;
+
 fn consider_face_pick(
-    best: &mut Option<(FaceId, f32)>,
+    best: &mut Option<(FaceId, f32, f32)>,
     face: FaceId,
     dist: f32,
+    depth: f32,
 ) {
-    if dist <= crate::construction::FACE_PICK_MARGIN_PX
-        && best.as_ref().is_none_or(|(_, d)| dist < *d)
-    {
-        *best = Some((face, dist));
+    if dist > crate::construction::FACE_PICK_MARGIN_PX {
+        return;
     }
+    let better = match best.as_ref() {
+        None => true,
+        Some((_, best_dist, best_depth)) => {
+            if dist < best_dist - FACE_PICK_DEPTH_TIE_PX {
+                true
+            } else if dist > best_dist + FACE_PICK_DEPTH_TIE_PX {
+                false
+            } else {
+                // Essentially the same screen distance (e.g. cursor inside both the
+                // front and back face of a solid): prefer the one nearer the camera.
+                depth < *best_depth
+            }
+        }
+    };
+    if better {
+        *best = Some((face, dist, depth));
+    }
+}
+
+fn centroid(points: &[Vec3]) -> Vec3 {
+    if points.is_empty() {
+        return Vec3::ZERO;
+    }
+    points.iter().copied().sum::<Vec3>() / points.len() as f32
 }
 
 fn quad_face_pick_distance(
     screen: eframe::egui::Pos2,
     project: &impl Fn(Vec3) -> Option<eframe::egui::Pos2>,
     corners: [Vec3; 4],
-) -> Option<f32> {
+) -> Option<(f32, Vec3)> {
     let pts: Option<Vec<eframe::egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
     let pts = pts?;
     let quad = [pts[0], pts[1], pts[2], pts[3]];
-    Some(if point_in_screen_quad(screen, quad) {
+    let dist = if point_in_screen_quad(screen, quad) {
         0.0
     } else {
         dist_point_to_quad_edges(screen, quad)
-    })
+    };
+    Some((dist, centroid(&corners)))
 }
 
 /// Pick a sketchable face (rectangle, circle, or construction plane) under the cursor.
@@ -677,20 +706,22 @@ pub fn pick_sketch_face(
     screen: eframe::egui::Pos2,
     project: &impl Fn(Vec3) -> Option<eframe::egui::Pos2>,
     doc: &Document,
+    eye: Vec3,
 ) -> Option<FaceId> {
-    let mut best: Option<(FaceId, f32)> = None;
+    let mut best: Option<(FaceId, f32, f32)> = None;
+    let depth = |p: Vec3| (p - eye).length();
 
     for (i, rect) in doc.rects.iter().enumerate().rev() {
         if let Some(corners) = rect_world_corners(doc, rect) {
-            if let Some(dist) = quad_face_pick_distance(screen, project, corners) {
-                consider_face_pick(&mut best, FaceId::Rect(i), dist);
+            if let Some((dist, c)) = quad_face_pick_distance(screen, project, corners) {
+                consider_face_pick(&mut best, FaceId::Rect(i), dist, depth(c));
             }
         }
     }
 
     for (i, circle) in doc.circles.iter().enumerate().rev() {
-        if let Some(dist) = circle_face_pick_distance(screen, doc, circle, project) {
-            consider_face_pick(&mut best, FaceId::Circle(i), dist);
+        if let Some((dist, c)) = circle_face_pick_distance(screen, doc, circle, project) {
+            consider_face_pick(&mut best, FaceId::Circle(i), dist, depth(c));
         }
     }
 
@@ -702,7 +733,9 @@ pub fn pick_sketch_face(
         }
         for &profile in &extrusion.faces {
             for top in [true, false] {
-                if let Some(dist) = cap_face_pick_distance(screen, project, doc, ei, profile, top) {
+                if let Some((dist, c)) =
+                    cap_face_pick_distance(screen, project, doc, ei, profile, top)
+                {
                     consider_face_pick(
                         &mut best,
                         FaceId::ExtrudeCap {
@@ -711,12 +744,15 @@ pub fn pick_sketch_face(
                             top,
                         },
                         dist,
+                        depth(c),
                     );
                 }
             }
             // Flat side walls (rectangular profiles) are sketchable too.
             for edge in 0..crate::extrude::side_face_count(profile) {
-                if let Some(dist) = side_face_pick_distance(screen, project, doc, ei, profile, edge) {
+                if let Some((dist, c)) =
+                    side_face_pick_distance(screen, project, doc, ei, profile, edge)
+                {
                     consider_face_pick(
                         &mut best,
                         FaceId::ExtrudeSide {
@@ -725,6 +761,7 @@ pub fn pick_sketch_face(
                             edge: edge as u8,
                         },
                         dist,
+                        depth(c),
                     );
                 }
             }
@@ -733,12 +770,12 @@ pub fn pick_sketch_face(
 
     for (i, plane) in doc.construction_planes.iter().enumerate().rev() {
         let corners = crate::construction::plane_corners(plane, crate::construction::PLANE_DISPLAY_HALF);
-        if let Some(dist) = quad_face_pick_distance(screen, project, corners) {
-            consider_face_pick(&mut best, FaceId::ConstructionPlane(i), dist);
+        if let Some((dist, c)) = quad_face_pick_distance(screen, project, corners) {
+            consider_face_pick(&mut best, FaceId::ConstructionPlane(i), dist, depth(c));
         }
     }
 
-    best.map(|(face, _)| face)
+    best.map(|(face, _, _)| face)
 }
 
 /// Screen-space pick distance to an extrusion cap polygon (0 inside).
@@ -749,7 +786,7 @@ fn cap_face_pick_distance(
     extrusion: usize,
     profile: crate::model::ExtrudeFace,
     top: bool,
-) -> Option<f32> {
+) -> Option<(f32, Vec3)> {
     let poly = crate::extrude::cap_polygon_world(doc, extrusion, profile, top)?;
     polygon_face_pick_distance(screen, project, &poly)
 }
@@ -762,33 +799,35 @@ fn side_face_pick_distance(
     extrusion: usize,
     profile: crate::model::ExtrudeFace,
     edge: usize,
-) -> Option<f32> {
+) -> Option<(f32, Vec3)> {
     let quad = crate::extrude::side_quad_world(doc, extrusion, profile, edge)?;
     polygon_face_pick_distance(screen, project, &quad)
 }
 
-/// Screen-space pick distance to a planar world-space polygon (0 inside, else nearest edge).
+/// Screen-space pick distance to a planar world-space polygon (0 inside, else
+/// nearest edge), paired with the polygon's world centroid for depth ordering.
 fn polygon_face_pick_distance(
     screen: eframe::egui::Pos2,
     project: &impl Fn(Vec3) -> Option<eframe::egui::Pos2>,
     poly: &[Vec3],
-) -> Option<f32> {
+) -> Option<(f32, Vec3)> {
     let pts: Option<Vec<eframe::egui::Pos2>> = poly.iter().map(|&p| project(p)).collect();
     let pts = pts?;
     if pts.len() < 3 {
         return None;
     }
+    let c = centroid(poly);
     // Inside test via triangle fan from the first vertex.
     let inside = (1..pts.len() - 1).any(|i| point_in_tri(screen, pts[0], pts[i], pts[i + 1]));
     if inside {
-        return Some(0.0);
+        return Some((0.0, c));
     }
     let mut edge = f32::MAX;
     for i in 0..pts.len() {
         let j = (i + 1) % pts.len();
         edge = edge.min(dist_point_to_segment_px(screen, pts[i], pts[j]));
     }
-    Some(edge)
+    Some((edge, c))
 }
 
 fn circle_face_pick_distance(
@@ -796,7 +835,7 @@ fn circle_face_pick_distance(
     doc: &Document,
     circle: &Circle,
     project: &impl Fn(Vec3) -> Option<eframe::egui::Pos2>,
-) -> Option<f32> {
+) -> Option<(f32, Vec3)> {
     let center = circle_world_center(doc, circle)?;
     let frame = sketch_geometry_frame(doc, circle.sketch)?;
     let rim = local_to_world(&frame, circle.cx + circle.r, circle.cy);
@@ -807,7 +846,7 @@ fn circle_face_pick_distance(
         return None;
     }
     let d = (screen - center_sp).length();
-    Some(if d <= radius { 0.0 } else { d - radius })
+    Some((if d <= radius { 0.0 } else { d - radius }, center))
 }
 
 fn point_in_screen_quad(p: eframe::egui::Pos2, quad: [eframe::egui::Pos2; 4]) -> bool {
@@ -933,7 +972,7 @@ mod tests {
         doc.circles
             .push(Circle::from_local_center_radius(sketch, 0.0, 0.0, 20.0, 0.0));
         let project = |p: Vec3| Some(eframe::egui::Pos2::new(p.x, p.y));
-        let face = pick_sketch_face(eframe::egui::pos2(5.0, 0.0), &project, &doc);
+        let face = pick_sketch_face(eframe::egui::pos2(5.0, 0.0), &project, &doc, Vec3::new(0.0, 0.0, 100.0));
         assert_eq!(face, Some(FaceId::Circle(0)));
     }
 
@@ -1037,7 +1076,7 @@ mod tests {
         // Offset screen x by height so the top cap (z=10) separates from the base
         // rect; click where only the lifted top cap projects.
         let project = |p: Vec3| Some(eframe::egui::Pos2::new(p.x + p.z, p.y));
-        let face = pick_sketch_face(eframe::egui::pos2(25.0, 10.0), &project, &doc);
+        let face = pick_sketch_face(eframe::egui::pos2(25.0, 10.0), &project, &doc, Vec3::new(0.0, 0.0, 100.0));
         assert!(
             matches!(
                 face,
@@ -1048,6 +1087,24 @@ mod tests {
                 })
             ),
             "clicking the lifted top cap should pick it, got {face:?}"
+        );
+    }
+
+    #[test]
+    fn pick_prefers_the_camera_facing_cap_not_the_hidden_one() {
+        // Top-down orthographic projection: both the top cap (z=10) and the bottom
+        // cap (z=0) of the box project onto the same screen rectangle, so the cursor
+        // at the center is inside both. The visible (camera-facing) cap must win.
+        let doc = doc_with_extruded_box();
+        let project = |p: Vec3| Some(eframe::egui::Pos2::new(p.x, p.y));
+        let cursor = eframe::egui::pos2(10.0, 10.0);
+
+        // Eye above the box: the near top cap must be picked, never the hidden
+        // bottom cap (z=0) which faces away from the camera.
+        let from_above = pick_sketch_face(cursor, &project, &doc, Vec3::new(10.0, 10.0, 100.0));
+        assert!(
+            matches!(from_above, Some(FaceId::ExtrudeCap { top: true, .. })),
+            "looking down should pick the visible top cap, got {from_above:?}"
         );
     }
 
@@ -1101,7 +1158,7 @@ mod tests {
         let doc = doc_with_extruded_box();
         // Project to the XZ plane so the y=0 side wall shows as a 20x10 rectangle.
         let project = |p: Vec3| Some(eframe::egui::Pos2::new(p.x, p.z));
-        let face = pick_sketch_face(eframe::egui::pos2(10.0, 5.0), &project, &doc);
+        let face = pick_sketch_face(eframe::egui::pos2(10.0, 5.0), &project, &doc, Vec3::new(0.0, 0.0, 100.0));
         assert!(
             matches!(face, Some(FaceId::ExtrudeSide { extrusion: 0, .. })),
             "clicking a side wall should pick it, got {face:?}"
