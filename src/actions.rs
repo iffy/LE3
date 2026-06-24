@@ -469,6 +469,12 @@ pub enum Action {
         x1: f32,
         y1: f32,
     },
+    /// Create a circle directly in the active sketch (face-local mm) with a locked diameter.
+    CreateCircle {
+        cx: f32,
+        cy: f32,
+        r: f32,
+    },
     /// Create an extrusion solid from coplanar sketch faces.
     CreateExtrusion {
         sketch: SketchId,
@@ -2346,6 +2352,36 @@ impl AppState {
                 }
                 self.refresh_document_health();
                 self.status = format!("Added rectangle ({width:.1} × {height:.1} mm)");
+                ActionResult::Ok
+            }
+            Action::CreateCircle { cx, cy, r } => {
+                let Some(session) = self.sketch_session else {
+                    return ActionResult::Err("Not in sketch mode".to_string());
+                };
+                if r <= 0.0 {
+                    return ActionResult::Err("Circle needs a positive radius".to_string());
+                }
+                let circle = Circle::from_local_center_radius(session.sketch, cx, cy, r, 0.0);
+                self.doc.circles.push(circle);
+                self.doc.shape_order.push(ShapeKind::Circle);
+                let circle_index = self.doc.circles.len() - 1;
+                if let Err(e) = add_distance_constraint(
+                    &mut self.doc,
+                    session.sketch,
+                    DistanceTarget::CircleDiameter(circle_index),
+                    (r * 2.0).to_string(),
+                ) {
+                    while self.doc.shape_order.last() == Some(&ShapeKind::Constraint) {
+                        self.doc.shape_order.pop();
+                        self.doc.constraints.pop();
+                    }
+                    self.doc.circles.pop();
+                    self.doc.shape_order.pop();
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
+                self.refresh_document_health();
+                self.status = format!("Added circle (⌀{:.1} mm)", r * 2.0);
                 ActionResult::Ok
             }
             Action::CreateLineSegment { x0, y0, x1, y1 } => {

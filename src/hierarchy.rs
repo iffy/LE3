@@ -19,7 +19,10 @@ use eframe::egui::{self, Color32, RichText};
 use std::collections::{HashMap, HashSet};
 
 /// A node in the scene hierarchy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// The derived `Ord` (variant order, then index) gives a stable, creation-ordered
+/// tiebreak when two nodes share a creation rank, so sibling ordering is deterministic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HierarchyNode {
     ConstructionPlane(usize),
     Sketch(SketchId),
@@ -156,8 +159,10 @@ fn face_element(face: FaceId) -> SceneElement {
         FaceId::ConstructionPlane(i) => SceneElement::ConstructionPlane(i),
         FaceId::Rect(i) => SceneElement::Rect(i),
         FaceId::Circle(i) => SceneElement::Circle(i),
-        // A sketch on a body cap depends on the extrusion that produced it.
-        FaceId::ExtrudeCap { extrusion, .. } => SceneElement::Extrusion(extrusion),
+        // A sketch on a body cap or side wall depends on the extrusion that produced it.
+        FaceId::ExtrudeCap { extrusion, .. } | FaceId::ExtrudeSide { extrusion, .. } => {
+            SceneElement::Extrusion(extrusion)
+        }
     }
 }
 
@@ -328,7 +333,9 @@ fn topological_flat_sort(
             })
             .copied()
             .collect();
-        ready.sort_by_key(|node| rank(*node));
+        // Rank orders by creation; the node itself is a deterministic, creation-ordered
+        // tiebreak when ranks collide (e.g. the default plane vs. the first shape_order slot).
+        ready.sort_by_key(|node| (rank(*node), *node));
         for node in ready {
             remaining.remove(&node);
             result.push(node);
@@ -459,10 +466,12 @@ fn collect_descendants(doc: &Document, element: SceneElement, out: &mut HashSet<
                     out.insert(SceneElement::Body(bi));
                 }
             }
-            // Sketches placed on this extrusion's cap faces.
+            // Sketches placed on this extrusion's cap or side-wall faces.
             for (si, sketch) in doc.sketches.iter().enumerate() {
                 if !sketch.deleted
-                    && matches!(sketch.face, FaceId::ExtrudeCap { extrusion, .. } if extrusion == index)
+                    && matches!(sketch.face,
+                        FaceId::ExtrudeCap { extrusion, .. } | FaceId::ExtrudeSide { extrusion, .. }
+                        if extrusion == index)
                 {
                     out.insert(SceneElement::Sketch(si));
                     collect_descendants(doc, SceneElement::Sketch(si), out);
@@ -916,7 +925,9 @@ fn build_sketch_extrusions(
                 .collect();
             for (si, sk) in doc.sketches.iter().enumerate() {
                 if !sk.deleted
-                    && matches!(sk.face, FaceId::ExtrudeCap { extrusion, .. } if extrusion == ei)
+                    && matches!(sk.face,
+                        FaceId::ExtrudeCap { extrusion, .. } | FaceId::ExtrudeSide { extrusion, .. }
+                        if extrusion == ei)
                 {
                     children.push(build_sketch_entry(doc, si, sketch_session));
                 }
@@ -1114,6 +1125,29 @@ mod tests {
         doc.lines
             .push(Line::from_local_endpoints(s1, 0.0, 0.0, 5.0, 0.0));
         doc
+    }
+
+    #[test]
+    fn construction_plane_ordering_is_deterministic_by_creation() {
+        let mut doc = Document::default();
+        // Two planes created before any other geometry: the first shape_order slot is
+        // rank 0, which used to tie with the default plane's hardcoded rank 0 and order
+        // randomly (HashSet iteration). Ordering must be stable and by creation order.
+        doc.construction_planes.push(default_xy_plane());
+        doc.shape_order.push(ShapeKind::ConstructionPlane);
+        doc.construction_planes.push(default_xy_plane());
+        doc.shape_order.push(ShapeKind::ConstructionPlane);
+
+        let expected = vec![
+            HierarchyNode::ConstructionPlane(0),
+            HierarchyNode::ConstructionPlane(1),
+            HierarchyNode::ConstructionPlane(2),
+        ];
+        // Repeat: HashSet iteration order is randomized per run, so a non-deterministic
+        // sort would eventually disagree.
+        for _ in 0..50 {
+            assert_eq!(build_element_list(&doc, None), expected);
+        }
     }
 
     #[test]

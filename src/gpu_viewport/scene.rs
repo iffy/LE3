@@ -278,7 +278,7 @@ impl ViewportScene {
                     sketch_color(input.palette.construction, dim),
                     input.document_health.element_status(element),
                 ),
-                shape_fill_depth_bias(ci),
+                shape_fill_depth_bias_laned(ci, 1),
             );
         }
 
@@ -1352,6 +1352,18 @@ impl<'a> SceneMesh<'a> {
                     }
                 }
             }
+            FaceId::ExtrudeSide {
+                extrusion,
+                profile,
+                edge,
+            } => {
+                if let Some(quad) =
+                    crate::extrude::side_quad_world(doc, extrusion, profile, edge as usize)
+                {
+                    self.push_triangle(quad[0], quad[1], quad[2], fill);
+                    self.push_triangle(quad[0], quad[2], quad[3], fill);
+                }
+            }
             FaceId::ConstructionPlane(_) => {}
         }
     }
@@ -1463,6 +1475,22 @@ impl<'a> SceneMesh<'a> {
                         let j = (i + 1) % n;
                         self.push_line_segment(
                             poly[i], poly[j], color, width, cam, viewport, view_proj,
+                        );
+                    }
+                }
+            }
+            FaceId::ExtrudeSide {
+                extrusion,
+                profile,
+                edge,
+            } => {
+                if let Some(quad) =
+                    crate::extrude::side_quad_world(doc, extrusion, profile, edge as usize)
+                {
+                    for i in 0..quad.len() {
+                        let j = (i + 1) % quad.len();
+                        self.push_line_segment(
+                            quad[i], quad[j], color, width, cam, viewport, view_proj,
                         );
                     }
                 }
@@ -1635,7 +1663,17 @@ pub fn fill_color(base: Color32, opacity: f32) -> Color32 {
 }
 
 pub fn shape_fill_depth_bias(index: usize) -> f32 {
-    SHAPE_FILL_DEPTH_BIAS_BASE + index as f32 * SHAPE_FILL_DEPTH_BIAS_STEP
+    shape_fill_depth_bias_laned(index, 0)
+}
+
+/// Depth bias for a coplanar sketch-shape fill. `index` separates shapes of the same type;
+/// `lane` (0 = rectangles, 1 = circles) adds a half-step so two *different* shape types never
+/// land on the same bias — otherwise e.g. rect 0 and circle 0 are coplanar with identical
+/// depth and z-fight ("jaggies" where a circle sits inside a rectangle).
+pub fn shape_fill_depth_bias_laned(index: usize, lane: usize) -> f32 {
+    SHAPE_FILL_DEPTH_BIAS_BASE
+        + index as f32 * SHAPE_FILL_DEPTH_BIAS_STEP
+        + lane as f32 * SHAPE_FILL_DEPTH_BIAS_STEP * 0.5
 }
 
 pub fn plane_fill_depth_bias(index: usize) -> f32 {
@@ -2905,6 +2943,27 @@ mod tests {
     fn stroke_depth_bias_beats_shape_fill_bias() {
         assert!(STROKE_DEPTH_BIAS > shape_fill_depth_bias(0));
         assert!(STROKE_DEPTH_BIAS > plane_fill_depth_bias(0));
+    }
+
+    #[test]
+    fn coplanar_shape_types_never_share_a_depth_bias() {
+        // The original bug: a rectangle and a circle at the same per-type index got the
+        // identical bias and z-fought. Lanes must keep every (index, lane) pair distinct.
+        for index in 0..16usize {
+            let rect = shape_fill_depth_bias_laned(index, 0);
+            // No circle at any index may equal this rectangle's bias.
+            for other in 0..16usize {
+                let circle = shape_fill_depth_bias_laned(other, 1);
+                assert!(
+                    (rect - circle).abs() > 1e-6,
+                    "rect {index} and circle {other} share bias {rect}"
+                );
+            }
+        }
+        // Rect 0 (the reported case) is specifically separated from circle 0.
+        assert!(
+            (shape_fill_depth_bias_laned(0, 0) - shape_fill_depth_bias_laned(0, 1)).abs() > 1e-6
+        );
     }
 
     #[test]

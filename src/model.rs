@@ -22,6 +22,13 @@ pub enum FaceId {
         profile: ExtrudeFace,
         top: bool,
     },
+    /// A planar side wall of an extruded body: the quad swept by one `edge` of a
+    /// polygonal profile (rectangles only; circular profiles have no flat sides).
+    ExtrudeSide {
+        extrusion: usize,
+        profile: ExtrudeFace,
+        edge: u8,
+    },
 }
 
 impl Default for FaceId {

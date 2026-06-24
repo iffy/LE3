@@ -592,8 +592,12 @@ impl App {
         pointer_screen: Option<egui::Pos2>,
     ) {
         let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
-        let primary_down = ui.input(|i| i.pointer.primary_down());
-        let primary_released = ui.input(|i| i.pointer.primary_released());
+
+        // If the in-progress extrusion went away (committed or cancelled), stop following.
+        if self.state.creating_extrusion.is_none() {
+            self.extrude_gizmo_drag = None;
+            self.pending_extrude_target = None;
+        }
 
         // Snapshot the pending extrusion so we can mutate state without holding a borrow.
         let pending = self
@@ -603,7 +607,9 @@ impl App {
             .filter(|ce| !ce.faces.is_empty())
             .map(|ce| (ce.faces.clone(), ce.evaluated_distance(&self.state.doc)));
 
-        // 1) Gizmo handle drag → distance (with extrude-to-object snapping).
+        // The handle is a click-to-grab control: one click grabs it, then it follows
+        // the cursor (no held button) until the next click, which finishes the extrude.
+        let following = self.extrude_gizmo_drag.is_some();
         let mut gizmo_active = false;
         if let Some((faces, distance)) = &pending {
             if let Some((origin, normal)) = extrude::faces_anchor(&self.state.doc, faces) {
@@ -611,7 +617,7 @@ impl App {
                 let hovered = pointer_screen.is_some_and(|pp| {
                     construction::offset_gizmo_hit(pp, project, origin, normal, handle_offset)
                 });
-                if self.extrude_gizmo_drag.is_none() && primary_pressed && hovered {
+                if !following && primary_pressed && hovered {
                     if let Some(pp) = pointer_screen {
                         self.extrude_gizmo_drag = Some(ExtrudeGizmoDrag {
                             start_screen: pp,
@@ -629,50 +635,51 @@ impl App {
                         });
                     }
                 }
+                // While following, track the cursor every frame (no button required).
                 if let Some(drag) = self.extrude_gizmo_drag {
                     gizmo_active = true;
-                    if primary_down {
-                        if let Some(pp) = pointer_screen {
-                            if let Some((target, dist)) = pick_extrude_target(
-                                pp,
-                                project,
-                                &self.state.doc,
+                    if let Some(pp) = pointer_screen {
+                        if let Some((target, dist)) = pick_extrude_target(
+                            pp,
+                            project,
+                            &self.state.doc,
+                            origin,
+                            normal,
+                            faces,
+                        ) {
+                            self.pending_extrude_target = Some(target);
+                            self.state.apply(Action::SetExtrudeDistance { distance: dist });
+                        } else {
+                            self.pending_extrude_target = None;
+                            let new_distance = construction::offset_from_normal_drag(
                                 origin,
                                 normal,
-                                faces,
-                            ) {
-                                self.pending_extrude_target = Some(target);
-                                self.state.apply(Action::SetExtrudeDistance { distance: dist });
-                            } else {
-                                self.pending_extrude_target = None;
-                                let new_distance = construction::offset_from_normal_drag(
-                                    origin,
-                                    normal,
-                                    project,
-                                    drag.start_distance,
-                                    drag.start_screen,
-                                    pp,
-                                );
-                                self.state
-                                    .apply(Action::SetExtrudeDistance { distance: new_distance });
-                            }
+                                project,
+                                drag.start_distance,
+                                drag.start_screen,
+                                pp,
+                            );
+                            self.state
+                                .apply(Action::SetExtrudeDistance { distance: new_distance });
                         }
                     }
                 }
             }
         }
-        if primary_released {
-            if self.extrude_gizmo_drag.is_some() {
-                let target = self.pending_extrude_target.take();
-                self.state.apply(Action::SetExtrudeTarget { target });
-            }
+
+        // A click while following commits the extrusion, snapping to any pending target.
+        if following && primary_pressed {
+            let target = self.pending_extrude_target.take();
+            self.state.apply(Action::SetExtrudeTarget { target });
+            self.state.apply(Action::CommitExtrusion);
             self.extrude_gizmo_drag = None;
+            return;
         }
         if gizmo_active {
             return;
         }
 
-        // 2) Click toggles the face under the cursor (highlighted via the GPU hover).
+        // Click toggles the face under the cursor (highlighted via the GPU hover).
         if primary_pressed {
             if let Some(pp) = pointer_screen {
                 if let Some(face) = pick_extrude_face(pp, project, &self.state.doc) {
@@ -2595,7 +2602,9 @@ fn pick_extrude_face(
     match pick_sketch_face(pp, project, doc)? {
         FaceId::Rect(i) => Some(model::ExtrudeFace::Rect(i)),
         FaceId::Circle(i) => Some(model::ExtrudeFace::Circle(i)),
-        FaceId::ConstructionPlane(_) | FaceId::ExtrudeCap { .. } => None,
+        FaceId::ConstructionPlane(_) | FaceId::ExtrudeCap { .. } | FaceId::ExtrudeSide { .. } => {
+            None
+        }
     }
 }
 
@@ -3097,6 +3106,40 @@ fn draw_face_highlight(
             if let Some(poly) = extrude::cap_polygon_world(doc, extrusion, profile, top) {
                 draw_polygon_face_highlight(painter, project, &poly, color);
             }
+        }
+        FaceId::ExtrudeSide {
+            extrusion,
+            profile,
+            edge,
+        } => {
+            if let Some(quad) = extrude::side_quad_world(doc, extrusion, profile, edge as usize) {
+                draw_polygon_face_highlight(painter, project, &quad, color);
+            }
+        }
+    }
+}
+
+/// Highlight the object an in-progress extrusion is currently snapping to (a vertex,
+/// face, or plane), so the extrude-to-object target is visible while dragging the gizmo.
+fn draw_extrude_target_highlight(
+    painter: &egui::Painter,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    doc: &model::Document,
+    target: model::ExtrudeTarget,
+    color: egui::Color32,
+) {
+    match target {
+        model::ExtrudeTarget::Vertex(point) => {
+            if let Some(sp) = extrude::constraint_point_world(doc, point).and_then(project) {
+                painter.circle_filled(sp, 5.0, color);
+                painter.circle_stroke(sp, 8.0, egui::Stroke::new(2.0, color));
+            }
+        }
+        model::ExtrudeTarget::Face(face) => {
+            draw_face_highlight(painter, project, doc, extrude_face_id(face), color);
+        }
+        model::ExtrudeTarget::Plane(index) => {
+            draw_face_highlight(painter, project, doc, FaceId::ConstructionPlane(index), color);
         }
     }
 }
@@ -4194,6 +4237,16 @@ impl App {
         if self.state.tool == Tool::Extrude {
             if let Some(ce) = self.state.creating_extrusion.as_ref() {
                 draw_extrude_height_dimension(&painter, &project, doc, ce);
+            }
+            // Highlight the object the extrusion is currently snapping to.
+            if let Some(target) = self.pending_extrude_target {
+                draw_extrude_target_highlight(
+                    &painter,
+                    &project,
+                    doc,
+                    target,
+                    col::DIM_EDGE_HIGHLIGHT,
+                );
             }
         }
 

@@ -1142,6 +1142,31 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     api.set(
+        "circle",
+        lua.create_function(|lua, opts: Table| {
+            let tick = lua.app_data_ref::<ScriptTickData>().unwrap();
+            let cx: f32 = opts.get("x").unwrap_or(0.0);
+            let cy: f32 = opts.get("y").unwrap_or(0.0);
+            // Accept either a radius or a diameter.
+            let r: f32 = match opts.get::<Option<f32>>("r")? {
+                Some(r) => r,
+                None => opts.get::<f32>("diameter")? * 0.5,
+            };
+            unsafe {
+                if tick.state().sketch_session.is_none() {
+                    tick.exec(Instruction::BeginSketch {
+                        face: FaceId::ConstructionPlane(0),
+                    })?;
+                }
+                tick.exec(Instruction::CreateCircle { cx, cy, r })?;
+            }
+            let element =
+                SceneElement::Circle(unsafe { tick.state().doc.circles.len().saturating_sub(1) });
+            apply_optional_name(lua, element, Some(opts))
+        })?,
+    )?;
+
+    api.set(
         "extrude",
         lua.create_function(|lua, opts: Table| {
             let tick = lua.app_data_ref::<ScriptTickData>().unwrap();
@@ -1289,6 +1314,36 @@ mod tests {
             find_element_by_name(&state.doc, "Guide"),
             Some(SceneElement::Line(0))
         );
+    }
+
+    #[test]
+    fn lua_circle_creates_circle_on_ground_plane() {
+        let state = run_lua(
+            r#"
+            le3.new()
+            le3.circle{ x = 10, y = 5, r = 12, name = "Hole" }
+        "#,
+        );
+        assert_eq!(state.doc.circles.len(), 1);
+        let circle = &state.doc.circles[0];
+        assert!((circle.cx - 10.0).abs() < 1e-3 && (circle.cy - 5.0).abs() < 1e-3);
+        assert!((circle.r - 12.0).abs() < 1e-3);
+        assert_eq!(
+            find_element_by_name(&state.doc, "Hole"),
+            Some(SceneElement::Circle(0))
+        );
+    }
+
+    #[test]
+    fn lua_circle_accepts_diameter() {
+        let state = run_lua(
+            r#"
+            le3.new()
+            le3.circle{ diameter = 30 }
+        "#,
+        );
+        assert_eq!(state.doc.circles.len(), 1);
+        assert!((state.doc.circles[0].r - 15.0).abs() < 1e-3);
     }
 
     #[test]

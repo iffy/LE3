@@ -47,10 +47,45 @@ pub fn extrusion_mesh(doc: &Document, extrusion: &Extrusion) -> Option<SolidMesh
     let mut mesh = SolidMesh::default();
     for face in &extrusion.faces {
         if let Some((profile, normal)) = face_profile_world(doc, *face) {
-            extrude_profile(&profile, normal * distance, &mut mesh.triangles);
+            let top: Vec<Vec3> = profile
+                .iter()
+                .map(|p| extruded_top_point(doc, extrusion, normal, *p, distance))
+                .collect();
+            extrude_profile(&profile, &top, &mut mesh.triangles);
         }
     }
     (!mesh.is_empty()).then_some(mesh)
+}
+
+/// The `(point, normal)` plane an extrusion's top cap should lie in, when its target defines
+/// one. A vertex target or a plain typed distance has no such plane.
+pub fn target_top_plane(doc: &Document, extrusion: &Extrusion) -> Option<(Vec3, Vec3)> {
+    match extrusion.target? {
+        ExtrudeTarget::Face(face) => face_plane(doc, face),
+        ExtrudeTarget::Plane(index) => {
+            let plane = doc.construction_planes.get(index)?;
+            Some((plane.origin, plane.normal))
+        }
+        ExtrudeTarget::Vertex(_) => None,
+    }
+}
+
+/// Where a base profile vertex `v` lands when extruded along `dir`. With a target plane each
+/// vertex slides until it meets that plane, so the whole top cap lies in it (full contact even
+/// when the plane is slanted); otherwise the vertex is offset uniformly by `uniform`.
+pub fn extruded_top_point(
+    doc: &Document,
+    extrusion: &Extrusion,
+    dir: Vec3,
+    v: Vec3,
+    uniform: f32,
+) -> Vec3 {
+    if let Some((p, n)) = target_top_plane(doc, extrusion) {
+        if let Some(t) = plane_axis_distance(v, dir, p, n) {
+            return v + dir * t;
+        }
+    }
+    v + dir * uniform
 }
 
 /// The effective signed depth: derived from `target`'s extended plane when set, else `distance`.
@@ -191,12 +226,52 @@ pub fn cap_polygon_world(
         return None;
     }
     let (poly, normal) = face_profile_world(doc, profile)?;
-    let shift = if top {
-        normal * effective_distance(doc, ext)
-    } else {
-        Vec3::ZERO
-    };
-    Some(poly.into_iter().map(|p| p + shift).collect())
+    if !top {
+        return Some(poly);
+    }
+    // The top cap follows the (possibly slanted) target plane, vertex by vertex.
+    let distance = effective_distance(doc, ext);
+    Some(
+        poly.into_iter()
+            .map(|p| extruded_top_point(doc, ext, normal, p, distance))
+            .collect(),
+    )
+}
+
+/// Number of flat, sketchable side walls of a profile (rectangles have 4; circular
+/// profiles are curved and have none).
+pub fn side_face_count(profile: ExtrudeFace) -> usize {
+    match profile {
+        ExtrudeFace::Rect(_) => 4,
+        ExtrudeFace::Circle(_) => 0,
+    }
+}
+
+/// World-space quad of an extrusion side wall, swept by `edge` of a polygonal profile.
+/// Ordered `[base_a, base_b, top_b, top_a]`. `None` for circular profiles, out-of-range
+/// edges, or a deleted/foreign extrusion.
+pub fn side_quad_world(
+    doc: &Document,
+    extrusion: usize,
+    profile: ExtrudeFace,
+    edge: usize,
+) -> Option<[Vec3; 4]> {
+    let ext = doc.extrusions.get(extrusion)?;
+    if ext.deleted || !ext.faces.contains(&profile) || edge >= side_face_count(profile) {
+        return None;
+    }
+    let (poly, normal) = face_profile_world(doc, profile)?;
+    let n = poly.len();
+    if edge >= n {
+        return None;
+    }
+    let a = poly[edge];
+    let b = poly[(edge + 1) % n];
+    // The top edge follows the (possibly slanted) target plane, so the wall stays planar.
+    let distance = effective_distance(doc, ext);
+    let top_a = extruded_top_point(doc, ext, normal, a, distance);
+    let top_b = extruded_top_point(doc, ext, normal, b, distance);
+    Some([a, b, top_b, top_a])
 }
 
 fn circle_profile_world(frame: &SketchFrame, cx: f32, cy: f32, r: f32) -> Vec<Vec3> {
@@ -208,13 +283,13 @@ fn circle_profile_world(frame: &SketchFrame, cx: f32, cy: f32, r: f32) -> Vec<Ve
         .collect()
 }
 
-/// Emit caps + side walls for a convex profile extruded by `extrude` (world space).
-fn extrude_profile(profile: &[Vec3], extrude: Vec3, triangles: &mut Vec<[Vec3; 3]>) {
+/// Emit caps + side walls for a convex profile, given its base loop and the matching
+/// `top` loop (one top vertex per base vertex, so the top cap may be slanted).
+fn extrude_profile(profile: &[Vec3], top: &[Vec3], triangles: &mut Vec<[Vec3; 3]>) {
     let n = profile.len();
-    if n < 3 {
+    if n < 3 || top.len() != n {
         return;
     }
-    let top: Vec<Vec3> = profile.iter().map(|p| *p + extrude).collect();
 
     // Bottom cap (fan).
     for i in 1..n - 1 {
@@ -331,6 +406,43 @@ mod tests {
         let mesh = extrusion_mesh(&doc, &ext).unwrap();
         let (min, max) = mesh.bounds().unwrap();
         assert!((max.z - 20.0).abs() < 1e-3 && min.z.abs() < 1e-3, "z [{},{}]", min.z, max.z);
+    }
+
+    #[test]
+    fn extrude_to_slanted_plane_lands_top_cap_in_the_plane() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 6.0));
+        // A construction plane tilted about the X axis, ~21.8°, raised above the sketch.
+        let plane_origin = Vec3::new(0.0, 0.0, 12.0);
+        let plane_normal = Vec3::new(0.0, 0.4, 1.0).normalize();
+        let mut slanted = crate::face::default_xy_plane();
+        slanted.origin = plane_origin;
+        slanted.normal = plane_normal;
+        doc.construction_planes.push(slanted);
+
+        let mut ext = extrusion(sketch, vec![ExtrudeFace::Rect(0)], 6.0);
+        ext.target = Some(ExtrudeTarget::Plane(1));
+        doc.extrusions.push(ext.clone());
+
+        // Every top-cap corner lies exactly in the slanted plane (full contact).
+        let cap = cap_polygon_world(&doc, 0, ExtrudeFace::Rect(0), true).unwrap();
+        assert_eq!(cap.len(), 4);
+        for corner in &cap {
+            let signed = (*corner - plane_origin).dot(plane_normal);
+            assert!(signed.abs() < 1e-3, "cap corner off the target plane: {signed}");
+        }
+        // The cap really is slanted: corners reach the plane at different heights.
+        let heights: Vec<f32> = cap.iter().map(|c| c.z).collect();
+        let zmin = heights.iter().cloned().fold(f32::MAX, f32::min);
+        let zmax = heights.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(zmax - zmin > 1.0, "expected a slanted top, spread {}", zmax - zmin);
+
+        // The base cap stays on the sketch plane (z = 0).
+        let base = cap_polygon_world(&doc, 0, ExtrudeFace::Rect(0), false).unwrap();
+        for corner in &base {
+            assert!(corner.z.abs() < 1e-4);
+        }
     }
 
     #[test]

@@ -87,9 +87,15 @@ pub fn sketch_frame(doc: &Document, face: FaceId) -> Option<SketchFrame> {
             if ext.deleted || !ext.faces.contains(&profile) {
                 return None;
             }
-            // The cap shares the profile face's in-plane axes, shifted along the
-            // extrusion normal to the base or offset end.
             let base = sketch_frame(doc, profile.face_id())?;
+            // A top cap that meets a slanted target plane lies in that plane, so derive its
+            // frame from the actual (slanted) cap polygon rather than a parallel offset.
+            if top && crate::extrude::target_top_plane(doc, ext).is_some() {
+                let poly = crate::extrude::cap_polygon_world(doc, extrusion, profile, true)?;
+                return frame_from_polygon(&poly, base.normal);
+            }
+            // Otherwise the cap shares the profile's in-plane axes, shifted along the
+            // extrusion normal to the base or offset end.
             let dist = if top {
                 crate::extrude::effective_distance(doc, ext)
             } else {
@@ -102,7 +108,70 @@ pub fn sketch_frame(doc: &Document, face: FaceId) -> Option<SketchFrame> {
                 normal: base.normal,
             })
         }
+        FaceId::ExtrudeSide {
+            extrusion,
+            profile,
+            edge,
+        } => {
+            let quad = crate::extrude::side_quad_world(doc, extrusion, profile, edge as usize)?;
+            let (poly, _) = crate::extrude::face_profile_world(doc, profile)?;
+            let centroid = poly.iter().fold(Vec3::ZERO, |acc, p| acc + *p) / poly.len() as f32;
+            let (a, b, a_top) = (quad[0], quad[1], quad[3]);
+            let u_axis = (b - a).normalize_or_zero();
+            let up = (a_top - a).normalize_or_zero();
+            if u_axis.length_squared() < 1e-8 || up.length_squared() < 1e-8 {
+                return None;
+            }
+            // Outward wall normal: perpendicular to the wall, pointing away from the solid.
+            let mut normal = u_axis.cross(up).normalize_or_zero();
+            if normal.length_squared() < 1e-8 {
+                return None;
+            }
+            let edge_mid = (a + b) * 0.5;
+            if normal.dot(edge_mid - centroid) < 0.0 {
+                normal = -normal;
+            }
+            // (u, v, normal) right-handed: v = normal × u keeps u × v == normal.
+            let v_axis = normal.cross(u_axis).normalize_or_zero();
+            Some(SketchFrame {
+                origin: a,
+                u_axis,
+                v_axis,
+                normal,
+            })
+        }
     }
+}
+
+/// Build a sketch frame from a planar world-space polygon: origin at the first vertex, U along
+/// the first edge, and a normal flipped to agree with `reference_normal` (so a slanted cap keeps
+/// the same facing as its base). Returns `None` for degenerate polygons.
+fn frame_from_polygon(poly: &[Vec3], reference_normal: Vec3) -> Option<SketchFrame> {
+    if poly.len() < 3 {
+        return None;
+    }
+    let origin = poly[0];
+    let mut normal = (poly[1] - poly[0]).cross(poly[2] - poly[0]).normalize_or_zero();
+    if normal.length_squared() < 1e-8 {
+        return None;
+    }
+    if normal.dot(reference_normal) < 0.0 {
+        normal = -normal;
+    }
+    // U along the first edge, made orthogonal to the (possibly flipped) normal.
+    let mut u_axis = poly[1] - poly[0];
+    u_axis = (u_axis - normal * u_axis.dot(normal)).normalize_or_zero();
+    if u_axis.length_squared() < 1e-8 {
+        return None;
+    }
+    // v = normal × u keeps (u, v, normal) right-handed with u × v == normal.
+    let v_axis = normal.cross(u_axis).normalize_or_zero();
+    Some(SketchFrame {
+        origin,
+        u_axis,
+        v_axis,
+        normal,
+    })
 }
 
 /// Resolve the world-space frame for geometry in a sketch.
@@ -523,6 +592,31 @@ pub fn sketch_camera_target(doc: &Document, sketch: SketchId) -> Option<SketchCa
                 zoom: Some(zoom),
             })
         }
+        FaceId::ExtrudeSide {
+            extrusion,
+            profile,
+            edge,
+        } => {
+            let quad = crate::extrude::side_quad_world(doc, extrusion, profile, edge as usize)?;
+            let mut zoom: Option<SketchZoomBounds> = None;
+            for p in &quad {
+                let (u, v) = world_to_local(&frame, *p);
+                extend_sketch_bounds(&mut zoom, u, v, u, v);
+            }
+            if let Some(children) = sketch_local_bounds(doc, sketch) {
+                zoom = Some(match zoom {
+                    Some(z) => SketchZoomBounds::union(z, children),
+                    None => children,
+                });
+            }
+            let zoom = zoom?;
+            let target = local_to_world(&frame, zoom.center_u, zoom.center_v);
+            Some(SketchCameraTarget {
+                target,
+                face_normal,
+                zoom: Some(zoom),
+            })
+        }
     }
 }
 
@@ -545,6 +639,9 @@ pub fn face_label(_doc: &Document, face: FaceId) -> String {
             let end = if top { "top" } else { "bottom" };
             format!("Extrusion {extrusion} {end} face")
         }
+        FaceId::ExtrudeSide {
+            extrusion, edge, ..
+        } => format!("Extrusion {extrusion} side face {edge}"),
     }
 }
 
@@ -617,6 +714,20 @@ pub fn pick_sketch_face(
                     );
                 }
             }
+            // Flat side walls (rectangular profiles) are sketchable too.
+            for edge in 0..crate::extrude::side_face_count(profile) {
+                if let Some(dist) = side_face_pick_distance(screen, project, doc, ei, profile, edge) {
+                    consider_face_pick(
+                        &mut best,
+                        FaceId::ExtrudeSide {
+                            extrusion: ei,
+                            profile,
+                            edge: edge as u8,
+                        },
+                        dist,
+                    );
+                }
+            }
         }
     }
 
@@ -640,6 +751,28 @@ fn cap_face_pick_distance(
     top: bool,
 ) -> Option<f32> {
     let poly = crate::extrude::cap_polygon_world(doc, extrusion, profile, top)?;
+    polygon_face_pick_distance(screen, project, &poly)
+}
+
+/// Screen-space pick distance to an extrusion side wall (0 inside).
+fn side_face_pick_distance(
+    screen: eframe::egui::Pos2,
+    project: &impl Fn(Vec3) -> Option<eframe::egui::Pos2>,
+    doc: &Document,
+    extrusion: usize,
+    profile: crate::model::ExtrudeFace,
+    edge: usize,
+) -> Option<f32> {
+    let quad = crate::extrude::side_quad_world(doc, extrusion, profile, edge)?;
+    polygon_face_pick_distance(screen, project, &quad)
+}
+
+/// Screen-space pick distance to a planar world-space polygon (0 inside, else nearest edge).
+fn polygon_face_pick_distance(
+    screen: eframe::egui::Pos2,
+    project: &impl Fn(Vec3) -> Option<eframe::egui::Pos2>,
+    poly: &[Vec3],
+) -> Option<f32> {
     let pts: Option<Vec<eframe::egui::Pos2>> = poly.iter().map(|&p| project(p)).collect();
     let pts = pts?;
     if pts.len() < 3 {
@@ -869,6 +1002,36 @@ mod tests {
     }
 
     #[test]
+    fn sketch_on_slanted_top_cap_lies_in_the_target_plane() {
+        let mut doc = doc_with_extruded_box();
+        let plane_origin = Vec3::new(0.0, 0.0, 25.0);
+        let plane_normal = Vec3::new(0.3, 0.0, 1.0).normalize();
+        let mut slanted = default_xy_plane();
+        slanted.origin = plane_origin;
+        slanted.normal = plane_normal;
+        doc.construction_planes.push(slanted);
+        doc.extrusions[0].target = Some(crate::model::ExtrudeTarget::Plane(1));
+
+        let frame = sketch_frame(
+            &doc,
+            FaceId::ExtrudeCap {
+                extrusion: 0,
+                profile: crate::model::ExtrudeFace::Rect(0),
+                top: true,
+            },
+        )
+        .unwrap();
+        // The cap frame lies in the slanted plane, keeping the base's (+Z) facing.
+        assert!(frame.normal.dot(plane_normal).abs() > 0.999);
+        assert!(frame.normal.z > 0.0);
+        for (u, v) in [(0.0, 0.0), (5.0, 3.0), (-2.0, 4.0)] {
+            let p = local_to_world(&frame, u, v);
+            let signed = (p - plane_origin).dot(plane_normal);
+            assert!(signed.abs() < 1e-3, "sketched point off the cap plane: {signed}");
+        }
+    }
+
+    #[test]
     fn pick_sketch_face_finds_extrusion_cap() {
         let doc = doc_with_extruded_box();
         // Offset screen x by height so the top cap (z=10) separates from the base
@@ -885,6 +1048,63 @@ mod tests {
                 })
             ),
             "clicking the lifted top cap should pick it, got {face:?}"
+        );
+    }
+
+    #[test]
+    fn sketch_on_extrusion_side_wall_lies_in_the_wall_plane() {
+        let doc = doc_with_extruded_box();
+        let profile = crate::model::ExtrudeFace::Rect(0);
+        // Edge 0 runs along +X at y=0; the wall rises in +Z.
+        let frame = sketch_frame(
+            &doc,
+            FaceId::ExtrudeSide {
+                extrusion: 0,
+                profile,
+                edge: 0,
+            },
+        )
+        .unwrap();
+        // Origin at the base corner, in-plane axes along the edge (+X) and up the wall (+Z).
+        assert!(frame.origin.abs_diff_eq(Vec3::ZERO, 1e-4));
+        assert!((frame.u_axis.x - 1.0).abs() < 1e-4);
+        assert!((frame.v_axis.z.abs() - 1.0).abs() < 1e-4);
+        // Outward normal points away from the box centroid (-Y for this wall).
+        assert!(frame.normal.y < -0.9, "outward normal {:?}", frame.normal);
+        // Geometry drawn on the wall stays on the y=0 plane.
+        let p = local_to_world(&frame, 5.0, 4.0);
+        assert!(p.y.abs() < 1e-4, "point off the wall plane: {p:?}");
+    }
+
+    #[test]
+    fn circular_profiles_have_no_flat_side_walls() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.circles
+            .push(Circle::from_local_center_radius(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.extrusions.push(crate::model::Extrusion {
+            sketch,
+            faces: vec![crate::model::ExtrudeFace::Circle(0)],
+            distance: 8.0,
+            target: None,
+            expression: String::new(),
+            name: None,
+            deleted: false,
+        });
+        let profile = crate::model::ExtrudeFace::Circle(0);
+        assert_eq!(crate::extrude::side_face_count(profile), 0);
+        assert!(crate::extrude::side_quad_world(&doc, 0, profile, 0).is_none());
+    }
+
+    #[test]
+    fn pick_sketch_face_finds_extrusion_side_wall() {
+        let doc = doc_with_extruded_box();
+        // Project to the XZ plane so the y=0 side wall shows as a 20x10 rectangle.
+        let project = |p: Vec3| Some(eframe::egui::Pos2::new(p.x, p.z));
+        let face = pick_sketch_face(eframe::egui::pos2(10.0, 5.0), &project, &doc);
+        assert!(
+            matches!(face, Some(FaceId::ExtrudeSide { extrusion: 0, .. })),
+            "clicking a side wall should pick it, got {face:?}"
         );
     }
 

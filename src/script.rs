@@ -49,6 +49,12 @@ pub enum Instruction {
         x1: f32,
         y1: f32,
     },
+    /// Create a circle directly in the active sketch (face-local mm) with a locked diameter.
+    CreateCircle {
+        cx: f32,
+        cy: f32,
+        r: f32,
+    },
     /// Extrude coplanar sketch faces into a solid.
     Extrude {
         sketch: SketchId,
@@ -190,6 +196,9 @@ impl Instruction {
             } => format!("le3.rect{{ x = {x}, y = {y}, width = {width}, height = {height} }}"),
             Instruction::CreateLine { x0, y0, x1, y1 } => {
                 format!("le3.line{{ x = {x0}, y = {y0}, x1 = {x1}, y1 = {y1} }}")
+            }
+            Instruction::CreateCircle { cx, cy, r } => {
+                format!("le3.circle{{ x = {cx}, y = {cy}, r = {r} }}")
             }
             Instruction::Extrude {
                 faces, distance, ..
@@ -786,8 +795,9 @@ fn face_lua_parts(face: FaceId) -> (&'static str, usize) {
         FaceId::Rect(i) => ("rect", i),
         FaceId::Circle(i) => ("circle", i),
         FaceId::ConstructionPlane(i) => ("construction_plane", i),
-        // Cap faces aren't yet addressable from the two-argument script form.
+        // Cap/side faces aren't yet addressable from the two-argument script form.
         FaceId::ExtrudeCap { extrusion, .. } => ("extrude_cap", extrusion),
+        FaceId::ExtrudeSide { extrusion, .. } => ("extrude_side", extrusion),
     }
 }
 
@@ -1440,6 +1450,10 @@ impl ScriptRunner {
             }
             Instruction::CreateLine { x0, y0, x1, y1 } => {
                 state.apply(Action::CreateLineSegment { x0, y0, x1, y1 });
+                StepResult::Continue
+            }
+            Instruction::CreateCircle { cx, cy, r } => {
+                state.apply(Action::CreateCircle { cx, cy, r });
                 StepResult::Continue
             }
             Instruction::Extrude {
