@@ -12,6 +12,10 @@ use std::sync::Mutex;
 /// Preferred MSAA sample count for viewport line/edge anti-aliasing.
 pub const VIEWPORT_MSAA_SAMPLES: u32 = 4;
 
+/// Depth-stencil format for the viewport. Needs a stencil aspect so coplanar
+/// sketch fills can be masked to paint each pixel once (#3).
+pub const VIEWPORT_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuUniforms {
@@ -22,6 +26,9 @@ pub struct ViewportGpuResources {
     target_format: wgpu::TextureFormat,
     msaa_sample_count: u32,
     scene_pipeline: wgpu::RenderPipeline,
+    /// Stencil-masked pipeline for coplanar sketch fills: each pixel is painted
+    /// exactly once so translucent overlaps don't double-blend (#3).
+    sketch_fill_pipeline: wgpu::RenderPipeline,
     scene_transparent_pipeline: wgpu::RenderPipeline,
     text_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
@@ -182,10 +189,77 @@ impl ViewportGpuResources {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: VIEWPORT_DEPTH_FORMAT,
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: multisample_state(msaa_sample_count),
+            multiview: None,
+            cache: None,
+        });
+
+        // Coplanar sketch fills: keep the depth test, but use the stencil buffer
+        // so that the first fill to cover a pixel paints it (stencil 0 -> 1) and
+        // any later coplanar fill at that pixel is rejected (stencil != 0). This
+        // prevents translucent overlap regions from being alpha-blended twice,
+        // which previously made overlaps render darker (#3).
+        let sketch_fill_stencil = wgpu::StencilFaceState {
+            compare: wgpu::CompareFunction::Equal,
+            fail_op: wgpu::StencilOperation::Keep,
+            depth_fail_op: wgpu::StencilOperation::Keep,
+            pass_op: wgpu::StencilOperation::IncrementClamp,
+        };
+        let sketch_fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("le3_viewport_sketch_fill_pipeline"),
+            layout: Some(&scene_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GpuVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: VIEWPORT_DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState {
+                    front: sketch_fill_stencil,
+                    back: sketch_fill_stencil,
+                    read_mask: 0xff,
+                    write_mask: 0xff,
+                },
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: multisample_state(msaa_sample_count),
@@ -234,7 +308,7 @@ impl ViewportGpuResources {
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
+                    format: VIEWPORT_DEPTH_FORMAT,
                     depth_write_enabled: false,
                     // Bias construction-plane fills away from the camera so a coplanar
                     // sketch face (drawn first, into the depth buffer) deterministically
@@ -327,7 +401,7 @@ impl ViewportGpuResources {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: VIEWPORT_DEPTH_FORMAT,
                 depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
@@ -436,6 +510,7 @@ impl ViewportGpuResources {
             target_format,
             msaa_sample_count,
             scene_pipeline,
+            sketch_fill_pipeline,
             scene_transparent_pipeline,
             text_pipeline,
             blit_pipeline,
@@ -546,7 +621,7 @@ impl ViewportGpuResources {
             mip_level_count: 1,
             sample_count: self.msaa_sample_count,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
+            format: VIEWPORT_DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -665,9 +740,11 @@ impl ViewportGpuResources {
 
         let vertex_bytes = (scene.vertices.len() * std::mem::size_of::<GpuVertex>()) as u64;
         let base_index_count = scene.indices.len();
+        let sketch_fill_index_count = scene.sketch_fill_indices.len();
         let plane_fill_index_count = scene.plane_fill_indices.len();
         let overlay_index_count = scene.overlay_indices.len();
-        let total_index_count = base_index_count + plane_fill_index_count + overlay_index_count;
+        let total_index_count =
+            base_index_count + sketch_fill_index_count + plane_fill_index_count + overlay_index_count;
         let index_bytes = (total_index_count * std::mem::size_of::<u32>()) as u64;
         let text_vertex_bytes =
             (scene.text_vertices.len() * std::mem::size_of::<GpuTextVertex>()) as u64;
@@ -692,6 +769,7 @@ impl ViewportGpuResources {
         if total_index_count > 0 {
             let mut combined_indices = Vec::with_capacity(total_index_count);
             combined_indices.extend_from_slice(&scene.indices);
+            combined_indices.extend_from_slice(&scene.sketch_fill_indices);
             combined_indices.extend_from_slice(&scene.plane_fill_indices);
             combined_indices.extend_from_slice(&scene.overlay_indices);
             queue.write_buffer(
@@ -753,7 +831,10 @@ impl ViewportGpuResources {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
                     }),
-                    stencil_ops: None,
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
@@ -766,15 +847,25 @@ impl ViewportGpuResources {
                     wgpu::IndexFormat::Uint32,
                 );
                 let base_end = base_index_count as u32;
-                let plane_end = (base_index_count + plane_fill_index_count) as u32;
+                let sketch_fill_end = (base_index_count + sketch_fill_index_count) as u32;
+                let plane_end =
+                    (base_index_count + sketch_fill_index_count + plane_fill_index_count) as u32;
                 let total_end = total_index_count as u32;
                 if base_end > 0 {
                     pass.set_pipeline(&self.scene_pipeline);
                     pass.draw_indexed(0..base_end, 0, 0..1);
                 }
-                if plane_end > base_end {
+                if sketch_fill_end > base_end {
+                    // Stencil ref 0: only fragments where the stencil is still 0 pass,
+                    // and each one bumps the stencil to 1, so coplanar sketch fills paint
+                    // each pixel exactly once instead of double-blending overlaps (#3).
+                    pass.set_pipeline(&self.sketch_fill_pipeline);
+                    pass.set_stencil_reference(0);
+                    pass.draw_indexed(base_end..sketch_fill_end, 0, 0..1);
+                }
+                if plane_end > sketch_fill_end {
                     pass.set_pipeline(&self.scene_transparent_pipeline);
-                    pass.draw_indexed(base_end..plane_end, 0, 0..1);
+                    pass.draw_indexed(sketch_fill_end..plane_end, 0, 0..1);
                 }
                 if total_end > plane_end {
                     pass.set_pipeline(&self.scene_pipeline);
