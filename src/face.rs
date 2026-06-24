@@ -283,6 +283,16 @@ pub fn sketch_view_up(
     let mut best_hint = v;
     let mut best_score = f32::MAX;
 
+    // For a near-vertical face (e.g. the side wall of a solid) there is a natural
+    // "up": world +Z. Orient the sketch so the ground falls to the bottom of the
+    // screen rather than rolling sideways to preserve the previous view. Faces that
+    // are horizontal or only mildly tilted have little in-plane vertical component,
+    // so they keep the roll-preservation behavior. A vertical wall's in-plane
+    // vertical component is ~1; the 0.9 cutoff admits faces within ~25° of vertical.
+    let plane_normal = (-target_look).normalize_or_zero();
+    let world_up_in_plane = Vec3::Z - plane_normal * Vec3::Z.dot(plane_normal);
+    let prefer_world_up = world_up_in_plane.length() > 0.9;
+
     for hint in [u, -u, v, -v] {
         let right = target_look.cross(hint).normalize_or_zero();
         if right.length_squared() < 1e-8 {
@@ -304,14 +314,20 @@ pub fn sketch_view_up(
             continue;
         }
 
-        let u_screen_after = axis_screen_vec(u, target_look, hint);
-        let v_screen_after = axis_screen_vec(v, target_look, hint);
-        let score = sketch_view_up_score(
-            u_screen_before,
-            v_screen_before,
-            u_screen_after,
-            v_screen_after,
-        );
+        let score = if prefer_world_up {
+            // Smaller is better: pick the orientation whose screen-up points most
+            // toward world +Z, keeping the ground at the bottom of the view.
+            -cam_up.dot(Vec3::Z)
+        } else {
+            let u_screen_after = axis_screen_vec(u, target_look, hint);
+            let v_screen_after = axis_screen_vec(v, target_look, hint);
+            sketch_view_up_score(
+                u_screen_before,
+                v_screen_before,
+                u_screen_after,
+                v_screen_after,
+            )
+        };
         if score < best_score {
             best_score = score;
             best_hint = hint;
@@ -1322,6 +1338,28 @@ mod tests {
         assert!(
             hint.dot(Vec3::Y) > 0.0,
             "already aligned with +Y should keep +Y hint, got {hint:?}"
+        );
+    }
+
+    #[test]
+    fn sketch_view_up_on_vertical_wall_keeps_ground_at_the_bottom() {
+        // A side wall whose in-plane axes are u along world +X and v along world
+        // +Z (a vertical wall facing -Y). Regardless of how the camera was rolled
+        // before, the sketch should orient so world up (+Z, our v axis) points up
+        // on screen, putting the ground at the bottom.
+        let frame = SketchFrame {
+            origin: Vec3::ZERO,
+            u_axis: Vec3::X,
+            v_axis: Vec3::Z,
+            normal: -Vec3::Y,
+        };
+        // view_direction points from the face toward the eye (outward normal, -Y).
+        let view_direction = -Vec3::Y;
+        // Start from a rolled-sideways view (current up pointing along +X).
+        let hint = sketch_view_up(view_direction, &frame, Vec3::Y, Vec3::X);
+        assert!(
+            hint.dot(Vec3::Z) > 0.9,
+            "vertical wall sketch should orient world +Z up, got {hint:?}"
         );
     }
 

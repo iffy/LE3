@@ -1,0 +1,1 @@
+Starting a sketch on a near-vertical face (e.g. the side wall of an extrusion) now orients the view with world up (+Z) toward the top of the screen — ground at the bottom — instead of rolling the camera onto its side, so orbit keeps working normally (#17).
