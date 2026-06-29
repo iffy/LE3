@@ -342,6 +342,9 @@ pub enum Action {
     Save { path: Option<String> },
     /// Export bodies to an STL file. `body` names a single body; `None` exports all bodies.
     ExportStl { path: String, body: Option<String> },
+    /// Export a single body (by index) to an STL file — used by the body row's context menu,
+    /// which has the index in hand and works for unnamed bodies too.
+    ExportStlBody { path: String, body: usize },
     Clear,
     UndoLast,
     SetTool(Tool),
@@ -895,6 +898,14 @@ pub struct AppState {
     pub rect_opposite_snap: Option<crate::snapping::SnapTarget>,
     /// Snap target for the center of a circle being drawn.
     pub circle_center_snap: Option<crate::snapping::SnapTarget>,
+    /// Inference ("extension") snap guides: edges of the vertex the cursor most recently
+    /// hovered while sketching. While these are active, pulling away from that vertex snaps
+    /// the point onto the infinite extension of those edges (#21). Cleared on sketch exit.
+    pub extension_anchors: Vec<crate::model::ConstraintLine>,
+    /// Snapshots of `construction_planes` taken before each in-place plane edit, so that
+    /// `UndoLast` can revert the edit. Kept in lockstep with `ShapeKind::ConstructionPlaneEdit`
+    /// markers in `shape_order` (one payload per marker, same LIFO order).
+    pub construction_plane_edit_undo: Vec<Vec<ConstructionPlane>>,
 }
 
 impl Default for AppState {
@@ -931,6 +942,8 @@ impl Default for AppState {
             rect_origin_snap: None,
             rect_opposite_snap: None,
             circle_center_snap: None,
+            extension_anchors: Vec::new(),
+            construction_plane_edit_undo: Vec::new(),
         }
     }
 }
@@ -938,6 +951,35 @@ impl Default for AppState {
 impl AppState {
     pub fn refresh_document_health(&mut self) {
         self.document_health = recompute_document_health(&self.doc);
+    }
+
+    /// Write `mesh` to `path` as an ASCII STL named `name`, setting `self.status`.
+    fn write_stl_file(
+        &mut self,
+        path: &str,
+        name: &str,
+        mesh: Option<crate::extrude::SolidMesh>,
+    ) -> ActionResult {
+        match mesh {
+            Some(m) if !m.is_empty() => {
+                let stl = crate::stl::write_ascii_stl(name, &m);
+                match std::fs::write(path, stl) {
+                    Ok(()) => {
+                        self.status =
+                            format!("Exported {} triangle(s) to {}", m.triangles.len(), path);
+                        ActionResult::Ok
+                    }
+                    Err(e) => {
+                        self.status = format!("Export failed: {e}");
+                        ActionResult::Err(self.status.clone())
+                    }
+                }
+            }
+            _ => {
+                self.status = "Export failed: no solid geometry to export".to_string();
+                ActionResult::Err(self.status.clone())
+            }
+        }
     }
 }
 
@@ -1208,29 +1250,19 @@ impl AppState {
                         Some(crate::extrude::document_solid_mesh(&self.doc)),
                     ),
                 };
-                match mesh {
-                    Some(m) if !m.is_empty() => {
-                        let stl = crate::stl::write_ascii_stl(&name, &m);
-                        match std::fs::write(&path, stl) {
-                            Ok(()) => {
-                                self.status = format!(
-                                    "Exported {} triangle(s) to {}",
-                                    m.triangles.len(),
-                                    path
-                                );
-                                ActionResult::Ok
-                            }
-                            Err(e) => {
-                                self.status = format!("Export failed: {e}");
-                                ActionResult::Err(self.status.clone())
-                            }
-                        }
-                    }
-                    _ => {
-                        self.status = "Export failed: no solid geometry to export".to_string();
-                        ActionResult::Err(self.status.clone())
-                    }
-                }
+                self.write_stl_file(&path, &name, mesh)
+            }
+            Action::ExportStlBody { path, body } => {
+                let Some(b) = self.doc.bodies.get(body).filter(|b| !b.deleted) else {
+                    self.status = format!("Export failed: no body {body}");
+                    return ActionResult::Err(self.status.clone());
+                };
+                let name = b
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("body-{body}"));
+                let mesh = crate::extrude::body_solid_mesh(&self.doc, body);
+                self.write_stl_file(&path, &name, mesh)
             }
             Action::Clear => {
                 self.doc = Document::default();
@@ -1323,6 +1355,20 @@ impl AppState {
                             }
                         }
                     }
+                    Some(ShapeKind::ConstructionPlaneEdit) => {
+                        match self.construction_plane_edit_undo.pop() {
+                            Some(previous_planes) => {
+                                self.doc.construction_planes = previous_planes;
+                                let _ = recompute_document_geometry(&mut self.doc);
+                                self.status = "Undid construction plane edit".to_string();
+                                undone = true;
+                            }
+                            None => {
+                                // Marker without payload should never happen; ignore safely.
+                                self.status = "Nothing to undo".to_string();
+                            }
+                        }
+                    }
                     None => self.status = "Nothing to undo".to_string(),
                 }
                 if undone {
@@ -1392,6 +1438,7 @@ impl AppState {
                 self.rect_origin_snap = None;
                 self.rect_opposite_snap = None;
                 self.circle_center_snap = None;
+                self.extension_anchors.clear();
                 if self.editing_committed_dim.take().is_some() {
                     self.status = "Cancelled".to_string();
                 } else if self.creating_extrusion.take().is_some() {
@@ -2049,6 +2096,9 @@ impl AppState {
                 let definition = cp.resolved_definition();
                 let live_offset = definition.offset_mm;
                 if let Some(index) = cp.edit_index {
+                    // Snapshot all planes before the edit so Undo can revert it (the edit
+                    // also moves descendant planes, so snapshot the whole list).
+                    let previous_planes = self.doc.construction_planes.clone();
                     match apply_construction_plane_edit(
                         &mut self.doc,
                         index,
@@ -2056,6 +2106,8 @@ impl AppState {
                         cp.parent,
                     ) {
                         Ok(()) => {
+                            self.construction_plane_edit_undo.push(previous_planes);
+                            self.doc.shape_order.push(ShapeKind::ConstructionPlaneEdit);
                             self.status = format!(
                                 "Updated construction plane {index} ({live_offset:.1} mm from {})",
                                 cp.reference.label()
@@ -2919,6 +2971,7 @@ impl AppState {
 
     fn exit_sketch_session(&mut self) {
         self.active_snap = None;
+        self.extension_anchors.clear();
         self.sketch_session = None;
         self.sketch_reframe_pending = false;
         self.creating_rect = None;
@@ -3201,6 +3254,44 @@ mod tests {
     }
 
     #[test]
+    fn export_stl_body_by_index_writes_a_parseable_file() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state
+            .doc
+            .rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
+        state.doc.shape_order.push(ShapeKind::Rect);
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace {
+            face: ExtrudeFace::Rect(0),
+        });
+        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
+        state.apply(Action::CommitExtrusion);
+        assert_eq!(state.doc.bodies.len(), 1);
+
+        let path = std::env::temp_dir().join(format!("le3_export_idx_{}.stl", std::process::id()));
+        let path_str = path.to_string_lossy().to_string();
+        // Index-based export works even for an unnamed body (the context-menu path).
+        let result = state.apply(Action::ExportStlBody {
+            path: path_str.clone(),
+            body: 0,
+        });
+        assert_eq!(result, ActionResult::Ok, "status: {}", state.status);
+        let text = std::fs::read_to_string(&path).expect("read exported stl");
+        let tris = crate::stl::parse_ascii_stl(&text).expect("parse exported stl");
+        assert_eq!(tris.len(), 12, "a box has 12 triangles");
+
+        // Out-of-range body index fails cleanly.
+        let missing = state.apply(Action::ExportStlBody {
+            path: path_str.clone(),
+            body: 9,
+        });
+        assert!(matches!(missing, ActionResult::Err(_)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn picking_extrude_tool_from_within_a_sketch_exits_sketch_editing() {
         let mut state = AppState::default();
         let _sketch = begin_default_sketch(&mut state);
@@ -3469,6 +3560,79 @@ mod tests {
         state.apply(Action::CommitConstructionPlane);
         state.apply(Action::UndoLast);
         assert_eq!(state.doc.construction_planes.len(), 1);
+    }
+
+    #[test]
+    fn undo_construction_plane_edit_restores_previous() {
+        let mut state = AppState::default();
+        state.apply(Action::BeginConstructionPlane {
+            reference: PlaneReference::Face {
+                origin: Vec3::ZERO,
+                normal: Vec3::Z,
+                label: "Ground".to_string(),
+            },
+            parent: ConstructionPlaneParent::Root,
+        });
+        let mut cp = state.creating_plane.take().unwrap();
+        cp.offset_text = "5".to_string();
+        cp.user_edited_offset = true;
+        state.creating_plane = Some(cp);
+        state.apply(Action::CommitConstructionPlane);
+        assert_eq!(state.doc.construction_planes.len(), 2);
+        assert!((state.doc.construction_planes[1].origin.z - 5.0).abs() < 1e-3);
+
+        // Edit the plane to a new offset.
+        state.apply(Action::BeginEditConstructionPlane { index: 1 });
+        state.apply(Action::SetPlaneOffset {
+            value: "30".to_string(),
+        });
+        state.apply(Action::CommitConstructionPlane);
+        assert!((state.doc.construction_planes[1].origin.z - 30.0).abs() < 1e-3);
+
+        // Undo should revert the edit, not delete the plane.
+        state.apply(Action::UndoLast);
+        assert_eq!(state.doc.construction_planes.len(), 2);
+        assert!(
+            (state.doc.construction_planes[1].origin.z - 5.0).abs() < 1e-3,
+            "expected undo to restore offset 5, got {}",
+            state.doc.construction_planes[1].origin.z
+        );
+    }
+
+    #[test]
+    fn undo_construction_plane_edit_restores_descendants() {
+        let mut state = AppState::default();
+        // A sketch on the default plane (0) and a child plane defined relative to it,
+        // so editing plane 0 moves the child (index 1).
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        state.doc.construction_planes.push(plane_from_definition(
+            &definition_from_reference(
+                &PlaneReference::Face {
+                    origin: Vec3::ZERO,
+                    normal: Vec3::Z,
+                    label: "Ground".to_string(),
+                },
+                5.0,
+                0.0,
+            ),
+            ConstructionPlaneParent::Sketch(sketch),
+        ));
+        state.doc.shape_order.push(ShapeKind::ConstructionPlane);
+        let child_before = state.doc.construction_planes[1].origin.z;
+
+        state.apply(Action::BeginEditConstructionPlane { index: 0 });
+        state.apply(Action::SetPlaneOffset {
+            value: "30".to_string(),
+        });
+        state.apply(Action::CommitConstructionPlane);
+        assert!((state.doc.construction_planes[1].origin.z - child_before).abs() > 1e-3);
+
+        state.apply(Action::UndoLast);
+        assert!(
+            (state.doc.construction_planes[1].origin.z - child_before).abs() < 1e-3,
+            "expected descendant restored to {child_before}, got {}",
+            state.doc.construction_planes[1].origin.z
+        );
     }
 
     #[test]

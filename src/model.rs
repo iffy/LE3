@@ -670,6 +670,9 @@ pub enum ShapeKind {
     ConstructionPlane,
     Extrusion,
     Body,
+    /// An in-place edit of an existing construction plane (undo restores the prior planes).
+    /// Transient: never persisted (storage rebuilds `shape_order` from created shapes only).
+    ConstructionPlaneEdit,
 }
 
 /// The whole document: sketches, sketch primitives, constraints, and construction planes.

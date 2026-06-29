@@ -355,6 +355,41 @@ impl App {
         }
     }
 
+    /// Export all bodies to an STL file chosen via a save dialog (File → Export STL…).
+    fn export_stl_all(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("STL mesh", &["stl"])
+            .set_file_name("model.stl")
+            .save_file();
+        if let Some(path) = picked {
+            self.state.apply(Action::ExportStl {
+                path: path.to_string_lossy().to_string(),
+                body: None,
+            });
+        }
+    }
+
+    /// Export a single body (by index) to an STL file chosen via a save dialog.
+    fn export_stl_body(&mut self, body: usize) {
+        let default_name = self
+            .state
+            .doc
+            .bodies
+            .get(body)
+            .and_then(|b| b.name.clone())
+            .unwrap_or_else(|| format!("body-{body}"));
+        let picked = rfd::FileDialog::new()
+            .add_filter("STL mesh", &["stl"])
+            .set_file_name(format!("{default_name}.stl"))
+            .save_file();
+        if let Some(path) = picked {
+            self.state.apply(Action::ExportStlBody {
+                path: path.to_string_lossy().to_string(),
+                body,
+            });
+        }
+    }
+
     fn open(&mut self) {
         let picked = rfd::FileDialog::new()
             .add_filter("LE3 document", &["le3"])
@@ -376,6 +411,7 @@ impl App {
                 MenuCommand::Open => self.open(),
                 MenuCommand::Save => self.save(),
                 MenuCommand::SaveAs => self.save_as(),
+                MenuCommand::ExportStl => self.export_stl_all(),
                 MenuCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 MenuCommand::About => {
                     self.state.status =
@@ -573,6 +609,9 @@ impl App {
                 })
                 .collect()
         });
+        if screenshots.is_empty() {
+            return;
+        }
 
         if let Some(runner) = &mut self.script {
             for image in screenshots {
@@ -1008,6 +1047,7 @@ impl eframe::App for App {
             let mut edit_sketch: Option<SketchId> = None;
             let mut edit_plane: Option<usize> = None;
             let mut edit_extrusion: Option<usize> = None;
+            let mut export_body: Option<usize> = None;
             let mut click_element: Option<(SceneElement, bool)> = None;
             egui::SidePanel::left("tree")
                 .resizable(true)
@@ -1022,6 +1062,9 @@ impl eframe::App for App {
                     };
                     let mut queue_edit_extrusion = |index: usize| {
                         edit_extrusion = Some(index);
+                    };
+                    let mut queue_export_body = |index: usize| {
+                        export_body = Some(index);
                     };
                     let mut noop_visibility = |_: SceneElement, _: bool| {};
                     let mut queue_click = |element: SceneElement, additive: bool| {
@@ -1041,6 +1084,7 @@ impl eframe::App for App {
                         &mut queue_edit_sketch,
                         &mut queue_edit_plane,
                         &mut queue_edit_extrusion,
+                        &mut queue_export_body,
                         &mut noop_visibility,
                         &mut queue_click,
                         &highlight_elements,
@@ -1060,6 +1104,9 @@ impl eframe::App for App {
             }
             if let Some(index) = edit_extrusion {
                 self.state.apply(Action::EditExtrusion { index });
+            }
+            if let Some(index) = export_body {
+                self.export_stl_body(index);
             }
         }
 
@@ -2719,7 +2766,8 @@ fn snap_icon(target: snapping::SnapTarget) -> icons::IconId {
         snapping::SnapTarget::Midpoint(_) => icons::IconId::Midpoint,
         snapping::SnapTarget::Vertex(_)
         | snapping::SnapTarget::Origin
-        | snapping::SnapTarget::OnLine(_) => icons::IconId::Coincident,
+        | snapping::SnapTarget::OnLine(_)
+        | snapping::SnapTarget::OnLineExtension(_) => icons::IconId::Coincident,
     }
 }
 
@@ -2738,12 +2786,33 @@ fn snap_ground_point(
     }
     let (u, v) = world_to_local(frame, world);
     let radius = snap_radius_uv(project, frame, world);
-    match snapping::find_snap(&state.doc, session.sketch, (u, v), radius, exclude) {
-        Some(snap) => (
+    if let Some(snap) = snapping::find_snap(&state.doc, session.sketch, (u, v), radius, exclude) {
+        return (
             face::local_to_world(frame, snap.uv.0, snap.uv.1),
             Some(snap.target),
-        ),
-        None => (world, None),
+        );
+    }
+    // No direct snap: fall back to the extension guides of the last-hovered vertex (#21),
+    // letting the point latch onto the infinite extension of those edges.
+    if !state.extension_anchors.is_empty() {
+        if let Some(snap) =
+            snapping::find_extension_snap(&state.doc, &state.extension_anchors, (u, v), radius, exclude)
+        {
+            return (
+                face::local_to_world(frame, snap.uv.0, snap.uv.1),
+                Some(snap.target),
+            );
+        }
+    }
+    (world, None)
+}
+
+/// Update the active extension-snap guides (#21) from the latest snap result: hovering a real
+/// vertex makes its incident edges the extension anchors; other snaps leave the guides in place
+/// so the user can pull away from the vertex and still snap to its edges' extensions.
+fn update_extension_anchors(state: &mut AppState, snap_target: Option<snapping::SnapTarget>) {
+    if let Some(snapping::SnapTarget::Vertex(point)) = snap_target {
+        state.extension_anchors = snapping::vertex_extension_anchors(point);
     }
 }
 
@@ -3551,6 +3620,7 @@ impl App {
                     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
                     let (sgp, snap_target) =
                         snap_ground_point(&self.state, session, &frame, &project, gp, &[]);
+                    update_extension_anchors(&mut self.state, snap_target);
 
                     if !was_creating && primary_pressed && !over_committed_dim_label {
                         self.state.rect_origin_snap = snap_target;
@@ -3653,6 +3723,7 @@ impl App {
                         // Snap the center; the rim follows the cursor freely.
                         let (center, center_snap) =
                             snap_ground_point(&self.state, session, &frame, &project, gp, &[]);
+                        update_extension_anchors(&mut self.state, center_snap);
                         self.state.circle_center_snap = center_snap;
                         self.state.creating_circle = Some(CreatingCircle {
                             origin: center,
@@ -3731,6 +3802,7 @@ impl App {
                     // Snap the cursor to nearby geometry (vertices, midpoints, lines).
                     let (sgp, snap_target) =
                         snap_ground_point(&self.state, session, &frame, &project, gp, &[]);
+                    update_extension_anchors(&mut self.state, snap_target);
 
                     if !was_creating && primary_pressed && !over_committed_dim_label {
                         self.state.line_start_snap = snap_target;
@@ -5068,6 +5140,27 @@ impl App {
                 if let Some((world, target)) = snap {
                     if let Some(sp) = project(world) {
                         let color = egui::Color32::from_rgb(120, 215, 230);
+                        // Inference guide (#21): a dashed line from the anchor edge through the
+                        // snapped point, showing the extension the point is aligned with.
+                        if let snapping::SnapTarget::OnLineExtension(line) = target {
+                            if let Ok(((x0, y0), (x1, y1))) =
+                                geometric_constraints::line_uv_endpoints(&self.state.doc, line)
+                            {
+                                let (su, sv) = world_to_local(&frame, world);
+                                let d0 = (x0 - su).hypot(y0 - sv);
+                                let d1 = (x1 - su).hypot(y1 - sv);
+                                let (au, av) = if d0 <= d1 { (x0, y0) } else { (x1, y1) };
+                                let anchor_world = face::local_to_world(&frame, au, av);
+                                if let Some(ap) = project(anchor_world) {
+                                    painter.extend(egui::Shape::dashed_line(
+                                        &[ap, sp],
+                                        egui::Stroke::new(1.5, color),
+                                        6.0,
+                                        4.0,
+                                    ));
+                                }
+                            }
+                        }
                         painter.circle_stroke(sp, 7.0, egui::Stroke::new(2.0, color));
                         // Emphasize the actual vertex being snapped to.
                         if matches!(target, snapping::SnapTarget::Vertex(_)) {

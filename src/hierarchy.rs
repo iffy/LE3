@@ -231,6 +231,8 @@ fn build_creation_ranks(doc: &Document) -> CreationRanks {
                 body_n += 1;
             }
             ShapeKind::Parameter => {}
+            // A plane edit is not a created shape; it only marks an undoable edit.
+            ShapeKind::ConstructionPlaneEdit => {}
         }
     }
     ranks
@@ -959,6 +961,7 @@ pub fn show_pane(
     on_edit_sketch: &mut impl FnMut(SketchId),
     on_edit_plane: &mut impl FnMut(usize),
     on_edit_extrusion: &mut impl FnMut(usize),
+    on_export_body: &mut impl FnMut(usize),
     on_toggle_visibility: &mut impl FnMut(SceneElement, bool),
     on_click_element: &mut impl FnMut(SceneElement, bool),
     highlight_elements: &HashSet<SceneElement>,
@@ -986,6 +989,7 @@ pub fn show_pane(
                 on_edit_sketch,
                 on_edit_plane,
                 on_edit_extrusion,
+                on_export_body,
                 on_toggle_visibility,
                 on_click_element,
                 highlight_elements,
@@ -1007,6 +1011,7 @@ fn show_row(
     on_edit_sketch: &mut impl FnMut(SketchId),
     on_edit_plane: &mut impl FnMut(usize),
     on_edit_extrusion: &mut impl FnMut(usize),
+    on_export_body: &mut impl FnMut(usize),
     on_toggle_visibility: &mut impl FnMut(SceneElement, bool),
     on_click_element: &mut impl FnMut(SceneElement, bool),
     highlight_elements: &HashSet<SceneElement>,
@@ -1095,11 +1100,22 @@ fn show_row(
                     }
                 });
             }
+            HierarchyNode::Body(index) => {
+                if response.clicked() {
+                    let additive = ui.input(|i| additive_click_modifiers(&i.modifiers));
+                    on_click_element(element, additive);
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Export STL…").clicked() {
+                        on_export_body(index);
+                        ui.close_menu();
+                    }
+                });
+            }
             HierarchyNode::Rect(_)
             | HierarchyNode::Line(_)
             | HierarchyNode::Circle(_)
-            | HierarchyNode::Constraint(_)
-            | HierarchyNode::Body(_) => {
+            | HierarchyNode::Constraint(_) => {
                 if response.clicked() {
                     let additive = ui.input(|i| additive_click_modifiers(&i.modifiers));
                     on_click_element(element, additive);

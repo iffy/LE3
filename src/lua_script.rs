@@ -374,10 +374,50 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
             let args = args.into_vec();
             let face = if let Some(Value::Table(table)) = args.first() {
                 let kind: String = table.get("kind").or_else(|_| table.get("type"))?;
-                let index: usize = table.get("index")?;
-                FaceId::from_script(&kind, index).ok_or_else(|| {
-                    mlua::Error::external(format!("unknown sketch face kind '{kind}'"))
-                })?
+                match kind.to_ascii_lowercase().as_str() {
+                    // 3D body faces need extra descriptors (extrusion + profile + which face),
+                    // so they can't go through the (kind, index) `from_script` path.
+                    "extrude_cap" | "extrude_side" => {
+                        let extrusion: usize = table.get("extrusion")?;
+                        let profile_kind: String =
+                            table.get("profile").or_else(|_| table.get("profile_kind"))?;
+                        let profile_index: usize = table
+                            .get("profile_index")
+                            .or_else(|_| table.get("index"))?;
+                        let profile = match profile_kind.to_ascii_lowercase().as_str() {
+                            "rect" | "rectangle" => {
+                                crate::model::ExtrudeFace::Rect(profile_index)
+                            }
+                            "circle" => crate::model::ExtrudeFace::Circle(profile_index),
+                            other => {
+                                return Err(mlua::Error::external(format!(
+                                    "unknown extrude profile kind '{other}'"
+                                )))
+                            }
+                        };
+                        if kind.eq_ignore_ascii_case("extrude_cap") {
+                            let top: bool = table.get("top").unwrap_or(true);
+                            FaceId::ExtrudeCap {
+                                extrusion,
+                                profile,
+                                top,
+                            }
+                        } else {
+                            let edge: u8 = table.get("edge").unwrap_or(0);
+                            FaceId::ExtrudeSide {
+                                extrusion,
+                                profile,
+                                edge,
+                            }
+                        }
+                    }
+                    _ => {
+                        let index: usize = table.get("index")?;
+                        FaceId::from_script(&kind, index).ok_or_else(|| {
+                            mlua::Error::external(format!("unknown sketch face kind '{kind}'"))
+                        })?
+                    }
+                }
             } else {
                 let kind = match args.first() {
                     Some(Value::String(s)) => s.to_str()?.to_string(),
@@ -1382,6 +1422,50 @@ mod tests {
         let mesh =
             crate::extrude::extrusion_mesh(&state.doc, &state.doc.extrusions[0]).unwrap();
         assert_eq!(mesh.triangles.len(), 12);
+    }
+
+    #[test]
+    fn lua_begin_sketch_on_extrude_cap_face() {
+        let state = run_lua(
+            r#"
+            le3.new()
+            le3.rect{ width = 80, height = 50 }
+            le3.extrude{ rect = 0, distance = 20 }
+            le3.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
+        "#,
+        );
+        let face = state.doc.sketches.last().map(|s| s.face);
+        assert_eq!(
+            face,
+            Some(FaceId::ExtrudeCap {
+                extrusion: 0,
+                profile: crate::model::ExtrudeFace::Rect(0),
+                top: true,
+            }),
+            "expected a sketch on the extrusion's top cap, got {face:?}"
+        );
+    }
+
+    #[test]
+    fn lua_begin_sketch_on_extrude_side_face() {
+        let state = run_lua(
+            r#"
+            le3.new()
+            le3.rect{ width = 80, height = 50 }
+            le3.extrude{ rect = 0, distance = 20 }
+            le3.begin_sketch{ kind = "extrude_side", extrusion = 0, profile = "rect", profile_index = 0, edge = 1 }
+        "#,
+        );
+        let face = state.doc.sketches.last().map(|s| s.face);
+        assert_eq!(
+            face,
+            Some(FaceId::ExtrudeSide {
+                extrusion: 0,
+                profile: crate::model::ExtrudeFace::Rect(0),
+                edge: 1,
+            }),
+            "expected a sketch on the extrusion's side face, got {face:?}"
+        );
     }
 
     #[test]

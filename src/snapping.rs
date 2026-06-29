@@ -19,6 +19,10 @@ pub enum SnapTarget {
     Midpoint(ConstraintLine),
     /// Anywhere along a line/edge.
     OnLine(ConstraintLine),
+    /// On the *infinite extension* of a line/edge (inference snapping): the point lies on the
+    /// edge's line but beyond its endpoints. Pinned with a point-on-line coincidence, just like
+    /// [`SnapTarget::OnLine`], so the point stays collinear with the edge.
+    OnLineExtension(ConstraintLine),
 }
 
 /// A resolved snap: where to place the point and what it latched onto.
@@ -139,7 +143,7 @@ pub fn snap_constraint_kind(point: ConstraintPoint, target: SnapTarget) -> Const
             b: ConstraintEntity::Origin,
         },
         SnapTarget::Midpoint(line) => ConstraintKind::Midpoint { point, line },
-        SnapTarget::OnLine(line) => ConstraintKind::Coincident {
+        SnapTarget::OnLine(line) | SnapTarget::OnLineExtension(line) => ConstraintKind::Coincident {
             a: ConstraintEntity::Point(point),
             b: ConstraintEntity::Line(line),
         },
@@ -311,6 +315,78 @@ fn project_onto_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> Option<(
     Some((a.0 + du * t, a.1 + dv * t))
 }
 
+/// Foot of the perpendicular from `p` onto the *infinite line* through `a`–`b` (unclamped), and
+/// the parameter `t` along `a`→`b` (`t<0` or `t>1` means the foot is beyond the segment). `None`
+/// for a degenerate segment.
+fn project_onto_infinite_line(
+    p: (f32, f32),
+    a: (f32, f32),
+    b: (f32, f32),
+) -> Option<((f32, f32), f32)> {
+    let du = b.0 - a.0;
+    let dv = b.1 - a.1;
+    let len_sq = du * du + dv * dv;
+    if len_sq < 1e-12 {
+        return None;
+    }
+    let t = ((p.0 - a.0) * du + (p.1 - a.1) * dv) / len_sq;
+    Some(((a.0 + du * t, a.1 + dv * t), t))
+}
+
+/// Inference ("extension") snap: project `query` onto the infinite extension of each anchor
+/// line/edge, returning the nearest whose perpendicular distance is within `perp_tol` and whose
+/// foot lies *beyond* the segment (the on-segment region is already covered by [`find_snap`]'s
+/// `OnLine`). `exclude` drops anchors owned by points being dragged. Sketch units throughout.
+pub fn find_extension_snap(
+    doc: &Document,
+    anchors: &[ConstraintLine],
+    query: (f32, f32),
+    perp_tol: f32,
+    exclude: &[ConstraintPoint],
+) -> Option<Snap> {
+    if perp_tol <= 0.0 {
+        return None;
+    }
+    let perp_tol_sq = perp_tol * perp_tol;
+    let excluded_lines: Vec<ConstraintLine> = exclude
+        .iter()
+        .flat_map(|point| owning_lines(*point))
+        .collect();
+
+    let mut best: Option<(f32, Snap)> = None;
+    for &line in anchors {
+        if excluded_lines.contains(&line) {
+            continue;
+        }
+        let Ok(((x0, y0), (x1, y1))) = line_uv_endpoints(doc, line) else {
+            continue;
+        };
+        let Some((foot, t)) = project_onto_infinite_line(query, (x0, y0), (x1, y1)) else {
+            continue;
+        };
+        // Only the extension beyond the segment endpoints is an "extension" snap.
+        if (0.0..=1.0).contains(&t) {
+            continue;
+        }
+        let d2 = dist_sq(query, foot);
+        if d2 <= perp_tol_sq && best.as_ref().is_none_or(|(b, _)| d2 < *b) {
+            best = Some((
+                d2,
+                Snap {
+                    uv: foot,
+                    target: SnapTarget::OnLineExtension(line),
+                },
+            ));
+        }
+    }
+    best.map(|(_, snap)| snap)
+}
+
+/// Edges incident to a vertex — its extension guides when the cursor hovers it (see #21).
+pub fn vertex_extension_anchors(point: ConstraintPoint) -> Vec<ConstraintLine> {
+    owning_lines(point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +509,81 @@ mod tests {
             snap.target,
             SnapTarget::Vertex(ConstraintPoint::RectCorner { rect: 0, corner: 2 })
         );
+    }
+
+    #[test]
+    fn extension_snaps_to_infinite_line_beyond_endpoint() {
+        let (mut doc, sketch) = sketch_doc();
+        // A horizontal segment from (0,0) to (10,0); the query at (15, 0.2) is past the End
+        // endpoint but close to the line's extension.
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let anchors = vec![ConstraintLine::Line(0)];
+        let snap = find_extension_snap(&doc, &anchors, (15.0, 0.2), 1.0, &[]).unwrap();
+        assert_eq!(snap.target, SnapTarget::OnLineExtension(ConstraintLine::Line(0)));
+        // Snapped onto the line (v=0) at the queried u.
+        assert!((snap.uv.0 - 15.0).abs() < EPS && snap.uv.1.abs() < EPS);
+        // Leaving the point there pins it on the (infinite) line.
+        let point = ConstraintPoint::CircleCenter(0);
+        assert!(matches!(
+            snap_constraint_kind(point, snap.target),
+            ConstraintKind::Coincident {
+                b: ConstraintEntity::Line(ConstraintLine::Line(0)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn extension_snap_ignores_on_segment_region() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let anchors = vec![ConstraintLine::Line(0)];
+        // Query is within the segment span — handled by `find_snap`'s OnLine, not extension.
+        assert!(find_extension_snap(&doc, &anchors, (5.0, 0.2), 1.0, &[]).is_none());
+    }
+
+    #[test]
+    fn extension_snap_rejects_far_perpendicular_distance() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let anchors = vec![ConstraintLine::Line(0)];
+        // Far above the extension line: outside perpendicular tolerance.
+        assert!(find_extension_snap(&doc, &anchors, (15.0, 5.0), 1.0, &[]).is_none());
+    }
+
+    #[test]
+    fn extension_anchors_from_a_rect_corner_extend_both_edges() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 6.0));
+        // Bottom-right corner (corner 1) owns the rectangle's four edges as anchors.
+        let corner = ConstraintPoint::RectCorner { rect: 0, corner: 1 };
+        let anchors = vertex_extension_anchors(corner);
+        // A point directly below the right edge (x=10) snaps onto that edge's extension.
+        let snap = find_extension_snap(&doc, &anchors, (10.2, -4.0), 1.0, &[]).unwrap();
+        assert_eq!(
+            snap.target,
+            SnapTarget::OnLineExtension(ConstraintLine::RectEdge {
+                rect: 0,
+                edge: RectEdge::Right
+            })
+        );
+        assert!((snap.uv.0 - 10.0).abs() < EPS);
+    }
+
+    #[test]
+    fn extension_snap_excludes_dragged_points_own_edges() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let anchors = vec![ConstraintLine::Line(0)];
+        let dragged = ConstraintPoint::LineEndpoint {
+            line: 0,
+            end: LineEnd::End,
+        };
+        assert!(find_extension_snap(&doc, &anchors, (15.0, 0.2), 1.0, &[dragged]).is_none());
     }
 }

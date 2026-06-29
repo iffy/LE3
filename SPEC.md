@@ -107,6 +107,11 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
   constraints. A ring marks the active snap. Snapping is toggleable from the context pane
   and the toggle only appears for tools that snap (Select, Line, Rectangle, Circle) while a
   sketch is open.
+- **Inference / extension snapping:** hovering a vertex while drawing arms its incident edges
+  as extension guides; pulling away then snaps the point onto the **infinite extension** of
+  those edges (within a perpendicular tolerance), with a dashed guide line from the edge to the
+  point. Leaving the point there adds a point-on-line coincidence (collinear with the edge), so
+  e.g. touching a rectangle corner lets the next point be placed in line with one of its sides.
 
 ### 3.2 Solid creation from sketches
 - **Extrude** — blind, symmetric, to-object, with optional draft angle.
@@ -391,6 +396,10 @@ Everything achievable in the GUI must be achievable by programming, and vice ver
   mouse/keyboard) and enter a ground-plane sketch if none is open: `le3.rect{ width, height,
   x?, y?, name? }` and `le3.line{ length, angle?, x?, y?, name? }` (or explicit endpoints
   `le3.line{ x, y, x1, y1 }`).
+- `le3.begin_sketch{ … }` starts a sketch on any face. Besides `kind = "rect"|"circle"|"plane"`
+  with `index`, it accepts **3D body faces**: `kind = "extrude_cap", extrusion, profile =
+  "rect"|"circle", profile_index, top?` and `kind = "extrude_side", extrusion, profile,
+  profile_index, edge?`. (This makes sketching on a solid's face scriptable, e.g. for testing.)
 
 ---
 
@@ -484,6 +493,9 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
   submenu that shows/hides each available pane via a checkbox. (The menu bar is
   drawn in-window rather than as a native OS menu so it appears in screenshot
   regression tests, §9.3, and stays consistent across platforms.)
+- **STL export from the GUI:** **File → Export STL…** exports all bodies (via a save
+  dialog); right-clicking a **body** row in the Elements pane exports just that body. Both
+  mirror the scriptable `le3.export_stl` (§8, §9.2).
 
 ### 11.2 Command palette
 - VS Code-style palette listing **context-pertinent** commands. Commands come from the

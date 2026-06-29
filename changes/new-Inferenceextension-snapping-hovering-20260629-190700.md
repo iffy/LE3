@@ -1,0 +1,1 @@
+Inference/extension snapping: hovering a sketch vertex arms its edges as guides, so points snap onto the infinite extension of those edges (with a dashed guide) and stay collinear via a point-on-line constraint (#21)

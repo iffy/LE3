@@ -19,6 +19,7 @@ pub enum MenuCommand {
     Open,
     Save,
     SaveAs,
+    ExportStl,
     Quit,
     UndoLast,
     Clear,
@@ -34,6 +35,7 @@ pub struct MenuIds {
     pub open: MenuId,
     pub save: MenuId,
     pub save_as: MenuId,
+    pub export_stl: MenuId,
     pub quit: MenuId,
     pub undo: MenuId,
     pub clear: MenuId,
@@ -82,6 +84,9 @@ pub fn command_for_id(
     if ids.save_as == id {
         return Some(MenuCommand::SaveAs);
     }
+    if ids.export_stl == id {
+        return Some(MenuCommand::ExportStl);
+    }
     if ids.quit == id {
         return Some(MenuCommand::Quit);
     }
@@ -129,6 +134,8 @@ impl MenuCommand {
         match self {
             MenuCommand::NewDocument => Some(Action::NewDocument),
             MenuCommand::Open | MenuCommand::Save | MenuCommand::SaveAs => None,
+            // Needs a file-save dialog, handled in the app frame loop.
+            MenuCommand::ExportStl => None,
             MenuCommand::Quit => None,
             MenuCommand::UndoLast => Some(Action::UndoLast),
             MenuCommand::Clear => Some(Action::Clear),
@@ -208,6 +215,7 @@ impl NativeMenu {
                 Code::KeyS,
             )),
         );
+        let export_stl = MenuItem::with_id("export_stl", "Export STL…", true, None);
         let quit = MenuItem::with_id(
             "quit",
             "Quit",
@@ -249,6 +257,8 @@ impl NativeMenu {
         file_menu.append(&file_sep)?;
         file_menu.append(&save)?;
         file_menu.append(&save_as)?;
+        file_menu.append(&PredefinedMenuItem::separator())?;
+        file_menu.append(&export_stl)?;
         #[cfg(not(target_os = "macos"))]
         {
             let quit_sep = PredefinedMenuItem::separator();
@@ -282,6 +292,7 @@ impl NativeMenu {
             open: open.id().clone(),
             save: save.id().clone(),
             save_as: save_as.id().clone(),
+            export_stl: export_stl.id().clone(),
             quit: quit.id().clone(),
             undo: undo.id().clone(),
             clear: clear.id().clone(),
@@ -366,6 +377,7 @@ mod tests {
             open: MenuId::new("open"),
             save: MenuId::new("save"),
             save_as: MenuId::new("save_as"),
+            export_stl: MenuId::new("export_stl"),
             quit: MenuId::new("quit"),
             undo: MenuId::new("undo"),
             clear: MenuId::new("clear"),
