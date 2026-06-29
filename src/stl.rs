@@ -1,5 +1,6 @@
-//! ASCII STL parsing and mesh normalization for HUD assets.
+//! ASCII STL parsing and mesh normalization for HUD assets, plus STL export of bodies.
 
+use crate::extrude::SolidMesh;
 use glam::Vec3;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,6 +42,28 @@ pub fn parse_ascii_stl(data: &str) -> Result<Vec<MeshTriangle>, String> {
         return Err("no triangles found".into());
     }
     Ok(triangles)
+}
+
+/// Serialize a solid mesh as an ASCII STL document named `name`. Each triangle's facet
+/// normal is derived from its winding (right-hand rule); degenerate triangles get a zero
+/// normal. The output round-trips through [`parse_ascii_stl`].
+pub fn write_ascii_stl(name: &str, mesh: &SolidMesh) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "solid {name}");
+    for tri in &mesh.triangles {
+        let [a, b, c] = *tri;
+        let n = (b - a).cross(c - a).normalize_or_zero();
+        let _ = writeln!(out, "  facet normal {} {} {}", n.x, n.y, n.z);
+        out.push_str("    outer loop\n");
+        for v in [a, b, c] {
+            let _ = writeln!(out, "      vertex {} {} {}", v.x, v.y, v.z);
+        }
+        out.push_str("    endloop\n");
+        out.push_str("  endfacet\n");
+    }
+    let _ = writeln!(out, "endsolid {name}");
+    out
 }
 
 fn parse_vec3(s: &str) -> Option<Vec3> {
@@ -160,5 +183,31 @@ mod tests {
     #[test]
     fn parse_ascii_stl_rejects_empty() {
         assert!(parse_ascii_stl("solid empty\nendsolid empty").is_err());
+    }
+
+    #[test]
+    fn write_ascii_stl_round_trips() {
+        let mesh = SolidMesh {
+            triangles: vec![
+                [
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(1.0, 0.0, 0.0),
+                    Vec3::new(0.0, 1.0, 0.0),
+                ],
+                [
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(0.0, 1.0, 0.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                ],
+            ],
+        };
+        let text = write_ascii_stl("part", &mesh);
+        assert!(text.starts_with("solid part"));
+        assert!(text.trim_end().ends_with("endsolid part"));
+        let parsed = parse_ascii_stl(&text).expect("round-trip parse");
+        assert_eq!(parsed.len(), 2);
+        // First triangle lies in the z=0 plane, so its normal is ±Z (here +Z by winding).
+        assert!((parsed[0].normal - Vec3::Z).length() < 1e-5, "normal {:?}", parsed[0].normal);
+        assert_eq!(parsed[0].vertices[1], Vec3::new(1.0, 0.0, 0.0));
     }
 }

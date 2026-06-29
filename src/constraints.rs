@@ -5,8 +5,8 @@ use crate::geometric_constraints::{
     point_uv, selected_constraint_refs, ConstraintRef,
 };
 use crate::model::{
-    default_constraint_sign, Constraint, ConstraintKind, ConstraintLine, ConstraintPoint,
-    DimensionTarget, DistanceTarget, Document, RectEdge, SketchId,
+    default_constraint_sign, Constraint, ConstraintEntity, ConstraintKind, ConstraintLine,
+    ConstraintPoint, DimensionTarget, DistanceTarget, Document, RectEdge, SketchId,
 };
 use crate::value::{
     eval_angle_rad_in_doc, eval_length_mm_in_doc, format_angle_display, format_diameter_display,
@@ -1295,6 +1295,81 @@ fn point_sketch(doc: &Document, point: ConstraintPoint) -> Option<SketchId> {
     }
 }
 
+/// The line a point lies on by virtue of being one of its endpoints, if any.
+fn endpoint_line(point: ConstraintPoint) -> Option<ConstraintLine> {
+    match point {
+        ConstraintPoint::LineEndpoint { line, .. } => Some(ConstraintLine::Line(line)),
+        _ => None,
+    }
+}
+
+/// `(point, line)` pairs that a constraint pins to a *specific* spot on a line: a midpoint
+/// constraint, or a coincidence between a free point and a line's endpoint.
+fn point_line_pins(kind: ConstraintKind) -> Vec<(ConstraintPoint, ConstraintLine)> {
+    match kind {
+        ConstraintKind::Midpoint { point, line } => vec![(point, line)],
+        ConstraintKind::Coincident {
+            a: ConstraintEntity::Point(pa),
+            b: ConstraintEntity::Point(pb),
+        } => {
+            let mut pins = Vec::new();
+            if let Some(line) = endpoint_line(pb) {
+                pins.push((pa, line));
+            }
+            if let Some(line) = endpoint_line(pa) {
+                pins.push((pb, line));
+            }
+            pins
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a coincident constraint's entities are exactly the generic point-on-line pair
+/// `(point, line)` (in either order).
+fn is_point_on_line(a: ConstraintEntity, b: ConstraintEntity, point: ConstraintPoint, line: ConstraintLine) -> bool {
+    matches!(
+        (a, b),
+        (ConstraintEntity::Point(p), ConstraintEntity::Line(l))
+            | (ConstraintEntity::Line(l), ConstraintEntity::Point(p))
+        if p == point && l == line
+    )
+}
+
+/// A point constrained coincident with a *specific* point on a line (its endpoint or
+/// midpoint) makes an earlier generic point-on-line coincidence for that same point and line
+/// redundant. Mark such constraints deleted so the more specific constraint wins (#23).
+/// `new_index` is the just-added constraint that should be kept.
+pub fn remove_subsumed_point_on_line(doc: &mut Document, sketch: SketchId, new_index: usize) {
+    let Some(new) = doc.constraints.get(new_index) else {
+        return;
+    };
+    if new.deleted || new.sketch != sketch {
+        return;
+    }
+    let pins = point_line_pins(new.kind);
+    if pins.is_empty() {
+        return;
+    }
+    for i in 0..doc.constraints.len() {
+        if i == new_index {
+            continue;
+        }
+        let c = &doc.constraints[i];
+        if c.deleted || c.sketch != sketch {
+            continue;
+        }
+        if let ConstraintKind::Coincident { a, b } = c.kind {
+            if pins
+                .iter()
+                .any(|(point, line)| is_point_on_line(a, b, *point, *line))
+            {
+                doc.constraints[i].deleted = true;
+            }
+        }
+    }
+}
+
 pub fn propagate_parameter_rename_to_constraints(doc: &mut Document, old: &str, new: &str) {
     if old == new {
         return;
@@ -1332,6 +1407,96 @@ mod tests {
         assert_eq!(id, 0);
         assert!((doc.lines[0].length() - 5.0).abs() < 1e-3);
         assert!(doc.lines[0].length_locked);
+    }
+
+    fn push_coincident(doc: &mut Document, sketch: SketchId, kind: ConstraintKind) -> usize {
+        let id = doc.constraints.len();
+        doc.constraints.push(Constraint {
+            sketch,
+            kind,
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+        doc.shape_order.push(ShapeKind::Constraint);
+        id
+    }
+
+    #[test]
+    fn endpoint_coincidence_subsumes_point_on_line() {
+        use crate::model::LineEnd;
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 3.0, 4.0, 6.0, 8.0));
+        let free = ConstraintPoint::LineEndpoint {
+            line: 1,
+            end: LineEnd::Start,
+        };
+        let on_line = push_coincident(
+            &mut doc,
+            sketch,
+            ConstraintKind::Coincident {
+                a: ConstraintEntity::Point(free),
+                b: ConstraintEntity::Line(ConstraintLine::Line(0)),
+            },
+        );
+        // Later: pin the same point to a specific endpoint of line 0.
+        let specific = push_coincident(
+            &mut doc,
+            sketch,
+            ConstraintKind::Coincident {
+                a: ConstraintEntity::Point(free),
+                b: ConstraintEntity::Point(ConstraintPoint::LineEndpoint {
+                    line: 0,
+                    end: LineEnd::End,
+                }),
+            },
+        );
+        remove_subsumed_point_on_line(&mut doc, sketch, specific);
+        assert!(doc.constraints[on_line].deleted, "generic point-on-line should be removed");
+        assert!(!doc.constraints[specific].deleted, "specific coincidence is kept");
+    }
+
+    #[test]
+    fn midpoint_subsumes_point_on_line_but_not_other_lines() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 5.0, 10.0, 5.0));
+        let pt = ConstraintPoint::CircleCenter(0);
+        doc.circles
+            .push(Circle::from_local_center_radius(sketch, 5.0, 0.0, 1.0, 0.0));
+        let on_line0 = push_coincident(
+            &mut doc,
+            sketch,
+            ConstraintKind::Coincident {
+                a: ConstraintEntity::Point(pt),
+                b: ConstraintEntity::Line(ConstraintLine::Line(0)),
+            },
+        );
+        let on_line1 = push_coincident(
+            &mut doc,
+            sketch,
+            ConstraintKind::Coincident {
+                a: ConstraintEntity::Point(pt),
+                b: ConstraintEntity::Line(ConstraintLine::Line(1)),
+            },
+        );
+        let mid = push_coincident(
+            &mut doc,
+            sketch,
+            ConstraintKind::Midpoint {
+                point: pt,
+                line: ConstraintLine::Line(0),
+            },
+        );
+        remove_subsumed_point_on_line(&mut doc, sketch, mid);
+        assert!(doc.constraints[on_line0].deleted, "midpoint subsumes point-on-line-0");
+        assert!(!doc.constraints[on_line1].deleted, "point-on-line-1 is unrelated");
     }
 
     #[test]

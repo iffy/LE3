@@ -29,6 +29,8 @@ pub enum Instruction {
     New,
     Open(String),
     Save(Option<String>),
+    /// Export bodies to an STL file at `path`; `body` names a single body (`None` = all).
+    ExportStl { path: String, body: Option<String> },
     Clear,
     Undo,
     Tool(Tool),
@@ -179,6 +181,11 @@ impl Instruction {
             Instruction::Open(path) => format!("le3.open({path:?})"),
             Instruction::Save(None) => "le3.save()".to_string(),
             Instruction::Save(Some(path)) => format!("le3.save({path:?})"),
+            Instruction::ExportStl { path, body: None } => format!("le3.export_stl({path:?})"),
+            Instruction::ExportStl {
+                path,
+                body: Some(body),
+            } => format!("le3.export_stl({path:?}, {body:?})"),
             Instruction::Clear => "le3.clear()".to_string(),
             Instruction::Undo => "le3.undo()".to_string(),
             Instruction::Tool(tool) => format!("le3.tool({:?})", tool_lua_name(*tool)),
@@ -557,6 +564,10 @@ pub fn instruction_from_action(action: &Action, doc: &crate::model::Document) ->
         Action::NewDocument => Some(Instruction::New),
         Action::Open { path } => Some(Instruction::Open(path.clone())),
         Action::Save { path } => Some(Instruction::Save(path.clone())),
+        Action::ExportStl { path, body } => Some(Instruction::ExportStl {
+            path: path.clone(),
+            body: body.clone(),
+        }),
         Action::Clear => Some(Instruction::Clear),
         Action::UndoLast => Some(Instruction::Undo),
         Action::SetTool(tool) => Some(Instruction::Tool(*tool)),
@@ -1402,6 +1413,10 @@ impl ScriptRunner {
             }
             Instruction::Save(path) => {
                 state.apply(Action::Save { path });
+                StepResult::Continue
+            }
+            Instruction::ExportStl { path, body } => {
+                state.apply(Action::ExportStl { path, body });
                 StepResult::Continue
             }
             Instruction::Clear => {

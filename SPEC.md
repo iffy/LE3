@@ -94,6 +94,11 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
 - Sketch entities: line, arc, circle, ellipse, spline, point, and construction-geometry
   variants. Convenience primitives (e.g. **rectangle**, drawn as four constrained lines)
   may be offered as tools that emit the underlying entities.
+- **Line tool chaining:** the line tool draws connected polylines — after a segment is
+  committed, the next segment starts automatically at that endpoint (coincident with it), so
+  a polygon is drawn with successive clicks. Chaining stops when the segment's end snaps onto
+  an existing vertex (closing/joining the shape); **Esc** finishes the polyline, keeping the
+  segments already drawn.
 - Sketches are fully constraint-driven (see §6).
 - **Snapping:** while drawing or dragging sketch geometry, the cursor snaps to nearby
   vertices, line midpoints, and lines (vertices take priority, then midpoints, then
@@ -267,12 +272,15 @@ modeled on SolveSpace (https://solvespace.com).
   vertices within the point pick tolerance.
 - **Context pane:** While the constraint tool is active, the context pane lists geometric
   constraint types as buttons (text labels for now; icons later).
-  - **Nothing selected:** every type is shown **disabled**, with a hint beside each button
-    describing what must be selected (e.g. `line, line` for Parallel).
-  - **Something selected:** types that cannot work with the current selection are **hidden**.
-    Remaining buttons are **enabled** when the selection satisfies the constraint, or
-    **disabled** with the still-missing selection roles listed.
-  - **Shortcuts:** enabled buttons are numbered **`1`–`9`** top-to-bottom.
+  - **Always all types:** every constraint type is **always listed**, in fixed order.
+    Types the current selection cannot satisfy (including when nothing is selected) appear
+    **disabled/faded**, with a hint beside the button describing what must be selected
+    (e.g. `line, line` for Parallel). Buttons are **enabled** only when the selection
+    satisfies that constraint.
+  - **Shortcuts:** each type has a fixed **mnemonic letter** shown left of its button —
+    Parallel `A`, Perpendicular `T`, Coincident `I`, Midpoint `M`, Vertical `V`,
+    Horizontal `H` (chosen to avoid the global tool keys). Pressing the letter while the
+    constraint tool is active applies that constraint if it is currently enabled.
 - **Geometric types (v1):**
   - **Parallel** — `line`, `line`
   - **Perpendicular** — `line`, `line`
@@ -281,6 +289,10 @@ modeled on SolveSpace (https://solvespace.com).
   - **Midpoint** — `point`, `line`
   - **Vertical** — `line`
   - **Horizontal** — `line`
+- **Redundant-constraint cleanup:** when a point already constrained coincident with a line
+  is then constrained to a *specific* point on that same line (one of its endpoints, or its
+  midpoint), the earlier generic point-on-line coincidence is removed in favor of the more
+  specific constraint.
 - **Scripting:** `tool constraint`; `select point line 0 start`; `add_geometric_constraint
   parallel` (uses current selection). Circle tool shortcut is **`O`** (`C` is constraint).
 

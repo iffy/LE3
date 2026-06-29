@@ -526,13 +526,15 @@ impl App {
             }
 
             if self.state.tool == Tool::Constraint {
+                // Mnemonic letter shortcuts for the constraint pane (see
+                // GeometricConstraintType::shortcut_label). `C` is reserved for the tool itself.
                 for (key, egui_key) in [
-                    ('1', egui::Key::Num1),
-                    ('2', egui::Key::Num2),
-                    ('3', egui::Key::Num3),
-                    ('4', egui::Key::Num4),
-                    ('5', egui::Key::Num5),
-                    ('6', egui::Key::Num6),
+                    ('A', egui::Key::A),
+                    ('T', egui::Key::T),
+                    ('I', egui::Key::I),
+                    ('M', egui::Key::M),
+                    ('V', egui::Key::V),
+                    ('H', egui::Key::H),
                 ] {
                     if ctx.input(|i| i.key_pressed(egui_key)) {
                         self.state.apply(Action::ApplyConstraintShortcut(key));

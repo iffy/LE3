@@ -7,7 +7,7 @@
 
 use crate::face::{local_to_world, sketch_geometry_frame, SketchFrame};
 use crate::geometric_constraints::point_uv;
-use crate::model::{Document, ExtrudeFace, ExtrudeTarget, Extrusion};
+use crate::model::{BodySource, Document, ExtrudeFace, ExtrudeTarget, Extrusion};
 use glam::Vec3;
 
 /// Number of segments used to facet a circular profile.
@@ -55,6 +55,33 @@ pub fn extrusion_mesh(doc: &Document, extrusion: &Extrusion) -> Option<SolidMesh
         }
     }
     (!mesh.is_empty()).then_some(mesh)
+}
+
+/// Build the solid mesh for a single body (by index), or `None` if the body is deleted,
+/// missing, or its source feature produces no geometry.
+pub fn body_solid_mesh(doc: &Document, body_index: usize) -> Option<SolidMesh> {
+    let body = doc.bodies.get(body_index)?;
+    if body.deleted {
+        return None;
+    }
+    let BodySource::Extrusion(ei) = body.source;
+    let extrusion = doc.extrusions.get(ei)?;
+    if extrusion.deleted {
+        return None;
+    }
+    extrusion_mesh(doc, extrusion)
+}
+
+/// Combined solid mesh of every non-deleted body in the document (the geometry an STL/OBJ
+/// export should contain). Bodies are concatenated into one triangle soup.
+pub fn document_solid_mesh(doc: &Document) -> SolidMesh {
+    let mut mesh = SolidMesh::default();
+    for bi in 0..doc.bodies.len() {
+        if let Some(solid) = body_solid_mesh(doc, bi) {
+            mesh.triangles.extend(solid.triangles);
+        }
+    }
+    mesh
 }
 
 /// The `(point, normal)` plane an extrusion's top cap should lie in, when its target defines
@@ -343,6 +370,26 @@ mod tests {
         let (min, max) = mesh.bounds().unwrap();
         assert!((min.z).abs() < 1e-4 && (max.z - 6.0).abs() < 1e-4, "z [{},{}]", min.z, max.z);
         assert!((max.x - min.x - 10.0).abs() < 1e-4 && (max.y - min.y - 4.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn document_solid_mesh_collects_bodies() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 4.0));
+        doc.extrusions
+            .push(extrusion(sketch, vec![ExtrudeFace::Rect(0)], 6.0));
+        doc.bodies.push(crate::model::Body {
+            source: BodySource::Extrusion(0),
+            name: Some("Box".into()),
+            deleted: false,
+        });
+        let combined = document_solid_mesh(&doc);
+        assert_eq!(combined.triangles.len(), 12);
+        // A deleted body contributes nothing.
+        doc.bodies[0].deleted = true;
+        assert!(document_solid_mesh(&doc).is_empty());
+        assert!(body_solid_mesh(&doc, 0).is_none());
     }
 
     #[test]

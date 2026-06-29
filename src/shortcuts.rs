@@ -212,19 +212,19 @@ mod tests {
     }
 
     #[test]
-    fn geometric_constraint_shortcut_maps_numbers() {
+    fn geometric_constraint_shortcut_maps_letters() {
         use crate::geometric_constraints::GeometricConstraintType;
         assert_eq!(
             format_shortcut(geometric_constraint_shortcut(
                 GeometricConstraintType::Parallel
             )),
-            "1"
+            "A"
         );
         assert_eq!(
             format_shortcut(geometric_constraint_shortcut(
                 GeometricConstraintType::Horizontal
             )),
-            "6"
+            "H"
         );
     }
 

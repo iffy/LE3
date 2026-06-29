@@ -340,6 +340,8 @@ pub enum Action {
     NewDocument,
     Open { path: String },
     Save { path: Option<String> },
+    /// Export bodies to an STL file. `body` names a single body; `None` exports all bodies.
+    ExportStl { path: String, body: Option<String> },
     Clear,
     UndoLast,
     SetTool(Tool),
@@ -437,7 +439,7 @@ pub enum Action {
     FocusElementName,
     /// Apply a geometric constraint type to the current selection (constraint tool).
     AddGeometricConstraint(crate::geometric_constraints::GeometricConstraintType),
-    /// Apply the enabled constraint matching a fixed shortcut key (1–6).
+    /// Apply the enabled constraint matching its mnemonic shortcut key (A/T/I/M/V/H).
     ApplyConstraintShortcut(char),
     /// Move a sketch vertex to local `(u, v)` while satisfying constraints.
     DragVertex {
@@ -1186,6 +1188,50 @@ impl AppState {
                     None => ActionResult::NeedsDialog,
                 }
             }
+            Action::ExportStl { path, body } => {
+                let (name, mesh) = match &body {
+                    Some(name) => {
+                        match self.doc.bodies.iter().position(|b| {
+                            !b.deleted && b.name.as_deref() == Some(name.as_str())
+                        }) {
+                            Some(bi) => {
+                                (name.clone(), crate::extrude::body_solid_mesh(&self.doc, bi))
+                            }
+                            None => {
+                                self.status = format!("Export failed: no body named '{name}'");
+                                return ActionResult::Err(self.status.clone());
+                            }
+                        }
+                    }
+                    None => (
+                        "le3".to_string(),
+                        Some(crate::extrude::document_solid_mesh(&self.doc)),
+                    ),
+                };
+                match mesh {
+                    Some(m) if !m.is_empty() => {
+                        let stl = crate::stl::write_ascii_stl(&name, &m);
+                        match std::fs::write(&path, stl) {
+                            Ok(()) => {
+                                self.status = format!(
+                                    "Exported {} triangle(s) to {}",
+                                    m.triangles.len(),
+                                    path
+                                );
+                                ActionResult::Ok
+                            }
+                            Err(e) => {
+                                self.status = format!("Export failed: {e}");
+                                ActionResult::Err(self.status.clone())
+                            }
+                        }
+                    }
+                    _ => {
+                        self.status = "Export failed: no solid geometry to export".to_string();
+                        ActionResult::Err(self.status.clone())
+                    }
+                }
+            }
             Action::Clear => {
                 self.doc = Document::default();
                 self.sketch_session = None;
@@ -1596,6 +1642,13 @@ impl AppState {
                             return ActionResult::Err(e);
                         }
                     }
+                    // If the segment's end latched onto an existing vertex (or the origin),
+                    // the polyline is closing/joining, so we stop chaining (#20).
+                    let end_on_vertex = matches!(
+                        self.line_end_snap,
+                        Some(crate::snapping::SnapTarget::Vertex(_))
+                            | Some(crate::snapping::SnapTarget::Origin)
+                    );
                     // Pin endpoints that were left on a snap target.
                     if let Some(target) = self.line_start_snap.take() {
                         let _ = self.add_snap_constraint(
@@ -1618,7 +1671,31 @@ impl AppState {
                         );
                     }
                     let len = self.doc.lines.last().unwrap().length();
-                    self.status = format!("Added line ({:.1} mm)", len);
+                    // Chain into the next segment: start a new line at this endpoint so polygons
+                    // can be drawn with successive clicks. The new start snaps to the just-placed
+                    // endpoint (coincident on commit), keeping the polyline connected. Skip this
+                    // when we closed onto an existing vertex (#20).
+                    if self.tool == Tool::Line && !end_on_vertex {
+                        self.line_start_snap = Some(crate::snapping::SnapTarget::Vertex(
+                            ConstraintPoint::LineEndpoint {
+                                line: line_index,
+                                end: LineEnd::End,
+                            },
+                        ));
+                        self.line_end_snap = None;
+                        self.creating_line = Some(CreatingLine {
+                            origin: end,
+                            text: String::new(),
+                            last_mouse: end,
+                            user_edited: false,
+                            pending_focus: true,
+                            construction: cl.construction,
+                        });
+                        self.status =
+                            format!("Added line ({:.1} mm) • click for next point • Esc to finish", len);
+                    } else {
+                        self.status = format!("Added line ({:.1} mm)", len);
+                    }
                     ActionResult::Ok
                 } else {
                     self.creating_line = Some(cl);
@@ -2833,6 +2910,8 @@ impl AppState {
         self.doc
             .shape_order
             .push(crate::model::ShapeKind::Constraint);
+        let new_index = self.doc.constraints.len() - 1;
+        crate::constraints::remove_subsumed_point_on_line(&mut self.doc, sketch, new_index);
         crate::constraints::solve_document_constraints(&mut self.doc)?;
         self.refresh_document_health();
         Ok(())
@@ -3082,6 +3161,43 @@ mod tests {
         assert_eq!(state.doc.extrusions[0].distance, 7.0);
         assert_eq!(state.doc.bodies.len(), 1);
         assert!(state.creating_extrusion.is_none());
+    }
+
+    #[test]
+    fn export_stl_writes_a_parseable_file() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state
+            .doc
+            .rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
+        state.doc.shape_order.push(ShapeKind::Rect);
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace {
+            face: ExtrudeFace::Rect(0),
+        });
+        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
+        state.apply(Action::CommitExtrusion);
+        assert_eq!(state.doc.bodies.len(), 1);
+
+        let path = std::env::temp_dir().join(format!("le3_export_{}.stl", std::process::id()));
+        let path_str = path.to_string_lossy().to_string();
+        let result = state.apply(Action::ExportStl {
+            path: path_str.clone(),
+            body: None,
+        });
+        assert_eq!(result, ActionResult::Ok, "status: {}", state.status);
+        let text = std::fs::read_to_string(&path).expect("read exported stl");
+        let tris = crate::stl::parse_ascii_stl(&text).expect("parse exported stl");
+        assert_eq!(tris.len(), 12, "a box has 12 triangles");
+
+        // Exporting a non-existent named body fails cleanly.
+        let missing = state.apply(Action::ExportStl {
+            path: path_str.clone(),
+            body: Some("Nope".into()),
+        });
+        assert!(matches!(missing, ActionResult::Err(_)));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -3458,7 +3574,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_constraint_shortcut_1_adds_parallel() {
+    fn apply_constraint_shortcut_a_adds_parallel() {
         let mut state = AppState::default();
         let sketch = begin_default_sketch(&mut state);
         state.tool = Tool::Constraint;
@@ -3478,7 +3594,7 @@ mod tests {
             element: SceneElement::Line(1),
             additive: true,
         });
-        state.apply(Action::ApplyConstraintShortcut('1'));
+        state.apply(Action::ApplyConstraintShortcut('A'));
         assert_eq!(state.doc.constraints.len(), 1);
         assert!(matches!(
             state.doc.constraints[0].kind,
@@ -3738,6 +3854,88 @@ mod tests {
         assert_eq!(state.doc.constraints.len(), 1);
         assert!(state.doc.lines[0].length_locked);
         assert!(state.creating_line.is_none());
+    }
+
+    #[test]
+    fn line_tool_chains_into_next_segment() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state.tool = Tool::Line;
+        state.creating_line = Some(CreatingLine {
+            origin: Vec3::ZERO,
+            text: "10".to_string(),
+            last_mouse: Vec3::new(10.0, 0.0, 0.0),
+            user_edited: true,
+            pending_focus: false,
+            construction: false,
+        });
+        state.apply(Action::CommitLine);
+
+        // The segment was committed, and a fresh segment is already started at its endpoint.
+        assert_eq!(state.doc.lines.len(), 1);
+        let cl = state
+            .creating_line
+            .as_ref()
+            .expect("a new segment should be chained from the endpoint");
+        let frame = sketch_geometry_frame(&state.doc, sketch).unwrap();
+        let (ou, ov) = world_to_local(&frame, cl.origin);
+        assert!((ou - 10.0).abs() < 1e-3 && ov.abs() < 1e-3, "new origin at endpoint");
+        // The new start snaps to the previous endpoint so the polyline stays connected.
+        assert!(matches!(
+            state.line_start_snap,
+            Some(crate::snapping::SnapTarget::Vertex(ConstraintPoint::LineEndpoint {
+                line: 0,
+                end: LineEnd::End
+            }))
+        ));
+
+        // Committing the chained segment connects the two lines (coincident constraint).
+        state.creating_line.as_mut().unwrap().last_mouse = Vec3::new(10.0, 10.0, 0.0);
+        state.creating_line.as_mut().unwrap().text.clear();
+        state.creating_line.as_mut().unwrap().user_edited = false;
+        state.apply(Action::CommitLine);
+        assert_eq!(state.doc.lines.len(), 2);
+        assert!(state
+            .doc
+            .constraints
+            .iter()
+            .any(|c| !c.deleted && matches!(c.kind, crate::model::ConstraintKind::Coincident { .. })));
+    }
+
+    #[test]
+    fn line_tool_stops_chaining_when_closing_on_a_vertex() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state.tool = Tool::Line;
+        // An existing line whose start vertex sits at (10, 0).
+        state
+            .doc
+            .lines
+            .push(Line::from_local_endpoints(sketch, 10.0, 0.0, 20.0, 0.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+
+        state.creating_line = Some(CreatingLine {
+            origin: Vec3::ZERO,
+            text: "10".to_string(),
+            last_mouse: Vec3::new(10.0, 0.0, 0.0),
+            user_edited: true,
+            pending_focus: false,
+            construction: false,
+        });
+        // The end latched onto the existing vertex at (10, 0).
+        state.line_end_snap = Some(crate::snapping::SnapTarget::Vertex(
+            ConstraintPoint::LineEndpoint {
+                line: 0,
+                end: LineEnd::Start,
+            },
+        ));
+        state.apply(Action::CommitLine);
+
+        assert_eq!(state.doc.lines.len(), 2);
+        assert!(
+            state.creating_line.is_none(),
+            "closing onto a vertex finishes the polyline"
+        );
     }
 
     #[test]

@@ -42,26 +42,27 @@ impl GeometricConstraintType {
         }
     }
 
-    /// Fixed context-pane shortcut (shown left of the constraint button).
+    /// Fixed context-pane shortcut (shown left of the constraint button). Mnemonic letters
+    /// rather than numbers; chosen to avoid the global tool keys (S/R/L/C/O/P/D/E/X/N).
     pub fn shortcut_label(self) -> &'static str {
         match self {
-            Self::Parallel => "1",
-            Self::Perpendicular => "2",
-            Self::Coincident => "3",
-            Self::Midpoint => "4",
-            Self::Vertical => "5",
-            Self::Horizontal => "6",
+            Self::Parallel => "A",      // p-A-rallel
+            Self::Perpendicular => "T", // a "T" is a right angle
+            Self::Coincident => "I",    // co-I-ncident
+            Self::Midpoint => "M",      // Midpoint
+            Self::Vertical => "V",      // Vertical
+            Self::Horizontal => "H",    // Horizontal
         }
     }
 
     pub fn from_shortcut_key(key: char) -> Option<Self> {
-        match key {
-            '1' => Some(Self::Parallel),
-            '2' => Some(Self::Perpendicular),
-            '3' => Some(Self::Coincident),
-            '4' => Some(Self::Midpoint),
-            '5' => Some(Self::Vertical),
-            '6' => Some(Self::Horizontal),
+        match key.to_ascii_uppercase() {
+            'A' => Some(Self::Parallel),
+            'T' => Some(Self::Perpendicular),
+            'I' => Some(Self::Coincident),
+            'M' => Some(Self::Midpoint),
+            'V' => Some(Self::Vertical),
+            'H' => Some(Self::Horizontal),
             _ => None,
         }
     }
@@ -95,24 +96,22 @@ pub fn constraint_pane_rows(selection: &SceneSelection) -> Vec<ConstraintPaneRow
     let refs = selected_constraint_refs(selection);
     let mut rows = Vec::new();
 
-    if refs.is_empty() {
-        for kind in GeometricConstraintType::ALL {
-            rows.push(ConstraintPaneRow {
-                kind,
-                enabled: false,
-                missing: missing_for_kind(kind),
-            });
-        }
-    } else {
-        for kind in GeometricConstraintType::ALL {
-            if let Some((enabled, missing)) = match_kind(kind, &refs) {
-                rows.push(ConstraintPaneRow {
-                    kind,
-                    enabled,
-                    missing,
-                });
+    // Every constraint type is always shown; ones the current selection can't satisfy appear
+    // disabled (faded) with their required roles, so the full set stays discoverable (#22).
+    for kind in GeometricConstraintType::ALL {
+        let (enabled, missing) = if refs.is_empty() {
+            (false, missing_for_kind(kind))
+        } else {
+            match match_kind(kind, &refs) {
+                Some(state) => state,
+                None => (false, missing_for_kind(kind)),
             }
-        }
+        };
+        rows.push(ConstraintPaneRow {
+            kind,
+            enabled,
+            missing,
+        });
     }
 
     rows
@@ -360,6 +359,7 @@ pub fn add_geometric_constraint_from_selection(
         deleted: false,
     });
     doc.shape_order.push(crate::model::ShapeKind::Constraint);
+    crate::constraints::remove_subsumed_point_on_line(doc, sketch, id);
     crate::constraints::solve_document_constraints(doc)?;
     Ok(id)
 }
@@ -903,16 +903,23 @@ mod tests {
 
     #[test]
     fn constraint_shortcut_keys_are_fixed_per_type() {
-        assert_eq!(GeometricConstraintType::Parallel.shortcut_label(), "1");
+        assert_eq!(GeometricConstraintType::Parallel.shortcut_label(), "A");
         assert_eq!(
-            GeometricConstraintType::from_shortcut_key('1'),
+            GeometricConstraintType::from_shortcut_key('A'),
             Some(GeometricConstraintType::Parallel)
         );
+        // Case-insensitive.
         assert_eq!(
-            GeometricConstraintType::from_shortcut_key('6'),
+            GeometricConstraintType::from_shortcut_key('h'),
             Some(GeometricConstraintType::Horizontal)
         );
-        assert!(GeometricConstraintType::from_shortcut_key('q').is_none());
+        // No constraint uses a global tool key, so they never collide.
+        for key in ['S', 'R', 'L', 'C', 'O', 'P', 'D', 'E', 'X', 'N'] {
+            assert!(
+                GeometricConstraintType::from_shortcut_key(key).is_none(),
+                "{key} collides with a tool shortcut"
+            );
+        }
     }
 
     #[test]
@@ -933,19 +940,21 @@ mod tests {
         assert!(by_kind[&GeometricConstraintType::Vertical].enabled);
         assert!(by_kind[&GeometricConstraintType::Horizontal].enabled);
         assert_eq!(
-            enabled_constraint_for_key(&rows, '5'),
+            enabled_constraint_for_key(&rows, 'V'),
             Some(GeometricConstraintType::Vertical)
         );
         assert_eq!(
-            enabled_constraint_for_key(&rows, '6'),
+            enabled_constraint_for_key(&rows, 'H'),
             Some(GeometricConstraintType::Horizontal)
         );
+        // A non-applicable type (Parallel) is present but disabled, not hidden.
+        assert_eq!(enabled_constraint_for_key(&rows, 'A'), None);
         assert_eq!(sole_enabled_constraint_type(&rows), None);
         let _ = doc;
     }
 
     #[test]
-    fn line_and_point_show_only_coincident_and_midpoint() {
+    fn line_and_point_enable_only_coincident_and_midpoint() {
         let (mut doc, sketch) = sketch_doc();
         doc.lines
             .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
@@ -960,17 +969,20 @@ mod tests {
         );
         click_scene_selection(&mut sel, SceneElement::Line(0), true);
         let rows = constraint_pane_rows(&sel);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].kind, GeometricConstraintType::Coincident);
-        assert!(rows[0].enabled);
+        // All six types are present; only Coincident and Midpoint are enabled.
+        assert_eq!(rows.len(), GeometricConstraintType::ALL.len());
+        let by_kind: std::collections::HashMap<_, _> =
+            rows.iter().map(|row| (row.kind, row)).collect();
+        assert!(by_kind[&GeometricConstraintType::Coincident].enabled);
+        assert!(by_kind[&GeometricConstraintType::Midpoint].enabled);
+        assert!(!by_kind[&GeometricConstraintType::Parallel].enabled);
+        assert!(!by_kind[&GeometricConstraintType::Vertical].enabled);
         assert_eq!(
-            enabled_constraint_for_key(&rows, '3'),
+            enabled_constraint_for_key(&rows, 'I'),
             Some(GeometricConstraintType::Coincident)
         );
-        assert_eq!(rows[1].kind, GeometricConstraintType::Midpoint);
-        assert!(rows[1].enabled);
         assert_eq!(
-            enabled_constraint_for_key(&rows, '4'),
+            enabled_constraint_for_key(&rows, 'M'),
             Some(GeometricConstraintType::Midpoint)
         );
         assert_eq!(sole_enabled_constraint_type(&rows), None);
@@ -997,11 +1009,12 @@ mod tests {
             }),
         );
         let rows = constraint_pane_rows(&sel);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, GeometricConstraintType::Coincident);
+        // All types listed; exactly one (Coincident) is enabled.
+        assert_eq!(rows.len(), GeometricConstraintType::ALL.len());
+        assert_eq!(rows.iter().filter(|r| r.enabled).count(), 1);
         assert_eq!(sole_enabled_constraint_type(&rows), Some(GeometricConstraintType::Coincident));
         assert_eq!(
-            enabled_constraint_for_key(&rows, '3'),
+            enabled_constraint_for_key(&rows, 'I'),
             Some(GeometricConstraintType::Coincident)
         );
         let _ = doc;
@@ -1247,6 +1260,53 @@ mod tests {
                 b: ConstraintEntity::Point(_),
             }
         ));
+    }
+
+    #[test]
+    fn pinning_to_endpoint_removes_earlier_point_on_line() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 3.0, 4.0, 7.0, 9.0));
+        let free = ConstraintPoint::LineEndpoint {
+            line: 1,
+            end: LineEnd::Start,
+        };
+
+        // First: generic point-on-line (point + line selected).
+        let mut sel = SceneSelection::default();
+        click_scene_selection(&mut sel, SceneElement::Point(free), false);
+        click_scene_selection(&mut sel, SceneElement::Line(0), true);
+        let on_line = add_geometric_constraint_from_selection(
+            &mut doc,
+            sketch,
+            GeometricConstraintType::Coincident,
+            &sel,
+        )
+        .unwrap();
+
+        // Later: pin to a specific endpoint of that same line (two points selected).
+        let endpoint = ConstraintPoint::LineEndpoint {
+            line: 0,
+            end: LineEnd::End,
+        };
+        let mut sel2 = SceneSelection::default();
+        select_two_points(
+            &mut sel2,
+            SceneElement::Point(free),
+            SceneElement::Point(endpoint),
+        );
+        let specific = add_geometric_constraint_from_selection(
+            &mut doc,
+            sketch,
+            GeometricConstraintType::Coincident,
+            &sel2,
+        )
+        .unwrap();
+
+        assert!(doc.constraints[on_line].deleted, "point-on-line should be superseded");
+        assert!(!doc.constraints[specific].deleted);
     }
 
     #[test]

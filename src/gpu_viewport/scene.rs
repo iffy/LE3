@@ -67,6 +67,11 @@ pub const GRID_DEPTH_BIAS: f32 = 0.0;
 pub const STROKE_DEPTH_BIAS: f32 = 0.10;
 /// Lift construction-plane hover fills above the plane surface (avoids z-fighting).
 const HOVER_PLANE_DEPTH_LIFT: f32 = 0.02;
+/// Lift sketch-face hover/active fills toward the camera so they sit above committed coplanar
+/// fills (which are themselves biased) and just under strokes — otherwise a hover over
+/// overlapping faces renders behind/at-equal-depth with those fills and shows patchy
+/// artifacts along the overlaps (#19).
+const HOVER_FILL_DEPTH_BIAS: f32 = 0.09;
 
 const GIZMO_OFFSET_STROKE_PX: f32 = 2.5;
 const GIZMO_OFFSET_STROKE_HOVER_PX: f32 = 4.0;
@@ -1307,7 +1312,7 @@ impl<'a> SceneMesh<'a> {
                     self.push_construction_plane_hover_fill(plane, index, color, 0.12, cam);
                 }
             }
-            _ => self.push_sketch_face_hover(doc, face, color, 0.12),
+            _ => self.push_sketch_face_hover(doc, face, color, 0.12, cam),
         }
     }
 
@@ -1332,14 +1337,24 @@ impl<'a> SceneMesh<'a> {
         face: FaceId,
         color: Color32,
         fill_multiplier: f32,
+        cam: &Camera,
     ) {
         let fill = color.gamma_multiply(fill_multiplier);
+        let eye = cam.eye();
         match face {
             FaceId::Rect(index) => {
                 if let Some(rect) = doc.rects.get(index) {
-                    if let Some(corners) = rect_world_corners(doc, rect) {
-                        self.push_triangle(corners[0], corners[1], corners[2], fill);
-                        self.push_triangle(corners[0], corners[2], corners[3], fill);
+                    if let (Some(corners), Some(frame)) =
+                        (rect_world_corners(doc, rect), sketch_geometry_frame(doc, rect.sketch))
+                    {
+                        let c = offset_corners_toward_camera(
+                            corners,
+                            frame.normal,
+                            eye,
+                            HOVER_FILL_DEPTH_BIAS,
+                        );
+                        self.push_triangle(c[0], c[1], c[2], fill);
+                        self.push_triangle(c[0], c[2], c[3], fill);
                     }
                 }
             }
@@ -1350,9 +1365,13 @@ impl<'a> SceneMesh<'a> {
                     {
                         let frame =
                             sketch_geometry_frame(doc, circle.sketch).expect("circle frame");
-                        let center = crate::face::local_to_world(&frame, circle.cx, circle.cy);
+                        let lift = |p: Vec3| {
+                            offset_toward_camera(p, frame.normal, eye, HOVER_FILL_DEPTH_BIAS)
+                        };
+                        let center =
+                            lift(crate::face::local_to_world(&frame, circle.cx, circle.cy));
                         for window in perimeter.windows(2) {
-                            self.push_triangle(center, window[0], window[1], fill);
+                            self.push_triangle(center, lift(window[0]), lift(window[1]), fill);
                         }
                     }
                 }
@@ -1366,8 +1385,17 @@ impl<'a> SceneMesh<'a> {
                     crate::extrude::cap_polygon_world(doc, extrusion, profile, top)
                 {
                     if poly.len() >= 3 {
+                        let normal =
+                            (poly[1] - poly[0]).cross(poly[2] - poly[0]).normalize_or_zero();
+                        let lift =
+                            |p: Vec3| offset_toward_camera(p, normal, eye, HOVER_FILL_DEPTH_BIAS);
                         for i in 1..poly.len() - 1 {
-                            self.push_triangle(poly[0], poly[i], poly[i + 1], fill);
+                            self.push_triangle(
+                                lift(poly[0]),
+                                lift(poly[i]),
+                                lift(poly[i + 1]),
+                                fill,
+                            );
                         }
                     }
                 }
@@ -1380,8 +1408,12 @@ impl<'a> SceneMesh<'a> {
                 if let Some(quad) =
                     crate::extrude::side_quad_world(doc, extrusion, profile, edge as usize)
                 {
-                    self.push_triangle(quad[0], quad[1], quad[2], fill);
-                    self.push_triangle(quad[0], quad[2], quad[3], fill);
+                    let normal =
+                        (quad[1] - quad[0]).cross(quad[2] - quad[0]).normalize_or_zero();
+                    let lift =
+                        |p: Vec3| offset_toward_camera(p, normal, eye, HOVER_FILL_DEPTH_BIAS);
+                    self.push_triangle(lift(quad[0]), lift(quad[1]), lift(quad[2]), fill);
+                    self.push_triangle(lift(quad[0]), lift(quad[2]), lift(quad[3]), fill);
                 }
             }
             FaceId::ConstructionPlane(_) => {}
@@ -1412,7 +1444,7 @@ impl<'a> SceneMesh<'a> {
                     }
                 }
                 _ => {
-                    self.push_sketch_face_hover(doc, *face, color, FACE_HOVER_FILL_MULTIPLIER);
+                    self.push_sketch_face_hover(doc, *face, color, FACE_HOVER_FILL_MULTIPLIER, cam);
                     self.push_sketch_face_hover_border(
                         doc,
                         *face,
@@ -3424,6 +3456,67 @@ mod tests {
         let plane = offset_toward_camera(on_plane, Vec3::Z, eye, plane_fill_depth_bias(0));
         let shape = offset_toward_camera(on_plane, Vec3::Z, eye, shape_fill_depth_bias(0));
         assert!(shape.z > plane.z);
+    }
+
+    #[test]
+    fn hover_fill_sits_above_committed_fills_and_below_strokes() {
+        let cam = Camera::default();
+        let eye = cam.eye();
+        let on_plane = Vec3::new(10.0, 10.0, 0.0);
+        // Even a handful of stacked coplanar fills stay behind the hover lift.
+        let committed = offset_toward_camera(on_plane, Vec3::Z, eye, shape_fill_depth_bias_laned(4, 1));
+        let hover = offset_toward_camera(on_plane, Vec3::Z, eye, HOVER_FILL_DEPTH_BIAS);
+        let stroke = offset_toward_camera(on_plane, Vec3::Z, eye, STROKE_DEPTH_BIAS);
+        assert!((eye - hover).length() < (eye - committed).length(), "hover above committed fills");
+        assert!((eye - stroke).length() < (eye - hover).length(), "strokes above hover fill");
+    }
+
+    #[test]
+    fn hovering_a_sketch_face_lifts_its_fill_off_the_plane() {
+        let mut state = AppState::default();
+        commit_test_rectangle(&mut state);
+        let cam = state.cam.clone();
+        let base = build_scene_for_doc(&state);
+        let with_hover = ViewportScene::build(&ViewportSceneInput {
+            doc: &state.doc,
+            cam: &cam,
+            viewport: test_viewport(),
+            palette: ViewportPalette::default(),
+            sketch_session: None,
+            selection: &state.scene_selection,
+            element_visibility: &state.element_visibility,
+            preview_rect: None,
+            preview_line: None,
+            preview_circle: None,
+            preview_extrusion: None,
+            editing_extrusion: None,
+            plane_preview: None,
+            active_sketch_face: None,
+            dimension_labels: &[],
+            dim_label_view: None,
+            plane_gizmo: None,
+            extrude_gizmo: None,
+            hover_highlight: Some(ViewportHoverHighlight::SketchFace(FaceId::Rect(0))),
+            hover_color: crate::construction::PICK_HOVER_RGBA,
+            document_health: &DocumentHealth::default(),
+            constraint_graphics: None,
+            constraint_connector_color: None,
+        });
+        let added = &with_hover.vertices[base.vertices.len()..];
+        assert!(!added.is_empty(), "hover should add geometry");
+        // The rectangle lies on the z=0 ground plane. Before the fix the hover fill sat at z=0,
+        // behind the committed coplanar fills (which are biased toward the camera) — showing
+        // through only in the gaps. It is now lifted to the hover bias so it covers the face
+        // cleanly above those fills (#19).
+        // The two fill triangles (6 vertices) are offset exactly along +Z by the hover bias.
+        let fill_verts = added
+            .iter()
+            .filter(|v| (v.position[2] - HOVER_FILL_DEPTH_BIAS).abs() < 1e-4)
+            .count();
+        assert!(
+            fill_verts >= 6,
+            "expected the hover fill lifted to z={HOVER_FILL_DEPTH_BIAS}, found {fill_verts} such vertices"
+        );
     }
 
     #[test]

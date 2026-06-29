@@ -327,6 +327,14 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
     )?;
 
     api.set(
+        "export_stl",
+        lua.create_function(|lua, (path, body): (String, Option<String>)| {
+            let tick = lua.app_data_ref::<ScriptTickData>().unwrap();
+            unsafe { tick.exec(Instruction::ExportStl { path, body }) }
+        })?,
+    )?;
+
+    api.set(
         "clear",
         lua.create_function(|lua, ()| {
             let tick = lua.app_data_ref::<ScriptTickData>().unwrap();
