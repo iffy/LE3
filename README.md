@@ -2,6 +2,11 @@
 
 On-device parametric CAD. See [SPEC.md](SPEC.md) for the full design.
 
+## Download
+
+Download the latest from
+[GitHub Releases](https://github.com/iffy/LE3/releases/latest).
+
 ## Status
 
 Very early prototype. Currently implemented:

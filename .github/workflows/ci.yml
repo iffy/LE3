@@ -5,6 +5,9 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -84,3 +87,101 @@ jobs:
             echo "Running $script"
             xvfb-run -a ./target/debug/le3 --script "$script" --exit
           done
+
+  build-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os_slug: linux-x86_64
+            binary: le3
+          - runner: macos-latest
+            os_slug: macos-aarch64
+            binary: le3
+          - runner: windows-latest
+            os_slug: windows-x86_64
+            binary: le3.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: release-${{ matrix.os_slug }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-0 \
+            libwayland-dev \
+            libssl-dev \
+            libvulkan-dev \
+            mesa-vulkan-drivers \
+            libgtk-3-dev
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.binary }}" dist/
+          tar czvf "le3-${{ matrix.os_slug }}.tar.gz" -C dist "${{ matrix.binary }}"
+
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}" dist/
+          Compress-Archive -Path "dist/${{ matrix.binary }}" -DestinationPath "le3-${{ matrix.os_slug }}.zip"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: le3-${{ matrix.os_slug }}
+          path: le3-${{ matrix.os_slug }}.*
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read package version
+        id: version
+        run: echo "version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}-build.${{ github.run_number }}
+          name: v${{ steps.version.outputs.version }} build ${{ github.run_number }}
+          prerelease: true
+          generate_release_notes: true
+          files: artifacts/*
