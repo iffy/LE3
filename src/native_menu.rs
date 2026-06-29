@@ -351,13 +351,16 @@ fn attach_to_platform(menu: &Menu, cc: &CreationContext<'_>) -> Result<(), muda:
         use raw_window_handle::RawWindowHandle;
         let handle = cc
             .window_handle()
-            .map_err(|_| muda::Error::UnsupportedPlatform)?;
-        if let RawWindowHandle::Win32(handle) = handle.as_raw() {
-            unsafe {
-                menu.init_for_hwnd(handle.hwnd.get());
+            .map_err(|_| muda::Error::NotInitialized)?;
+        match handle.as_raw() {
+            RawWindowHandle::Win32(handle) => {
+                unsafe {
+                    menu.init_for_hwnd(handle.hwnd.get());
+                }
+                Ok(())
             }
+            _ => Err(muda::Error::NotInitialized),
         }
-        return Ok(());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
