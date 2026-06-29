@@ -353,12 +353,9 @@ fn attach_to_platform(menu: &Menu, cc: &CreationContext<'_>) -> Result<(), muda:
             .window_handle()
             .map_err(|_| muda::Error::NotInitialized)?;
         match handle.as_raw() {
-            RawWindowHandle::Win32(handle) => {
-                unsafe {
-                    menu.init_for_hwnd(handle.hwnd.get());
-                }
-                Ok(())
-            }
+            RawWindowHandle::Win32(handle) => unsafe {
+                menu.init_for_hwnd(handle.hwnd.get())
+            },
             _ => Err(muda::Error::NotInitialized),
         }
     }
