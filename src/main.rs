@@ -151,7 +151,7 @@ fn native_options() -> eframe::NativeOptions {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([960.0, 640.0])
         .with_title("BearCAD")
-        .with_icon(app_icon::load());
+        .with_icon(app_icon::load_for_viewport());
     if !uses_deferred_launch_maximize() {
         viewport = viewport.with_maximized(true);
     }
