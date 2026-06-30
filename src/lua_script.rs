@@ -1282,9 +1282,26 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set("bearcad", api)?;
     lua.load(
         r#"
+        -- The primary API is declarative modeling (OpenSCAD-style). GUI/UI manipulation
+        -- functions (camera, tool, panes, palette, mouse, keyboard, drags) live under the
+        -- `bearcad.ui.*` sub-namespace so scripts can focus on modeling (#46).
+        bearcad.ui = {}
+        local ui_funcs = {
+            "tool", "focus_name", "focus_dim", "pane", "palette",
+            "orbit", "pan", "wheel", "set_home_view", "toggle_projection",
+            "move", "click", "move_ground", "click_ground",
+            "drag", "right_drag", "right_drag_pan", "drag_vertex", "drag_line",
+            "key", "keydown", "keyup", "type",
+            "_view", "_view_home", "_wait", "_wait_ms", "_screenshot",
+        }
+        for _, name in ipairs(ui_funcs) do
+            bearcad.ui[name] = bearcad[name]
+            bearcad[name] = nil
+        end
+
         local function yielding(name, native_name)
-            local native = bearcad[native_name or name]
-            bearcad[name] = function(...)
+            local native = bearcad.ui[native_name or name]
+            bearcad.ui[name] = function(...)
                 native(...)
                 coroutine.yield()
             end
@@ -1327,6 +1344,39 @@ mod tests {
             runner.tick(&mut state, &mut synthetic, Some(vp), &ctx);
         }
         state
+    }
+
+    fn run_lua_expect_ok(source: &str) {
+        let mut runner = ScriptRunner::from_lua_source(source).unwrap();
+        runner.verbose = false;
+        let mut state = AppState::default();
+        let mut synthetic = SyntheticInput::default();
+        let ctx = egui::Context::default();
+        let vp = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(960.0, 560.0));
+        while !runner.done {
+            runner.tick(&mut state, &mut synthetic, Some(vp), &ctx);
+        }
+        assert!(runner.error.is_none(), "script error: {:?}", runner.error);
+    }
+
+    /// #46: GUI/UI manipulation lives under `bearcad.ui.*`; modeling stays top-level.
+    #[test]
+    fn lua_ui_functions_live_under_ui_namespace() {
+        run_lua_expect_ok(
+            r#"
+            assert(bearcad.ui ~= nil, "bearcad.ui table missing")
+            for _, name in ipairs({ "move", "click", "tool", "view", "orbit", "pan",
+                                    "key", "type", "pane", "palette", "drag_vertex", "wait" }) do
+                assert(type(bearcad.ui[name]) == "function", "bearcad.ui." .. name .. " missing")
+                assert(bearcad[name] == nil, "bearcad." .. name .. " should move to bearcad.ui")
+            end
+            -- declarative modeling stays at the top level
+            for _, name in ipairs({ "rect", "line", "circle", "extrude", "new", "select",
+                                    "add_constraint", "parameter", "export_stl" }) do
+                assert(type(bearcad[name]) == "function", "bearcad." .. name .. " should stay top-level")
+            end
+        "#,
+        );
     }
 
     #[test]
@@ -1492,7 +1542,7 @@ mod tests {
             r#"
             bearcad.new()
             bearcad.begin_sketch("construction_plane", 0)
-            bearcad.tool("rectangle")
+            bearcad.ui.tool("rectangle")
         "#,
         );
         assert_eq!(state.tool, Tool::Rectangle);
@@ -1531,9 +1581,9 @@ mod tests {
         let mut runner = ScriptRunner::from_lua_source(
             r#"
             bearcad.begin_sketch("construction_plane", 0)
-            bearcad.tool("line")
-            bearcad.click(0, 0)
-            bearcad.click(100, 0)
+            bearcad.ui.tool("line")
+            bearcad.ui.click(0, 0)
+            bearcad.ui.click(100, 0)
             bearcad.commit()
             assert(bearcad.sketch_dof() > 0)
         "#,
@@ -1572,7 +1622,7 @@ mod tests {
     fn lua_wait_frames_advances() {
         let mut runner = ScriptRunner::from_lua_source(
             r#"
-            bearcad.wait(2)
+            bearcad.ui.wait(2)
             bearcad.clear()
         "#,
         )

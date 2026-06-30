@@ -49,6 +49,7 @@ pub enum PaletteCommandId {
     ShowPaneViewCube,
     HidePaneViewCube,
     DeleteSelection,
+    ExportSessionCommands,
 }
 
 /// What happens when a palette entry is chosen.
@@ -58,6 +59,7 @@ pub enum PaletteOutcome {
     OpenFile,
     SaveFile,
     SaveFileAs,
+    ExportSessionCommands,
 }
 
 /// One invokable palette entry.
@@ -167,6 +169,7 @@ impl PaletteCommand {
             PaletteCommandId::DeleteSelection => {
                 PaletteOutcome::Action(Action::DeleteSelection)
             }
+            PaletteCommandId::ExportSessionCommands => PaletteOutcome::ExportSessionCommands,
         }
     }
 }
@@ -355,6 +358,11 @@ const BASE_COMMANDS: &[PaletteCommand] = &[
     ),
     PaletteCommand::new(PaletteCommandId::Undo, "Undo", "undo revert last"),
     PaletteCommand::new(PaletteCommandId::Clear, "Clear Document", "clear document delete all"),
+    PaletteCommand::new(
+        PaletteCommandId::ExportSessionCommands,
+        "Export Session Commands…",
+        "export session commands lua script record steps replay history",
+    ),
     PaletteCommand::new(
         PaletteCommandId::ToolSelect,
         "Select Tool",

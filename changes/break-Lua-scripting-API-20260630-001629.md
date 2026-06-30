@@ -1,0 +1,1 @@
+Lua scripting API: GUI/UI manipulation functions (mouse, keyboard, camera, tools, panes, palette, viewport drags) moved to the bearcad.ui.* sub-namespace. Declarative modeling/document functions remain at the top level (OpenSCAD-style). Update scripts: e.g. bearcad.move -> bearcad.ui.move, bearcad.view -> bearcad.ui.view.

@@ -629,6 +629,12 @@ impl Equation {
 }
 
 pub const DEFAULT_WEIGHT: f64 = 1.0;
-/// Soft anchor for reference geometry (reference lines stay put unless dragged).
+/// Strong anchor for reference geometry during a drag (reference stays put while the
+/// movable side is dragged). Sits between the constraint weight and the drag pin.
 pub const REFERENCE_HOLD_WEIGHT: f64 = 1e4;
+/// Gauge anchor applied during a non-drag full solve to keep otherwise-free reference
+/// geometry stable. Must be far weaker than `DEFAULT_WEIGHT` so it only breaks ties among
+/// free degrees of freedom and never fights a real constraint — e.g. a parameter change
+/// driving a rectangle whose corner is also a distance anchor (#53).
+pub const GAUGE_HOLD_WEIGHT: f64 = 1e-6;
 pub const DRAG_PIN_WEIGHT: f64 = 1e6;

@@ -250,6 +250,10 @@ is the source of truth for the model; geometry is derived from it (see §4.4).
   (trig, sqrt, min/max, etc. — full list **TBD**).
 - The **raw expression text is stored verbatim** so the user sees and can edit exactly
   what they typed (e.g. `3mm + 2in`), alongside the evaluated value (§7).
+- **Variable-name autocomplete**: while typing an identifier in an expression field, a
+  dropdown offers matching parameter names (best match on top). Arrow keys move the
+  highlight; **Space** or **Tab** completes the highlighted name and keeps editing;
+  **Enter** completes the highlighted name *and* commits the field in a single keystroke.
 
 ### 5.3 Units
 - Strong unit support with mixed units. `3mm + 2in` is valid and evaluates correctly.
@@ -389,7 +393,17 @@ Everything achievable in the GUI must be achievable by programming, and vice ver
 - The API surface is versioned and documented. Exact module layout and function signatures
   are **TBD**, but must be designed so that the GUI's command set maps 1:1 onto API calls
   (this also powers the CLI, §9, and the command palette, §11).
-- `bearcad.screenshot([path], [whole_window])` captures the 3D viewport only by default (the
+- **Namespace split.** The primary API is *declarative modeling*, in the spirit of OpenSCAD:
+  geometry/document operations live at the top level (`bearcad.new`, `bearcad.rect`,
+  `bearcad.extrude`, `bearcad.add_constraint`, `bearcad.parameter`, `bearcad.select`, …).
+  All **GUI/UI manipulation** — simulated mouse/keyboard, camera, tools, panes, the command
+  palette, and viewport drags — lives under the `bearcad.ui.*` sub-namespace
+  (`bearcad.ui.move`, `bearcad.ui.click`, `bearcad.ui.key`, `bearcad.ui.type`,
+  `bearcad.ui.orbit`, `bearcad.ui.pan`, `bearcad.ui.wheel`, `bearcad.ui.view`,
+  `bearcad.ui.tool`, `bearcad.ui.pane`, `bearcad.ui.palette`, `bearcad.ui.drag_vertex`,
+  `bearcad.ui.wait`, `bearcad.ui.screenshot`, …). Examples and documentation should model
+  with the top-level API and avoid `bearcad.ui.*` except where a UI interaction is the point.
+- `bearcad.ui.screenshot([path], [whole_window])` captures the 3D viewport only by default (the
   view-cube HUD is suppressed for that frame); passing `whole_window = true` captures the
   entire window. With no `path`, the image is written to `screenshot-bearcad.png`.
 - Geometry-creation helpers are single calls that create the thing directly (no simulated
@@ -496,6 +510,10 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
 - **STL export from the GUI:** **File → Export STL…** exports all bodies (via a save
   dialog); right-clicking a **body** row in the Elements pane exports just that body. Both
   mirror the scriptable `bearcad.export_stl` (§8, §9.2).
+- **Export session commands:** **Help → Export Session Commands…** (also a command-palette
+  entry, "Export Session Commands…") writes everything done since the app opened as a
+  timestamped, replayable Lua script (the same instructions as `--show-commands`, §9). Useful
+  for reproducing a bug by pasting the steps. The session is always recorded interactively.
 
 ### 11.2 Command palette
 - VS Code-style palette listing **context-pertinent** commands. Commands come from the

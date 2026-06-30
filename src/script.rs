@@ -188,7 +188,7 @@ impl Instruction {
             } => format!("bearcad.export_stl({path:?}, {body:?})"),
             Instruction::Clear => "bearcad.clear()".to_string(),
             Instruction::Undo => "bearcad.undo()".to_string(),
-            Instruction::Tool(tool) => format!("bearcad.tool({:?})", tool_lua_name(*tool)),
+            Instruction::Tool(tool) => format!("bearcad.ui.tool({:?})", tool_lua_name(*tool)),
             Instruction::BeginSketch { face } => {
                 let (kind, index) = face_lua_parts(*face);
                 format!("bearcad.begin_sketch({kind:?}, {index})")
@@ -245,7 +245,7 @@ impl Instruction {
                     element_lua_ref(*element)
                 )
             }
-            Instruction::FocusElementName => "bearcad.focus_name()".to_string(),
+            Instruction::FocusElementName => "bearcad.ui.focus_name()".to_string(),
             Instruction::SetDim { axis, value } => {
                 format!(
                     "bearcad.set_dim({:?}, {value:?})",
@@ -282,7 +282,7 @@ impl Instruction {
             }
             Instruction::DragVertex { point, u, v } => {
                 format!(
-                    "bearcad.drag_vertex({}, {u}, {v})",
+                    "bearcad.ui.drag_vertex({}, {u}, {v})",
                     constraint_point_lua_ref(*point)
                 )
             }
@@ -293,7 +293,7 @@ impl Instruction {
                 u,
                 v,
             } => format!(
-                "bearcad.drag_line({}, {anchor_u}, {anchor_v}, {u}, {v})",
+                "bearcad.ui.drag_line({}, {anchor_u}, {anchor_v}, {u}, {v})",
                 constraint_line_lua_ref(*target)
             ),
             Instruction::SetLineLength { value } => {
@@ -313,37 +313,37 @@ impl Instruction {
                 format!("bearcad.set_dim(\"angle\", {value:?})")
             }
             Instruction::FocusDim(axis) => {
-                format!("bearcad.focus_dim({:?})", rect_axis_lua_name(*axis))
+                format!("bearcad.ui.focus_dim({:?})", rect_axis_lua_name(*axis))
             }
-            Instruction::FocusLineLength => "bearcad.focus_dim(\"length\")".to_string(),
-            Instruction::FocusCircleDiameter => "bearcad.focus_dim(\"diameter\")".to_string(),
+            Instruction::FocusLineLength => "bearcad.ui.focus_dim(\"length\")".to_string(),
+            Instruction::FocusCircleDiameter => "bearcad.ui.focus_dim(\"diameter\")".to_string(),
             Instruction::FocusPlaneDim(dim) => {
-                format!("bearcad.focus_dim({:?})", plane_dim_lua_name(*dim))
+                format!("bearcad.ui.focus_dim({:?})", plane_dim_lua_name(*dim))
             }
-            Instruction::Orbit { dx, dy } => format!("bearcad.orbit({dx}, {dy})"),
-            Instruction::Pan { dx, dy } => format!("bearcad.pan({dx}, {dy})"),
-            Instruction::Zoom { scroll } => format!("bearcad.wheel({scroll})"),
-            Instruction::View(view) => format!("bearcad.view({:?})", view_script_name(*view)),
+            Instruction::Orbit { dx, dy } => format!("bearcad.ui.orbit({dx}, {dy})"),
+            Instruction::Pan { dx, dy } => format!("bearcad.ui.pan({dx}, {dy})"),
+            Instruction::Zoom { scroll } => format!("bearcad.ui.wheel({scroll})"),
+            Instruction::View(view) => format!("bearcad.ui.view({:?})", view_script_name(*view)),
             Instruction::ViewEdge(edge) => {
-                format!("bearcad.view(\"edge\", {:?})", edge_script_name(*edge))
+                format!("bearcad.ui.view(\"edge\", {:?})", edge_script_name(*edge))
             }
             Instruction::ViewCorner(corner) => format!(
-                "bearcad.view(\"corner\", {:?})",
+                "bearcad.ui.view(\"corner\", {:?})",
                 corner_script_name(*corner)
             ),
-            Instruction::ViewHome => "bearcad.view_home()".to_string(),
-            Instruction::SetHomeView => "bearcad.set_home_view()".to_string(),
+            Instruction::ViewHome => "bearcad.ui.view_home()".to_string(),
+            Instruction::SetHomeView => "bearcad.ui.set_home_view()".to_string(),
             Instruction::ProjectionMode(mode) => {
-                format!("bearcad.view({:?})", projection_mode_script_name(*mode))
+                format!("bearcad.ui.view({:?})", projection_mode_script_name(*mode))
             }
-            Instruction::ToggleProjectionMode => "bearcad.toggle_projection()".to_string(),
+            Instruction::ToggleProjectionMode => "bearcad.ui.toggle_projection()".to_string(),
             Instruction::SetPane { pane, visible } => {
                 let verb = match visible {
                     Some(true) => "show",
                     Some(false) => "hide",
                     None => "toggle",
                 };
-                format!("bearcad.pane({:?}, {verb:?})", pane.script_name())
+                format!("bearcad.ui.pane({:?}, {verb:?})", pane.script_name())
             }
             Instruction::AddParameter { name, expression } => {
                 format!("bearcad.parameter(\"add\", {name:?}, {expression:?})")
@@ -370,33 +370,33 @@ impl Instruction {
                     Some(false) => "hide",
                     None => "toggle",
                 };
-                format!("bearcad.palette({verb:?})")
+                format!("bearcad.ui.palette({verb:?})")
             }
             Instruction::RunPaletteCommand { query } => {
-                format!("bearcad.palette(\"run\", {query:?})")
+                format!("bearcad.ui.palette(\"run\", {query:?})")
             }
-            Instruction::Move { x, y } => format!("bearcad.move({x}, {y})"),
-            Instruction::Click { x, y } => format!("bearcad.click({x}, {y})"),
-            Instruction::MoveGround { x, y } => format!("bearcad.move_ground({x}, {y})"),
-            Instruction::ClickGround { x, y } => format!("bearcad.click_ground({x}, {y})"),
+            Instruction::Move { x, y } => format!("bearcad.ui.move({x}, {y})"),
+            Instruction::Click { x, y } => format!("bearcad.ui.click({x}, {y})"),
+            Instruction::MoveGround { x, y } => format!("bearcad.ui.move_ground({x}, {y})"),
+            Instruction::ClickGround { x, y } => format!("bearcad.ui.click_ground({x}, {y})"),
             Instruction::Drag { x0, y0, x1, y1 } => {
-                format!("bearcad.drag({x0}, {y0}, {x1}, {y1})")
+                format!("bearcad.ui.drag({x0}, {y0}, {x1}, {y1})")
             }
-            Instruction::RightDrag { dx, dy } => format!("bearcad.right_drag({dx}, {dy})"),
+            Instruction::RightDrag { dx, dy } => format!("bearcad.ui.right_drag({dx}, {dy})"),
             Instruction::RightDragShift { dx, dy } => {
-                format!("bearcad.right_drag_pan({dx}, {dy})")
+                format!("bearcad.ui.right_drag_pan({dx}, {dy})")
             }
-            Instruction::Key(key) => format!("bearcad.key({:?})", key_name(*key)),
-            Instruction::KeyDown(key) => format!("bearcad.keydown({:?})", key_name(*key)),
-            Instruction::KeyUp(key) => format!("bearcad.keyup({:?})", key_name(*key)),
-            Instruction::Type(text) => format!("bearcad.type({text:?})"),
-            Instruction::WaitMs(ms) => format!("bearcad.wait_ms({ms})"),
-            Instruction::WaitFrames(n) => format!("bearcad.wait({n})"),
+            Instruction::Key(key) => format!("bearcad.ui.key({:?})", key_name(*key)),
+            Instruction::KeyDown(key) => format!("bearcad.ui.keydown({:?})", key_name(*key)),
+            Instruction::KeyUp(key) => format!("bearcad.ui.keyup({:?})", key_name(*key)),
+            Instruction::Type(text) => format!("bearcad.ui.type({text:?})"),
+            Instruction::WaitMs(ms) => format!("bearcad.ui.wait_ms({ms})"),
+            Instruction::WaitFrames(n) => format!("bearcad.ui.wait({n})"),
             Instruction::Screenshot { path, whole_window } => {
                 if *whole_window {
-                    format!("bearcad.screenshot({path:?}, true)")
+                    format!("bearcad.ui.screenshot({path:?}, true)")
                 } else {
-                    format!("bearcad.screenshot({path:?})")
+                    format!("bearcad.ui.screenshot({path:?})")
                 }
             }
             Instruction::Quit => "bearcad.quit()".to_string(),
@@ -1730,7 +1730,8 @@ impl ScriptRunner {
                             state.apply(action);
                         }
                         PaletteOutcome::OpenFile | PaletteOutcome::SaveFile
-                        | PaletteOutcome::SaveFileAs => {
+                        | PaletteOutcome::SaveFileAs
+                        | PaletteOutcome::ExportSessionCommands => {
                             state.status =
                                 "Palette file commands require the GUI".to_string();
                         }
@@ -2105,7 +2106,7 @@ mod tests {
     #[test]
     fn instruction_as_lua_formats_click() {
         let ins = Instruction::Click { x: 100.0, y: 200.0 };
-        assert_eq!(ins.as_lua(), "bearcad.click(100, 200)");
+        assert_eq!(ins.as_lua(), "bearcad.ui.click(100, 200)");
     }
 
     #[test]

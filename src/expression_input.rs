@@ -279,6 +279,8 @@ pub fn expression_autocomplete_handle_keys(
     let up = ui.input(|i| i.key_pressed(Key::ArrowUp));
     let down = ui.input(|i| i.key_pressed(Key::ArrowDown));
     let space = ui.input(|i| i.key_pressed(Key::Space));
+    let tab = ui.input(|i| i.key_pressed(Key::Tab));
+    let enter = ui.input(|i| i.key_pressed(Key::Enter));
     let mut changed = false;
 
     if up {
@@ -287,11 +289,20 @@ pub fn expression_autocomplete_handle_keys(
     } else if down {
         ui_state.highlight = (ui_state.highlight + 1).min(candidates.len() - 1);
         ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::ArrowDown));
-    } else if space {
+    } else if space || tab {
+        // Space or Tab accepts the highlighted (top by default) candidate and keeps editing.
         let name = candidates[ui_state.highlight].name.clone();
         apply_parameter_completion(text, token, &name, &mut text_state);
         text_state.store(ctx, id);
-        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Space));
+        let key = if space { Key::Space } else { Key::Tab };
+        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
+        changed = true;
+    } else if enter {
+        // Enter accepts the highlighted candidate too, but is left unconsumed so the field's
+        // own Enter handling still commits the (now completed) expression in one keystroke (#50).
+        let name = candidates[ui_state.highlight].name.clone();
+        apply_parameter_completion(text, token, &name, &mut text_state);
+        text_state.store(ctx, id);
         changed = true;
     }
 
@@ -483,6 +494,16 @@ mod tests {
         add_parameter(&mut doc, "height".to_string(), "5mm".to_string()).unwrap();
         let matches = parameter_autocomplete_candidates(&doc, "wid", &[]);
         assert_eq!(matches.first().map(|m| m.name.as_str()), Some("width"));
+    }
+
+    #[test]
+    fn apply_parameter_completion_replaces_partial_token() {
+        // Backs the Tab/Enter completion in #50: "wid" -> "width".
+        let mut text = "10mm + wid".to_string();
+        let token = identifier_token_at_cursor(&text, text.chars().count()).unwrap();
+        let mut state = TextEditState::default();
+        apply_parameter_completion(&mut text, token, "width", &mut state);
+        assert_eq!(text, "10mm + width");
     }
 
     #[test]

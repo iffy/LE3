@@ -1383,7 +1383,7 @@ pub fn propagate_parameter_rename_to_constraints(doc: &mut Document, old: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Circle, Document, FaceId, Line, Rect, ShapeKind};
+    use crate::model::{Circle, Document, FaceId, Line, LineEnd, Rect, ShapeKind};
 
     fn sketch_doc() -> (Document, SketchId) {
         let mut doc = Document::default();
@@ -1522,6 +1522,50 @@ mod tests {
         .unwrap();
         assert!((doc.rects[0].w - 20.0).abs() < 1e-3);
         assert!(doc.rects[0].width_locked);
+    }
+
+    /// #53: a rectangle driven by a parameter must keep resizing even after another point is
+    /// constrained at a fixed distance from one of its corners (the corner becomes the
+    /// distance "anchor"). The anchor hold must not pin the rect against its own dimension.
+    #[test]
+    fn parameter_driven_rect_resizes_with_point_distance_to_corner() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 50.0, 30.0));
+        doc.shape_order.push(ShapeKind::Rect);
+        // Constraint 0: width driven to 100mm.
+        add_distance_constraint(
+            &mut doc,
+            sketch,
+            DistanceTarget::RectWidth(0),
+            "100mm".to_string(),
+        )
+        .unwrap();
+        assert!((doc.rects[0].w - 100.0).abs() < 1e-2);
+
+        // A free line 30mm to the right of the rect's bottom-right corner (now at (100, 0)).
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 130.0, 0.0, 130.0, 10.0));
+        doc.shape_order.push(ShapeKind::Line);
+        let target = capture_point_point_distance(
+            &doc,
+            ConstraintPoint::RectCorner { rect: 0, corner: 1 },
+            ConstraintPoint::LineEndpoint {
+                line: 0,
+                end: LineEnd::Start,
+            },
+        )
+        .unwrap();
+        // Constraint 1: 30mm between the line endpoint and the rect corner.
+        add_distance_constraint(&mut doc, sketch, target, "30mm".to_string()).unwrap();
+
+        // Grow the width to 200mm; the rectangle must follow.
+        set_constraint_expression(&mut doc, 0, "200mm".to_string()).unwrap();
+        assert!(
+            (doc.rects[0].w - 200.0).abs() < 1e-1,
+            "rect width should follow its parameter, got {}",
+            doc.rects[0].w
+        );
     }
 
     #[test]

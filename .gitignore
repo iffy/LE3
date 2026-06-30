@@ -27,3 +27,4 @@ bearcad-*.exe
 
 # Issue monitor runtime state (scripts/bearcad-monitor.sh)
 scripts/monitor-state/
+block.stl

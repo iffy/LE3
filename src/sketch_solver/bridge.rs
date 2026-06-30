@@ -2,7 +2,9 @@
 
 use super::dof::{dof_remaining, vars_can_move_together};
 use super::newton::{solve_lm, SolveReport, SolverConfig};
-use super::residuals::{Equation, DEFAULT_WEIGHT, DRAG_PIN_WEIGHT, REFERENCE_HOLD_WEIGHT};
+use super::residuals::{
+    Equation, DEFAULT_WEIGHT, DRAG_PIN_WEIGHT, GAUGE_HOLD_WEIGHT, REFERENCE_HOLD_WEIGHT,
+};
 use crate::geometric_constraints::parallel_reference_and_movable;
 use super::system::{System, VarId};
 use crate::document_lifecycle::constraint_kind_applicable;
@@ -363,7 +365,7 @@ impl SketchBridge {
             }
             ConstraintKind::Parallel { line_a, line_b } => {
                 let (reference, movable) = parallel_reference_and_movable(line_a, line_b);
-                self.hold_line(reference, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_line(reference)?;
                 let a = self.line_vars(reference)?;
                 let b = self.line_vars(movable)?;
                 self.system.add_equation(Equation::Parallel {
@@ -380,7 +382,7 @@ impl SketchBridge {
             }
             ConstraintKind::Perpendicular { line_a, line_b } => {
                 let (reference, movable) = parallel_reference_and_movable(line_a, line_b);
-                self.hold_line(reference, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_line(reference)?;
                 let a = self.line_vars(reference)?;
                 let b = self.line_vars(movable)?;
                 self.system.add_equation(Equation::Perpendicular {
@@ -397,7 +399,7 @@ impl SketchBridge {
             }
             ConstraintKind::Coincident { a, b } => self.add_coincident(a, b)?,
             ConstraintKind::Midpoint { point, line } => {
-                self.hold_line(line, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_line(line)?;
                 let (pu, pv) = self.point_vars(point)?;
                 let ((x0, y0), (x1, y1)) = self.line_vars(line)?;
                 self.system.add_equation(Equation::MidpointU {
@@ -425,7 +427,7 @@ impl SketchBridge {
                     return Ok(());
                 }
                 let (reference, movable) = parallel_reference_and_movable(line_a, line_b);
-                self.hold_line(reference, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_line(reference)?;
                 let a = self.line_vars(reference)?;
                 let b = self.line_vars(movable)?;
                 self.system.add_equation(Equation::Angle {
@@ -559,7 +561,7 @@ impl SketchBridge {
                 side,
             } => {
                 let (reference, movable) = parallel_reference_and_movable(line_a, line_b);
-                self.hold_line(reference, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_line(reference)?;
                 let a = self.line_vars(reference)?;
                 let b = self.line_vars(movable)?;
                 self.system.add_equation(Equation::LineLineDistance {
@@ -582,7 +584,7 @@ impl SketchBridge {
                 dir_u: _,
                 dir_v: _,
             } => {
-                self.hold_point(anchor, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_point(anchor)?;
                 let (ax, ay) = self.point_vars(anchor)?;
                 let (mx, my) = self.point_vars(mover)?;
                 self.system.add_equation(Equation::PointPointDistance {
@@ -599,7 +601,7 @@ impl SketchBridge {
                 line,
                 side,
             } => {
-                self.hold_line(line, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_line(line)?;
                 let (px, py) = self.point_vars(point)?;
                 let ((x0, y0), (x1, y1)) = self.line_vars(line)?;
                 self.system.add_equation(Equation::PointLineDistance {
@@ -618,13 +620,17 @@ impl SketchBridge {
         Ok(())
     }
 
-    fn hold_line(&mut self, line: ConstraintLine, weight: f64) -> Result<(), String> {
+    /// Hold a relational constraint's reference line during a full solve (no-op during a drag),
+    /// so the dependent geometry moves to it rather than the reference moving. This must stay
+    /// strong (a relational constraint like coincident/parallel carries `DEFAULT_WEIGHT`, and
+    /// the reference must win so it stays put).
+    fn hold_line(&mut self, line: ConstraintLine) -> Result<(), String> {
         if !self.hold_references {
             return Ok(());
         }
         let ((u0, v0), (u1, v1)) = self.line_vars(line)?;
         for var in [u0, v0, u1, v1] {
-            self.hold_var(var, weight);
+            self.hold_var(var, REFERENCE_HOLD_WEIGHT);
         }
         Ok(())
     }
@@ -642,11 +648,13 @@ impl SketchBridge {
         Ok(())
     }
 
-    fn hold_point(&mut self, point: ConstraintPoint, weight: f64) -> Result<(), String> {
+    /// Gauge-hold a reference point during a full solve (no-op during a drag). Uses the weak
+    /// gauge weight so it stabilises free geometry without fighting real constraints.
+    fn hold_point(&mut self, point: ConstraintPoint) -> Result<(), String> {
         if !self.hold_references {
             return Ok(());
         }
-        self.anchor_point(point, weight)
+        self.anchor_point(point, GAUGE_HOLD_WEIGHT)
     }
 
     fn hold_var(&mut self, var: VarId, weight: f64) {
@@ -662,7 +670,7 @@ impl SketchBridge {
             (ConstraintEntity::Point(pa), ConstraintEntity::Point(pb)) => {
                 use crate::geometric_constraints::coincident_mover_and_anchor;
                 let (_mover, anchor) = coincident_mover_and_anchor(pa, pb);
-                self.hold_point(anchor, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_point(anchor)?;
                 let (au, av) = self.point_vars(pa)?;
                 let (bu, bv) = self.point_vars(pb)?;
                 self.system.add_equation(Equation::CoincidentU {
@@ -678,7 +686,7 @@ impl SketchBridge {
             }
             (ConstraintEntity::Point(point), ConstraintEntity::Line(line))
             | (ConstraintEntity::Line(line), ConstraintEntity::Point(point)) => {
-                self.hold_line(line, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_line(line)?;
                 let (px, py) = self.point_vars(point)?;
                 let ((x0, y0), (x1, y1)) = self.line_vars(line)?;
                 self.system.add_equation(Equation::PointLineDistance {
@@ -696,7 +704,7 @@ impl SketchBridge {
             (ConstraintEntity::Point(point), ConstraintEntity::Circle(circle))
             | (ConstraintEntity::Circle(circle), ConstraintEntity::Point(point)) => {
                 let center = ConstraintPoint::CircleCenter(circle);
-                self.hold_point(center, REFERENCE_HOLD_WEIGHT)?;
+                self.hold_point(center)?;
                 let (px, py) = self.point_vars(point)?;
                 let (cx, cy) = self.point_vars(center)?;
                 let radius = self
@@ -707,7 +715,7 @@ impl SketchBridge {
                 // The circle is the reference: hold its radius so the point moves to the
                 // perimeter rather than the circle shrinking to meet the point.
                 if self.hold_references {
-                    self.hold_var(radius, REFERENCE_HOLD_WEIGHT);
+                    self.hold_var(radius, GAUGE_HOLD_WEIGHT);
                 }
                 self.system.add_equation(Equation::PointOnCircle {
                     px,

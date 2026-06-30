@@ -8,7 +8,9 @@ use egui::Vec2;
 
 const EPS: f32 = 1e-4;
 
-/// Records interactive user actions and prints script lines to stdout.
+/// Records interactive user actions as script instructions. Every emitted instruction is
+/// kept in `history` so the whole session can be exported as a Lua script (#43); it is also
+/// echoed to stdout when `print_stdout` is set (the `--show-commands` flag).
 #[derive(Clone, Debug, Default)]
 pub struct CommandLog {
     pending_orbit: Vec2,
@@ -16,11 +18,35 @@ pub struct CommandLog {
     pending_zoom: f32,
     pending_discrete: Option<Instruction>,
     defer_baseline: bool,
+    print_stdout: bool,
+    history: Vec<Instruction>,
 }
 
 impl CommandLog {
-    pub fn new() -> Self {
-        Self::default()
+    /// A recording log; `print_stdout` echoes each instruction to stdout (`--show-commands`).
+    pub fn new_recording(print_stdout: bool) -> Self {
+        Self {
+            print_stdout,
+            ..Self::default()
+        }
+    }
+
+    /// Whether any instruction has been recorded this session.
+    pub fn is_empty(&self) -> bool {
+        self.history.is_empty()
+    }
+
+    /// The recorded session as a replayable, timestamped Lua script.
+    pub fn session_lua_script(&self, timestamp: &str) -> String {
+        let mut out = String::new();
+        out.push_str("-- BearCAD session commands\n");
+        out.push_str(&format!("-- Exported {timestamp} UTC\n"));
+        out.push_str("-- Replay headless with: cargo run -- --script <file> --exit\n\n");
+        for instruction in &self.history {
+            out.push_str(&instruction.as_lua());
+            out.push('\n');
+        }
+        out
     }
 
     pub fn is_camera_action(action: &Action) -> bool {
@@ -185,9 +211,39 @@ impl CommandLog {
         self.pending_discrete = None;
     }
 
-    fn emit(&self, instruction: Instruction) {
-        println!("{}", instruction.as_lua());
+    fn emit(&mut self, instruction: Instruction) {
+        if self.print_stdout {
+            println!("{}", instruction.as_lua());
+        }
+        self.history.push(instruction);
     }
+}
+
+/// Current UTC time as `YYYYMMDD-HHMMSS` (Howard Hinnant's civil-from-days algorithm), used
+/// for session-export filenames and headers without pulling in a date/time dependency.
+pub fn utc_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hour, min, sec) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    // Days since 1970-01-01 -> civil (year, month, day).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}{month:02}{day:02}-{hour:02}{min:02}{sec:02}")
 }
 
 #[cfg(test)]
@@ -197,7 +253,7 @@ mod tests {
 
     #[test]
     fn accumulates_orbit_until_non_camera_action() {
-        let mut log = CommandLog::new();
+        let mut log = CommandLog::new_recording(false);
         let cam = Camera::default();
         log.note_orbit(Vec2::new(10.0, 0.0));
         log.note_orbit(Vec2::new(-4.0, 5.0));
@@ -207,7 +263,7 @@ mod tests {
 
     #[test]
     fn discrete_view_survives_until_flush_without_drag() {
-        let mut log = CommandLog::new();
+        let mut log = CommandLog::new_recording(false);
         let cam = Camera::default();
         log.note_view_instruction(Instruction::View(crate::camera::StandardView::Front));
         log.before_apply(&Action::SetTool(crate::actions::Tool::Rectangle), &cam);
@@ -215,8 +271,35 @@ mod tests {
     }
 
     #[test]
+    fn session_script_contains_recorded_instructions_with_header() {
+        let mut log = CommandLog::new_recording(false);
+        log.emit(Instruction::New);
+        log.emit(Instruction::CreateRect {
+            x: 0.0,
+            y: 0.0,
+            width: 80.0,
+            height: 50.0,
+        });
+        let script = log.session_lua_script("20260630-000000");
+        assert!(script.starts_with("-- BearCAD session commands"));
+        assert!(script.contains("-- Exported 20260630-000000 UTC"));
+        assert!(script.contains("bearcad.new()"));
+        assert!(script.contains("bearcad.rect"));
+        assert!(!log.is_empty());
+    }
+
+    #[test]
+    fn utc_timestamp_has_expected_shape() {
+        let ts = utc_timestamp();
+        assert_eq!(ts.len(), 15, "timestamp = {ts}");
+        assert_eq!(&ts[8..9], "-");
+        assert!(ts[..8].chars().all(|c| c.is_ascii_digit()));
+        assert!(ts[9..].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
     fn drag_after_view_clears_discrete_view() {
-        let mut log = CommandLog::new();
+        let mut log = CommandLog::new_recording(false);
         log.note_view_instruction(Instruction::View(crate::camera::StandardView::Front));
         log.note_orbit(Vec2::new(1.0, 2.0));
         assert!(log.pending_discrete.is_none());

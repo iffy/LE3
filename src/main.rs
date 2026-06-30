@@ -322,8 +322,12 @@ impl App {
                 _ => {}
             }
         }
-        if show_commands && script.is_none() {
-            state.command_log = Some(std::cell::RefCell::new(command_log::CommandLog::new()));
+        // Always record interactively so the session can be exported as a Lua script (#43);
+        // `show_commands` only controls whether each instruction is also echoed to stdout.
+        if script.is_none() {
+            state.command_log = Some(std::cell::RefCell::new(
+                command_log::CommandLog::new_recording(show_commands),
+            ));
         }
         let exit_after_startup = exit_on_script_complete && script.is_none();
         Self {
@@ -401,6 +405,34 @@ impl App {
         }
     }
 
+    /// Export everything done this session as a timestamped, replayable Lua script, chosen
+    /// via a save dialog (Help → Export Session Commands…, and the command palette). See #43.
+    fn export_session_commands(&mut self) {
+        let timestamp = command_log::utc_timestamp();
+        let script = match &self.state.command_log {
+            Some(log) if !log.borrow().is_empty() => log.borrow().session_lua_script(&timestamp),
+            _ => {
+                self.state.status = "No session commands to export yet".to_string();
+                return;
+            }
+        };
+        let picked = rfd::FileDialog::new()
+            .add_filter("Lua script", &["lua"])
+            .set_file_name(format!("bearcad-session-{timestamp}.lua"))
+            .save_file();
+        if let Some(path) = picked {
+            match std::fs::write(&path, script) {
+                Ok(()) => {
+                    self.state.status =
+                        format!("Exported session commands to {}", path.display());
+                }
+                Err(e) => {
+                    self.state.status = format!("Failed to export session commands: {e}");
+                }
+            }
+        }
+    }
+
     fn open(&mut self) {
         let picked = rfd::FileDialog::new()
             .add_filter("BearCAD document", &["bearcad"])
@@ -423,6 +455,7 @@ impl App {
                 MenuCommand::Save => self.save(),
                 MenuCommand::SaveAs => self.save_as(),
                 MenuCommand::ExportStl => self.export_stl_all(),
+                MenuCommand::ExportSessionCommands => self.export_session_commands(),
                 MenuCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 MenuCommand::About => {
                     self.state.status =
@@ -448,6 +481,7 @@ impl App {
             PaletteOutcome::OpenFile => self.open(),
             PaletteOutcome::SaveFile => self.save(),
             PaletteOutcome::SaveFileAs => self.save_as(),
+            PaletteOutcome::ExportSessionCommands => self.export_session_commands(),
         }
         self.state.command_palette.close_palette();
     }
@@ -844,9 +878,10 @@ impl App {
     fn tick_script(&mut self, ctx: &egui::Context) {
         if self.script.as_ref().is_some_and(|r| !r.done) {
             self.state.command_log = None;
-        } else if self.show_commands && self.state.command_log.is_none() {
-            self.state.command_log =
-                Some(std::cell::RefCell::new(command_log::CommandLog::new()));
+        } else if self.state.command_log.is_none() {
+            self.state.command_log = Some(std::cell::RefCell::new(
+                command_log::CommandLog::new_recording(self.show_commands),
+            ));
         }
         let needs_repaint = if let Some(runner) = &mut self.script {
             if runner.done {

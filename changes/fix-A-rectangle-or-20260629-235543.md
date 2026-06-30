@@ -1,0 +1,1 @@
+A rectangle (or any geometry) driven by a parameter/dimension now keeps resizing after another point is constrained at a fixed distance from one of its corners. Reference 'gauge' holds applied during a full solve no longer override hard dimension constraints.

@@ -22,6 +22,7 @@ pub enum MenuCommand {
     Save,
     SaveAs,
     ExportStl,
+    ExportSessionCommands,
     Quit,
     UndoLast,
     Clear,
@@ -38,6 +39,7 @@ pub struct MenuIds {
     pub save: MenuId,
     pub save_as: MenuId,
     pub export_stl: MenuId,
+    pub export_session_commands: MenuId,
     pub quit: MenuId,
     pub undo: MenuId,
     pub clear: MenuId,
@@ -89,6 +91,9 @@ pub fn command_for_id(
     if ids.export_stl == id {
         return Some(MenuCommand::ExportStl);
     }
+    if ids.export_session_commands == id {
+        return Some(MenuCommand::ExportSessionCommands);
+    }
     if ids.quit == id {
         return Some(MenuCommand::Quit);
     }
@@ -137,7 +142,7 @@ impl MenuCommand {
             MenuCommand::NewDocument => Some(Action::NewDocument),
             MenuCommand::Open | MenuCommand::Save | MenuCommand::SaveAs => None,
             // Needs a file-save dialog, handled in the app frame loop.
-            MenuCommand::ExportStl => None,
+            MenuCommand::ExportStl | MenuCommand::ExportSessionCommands => None,
             MenuCommand::Quit => None,
             MenuCommand::UndoLast => Some(Action::UndoLast),
             MenuCommand::Clear => Some(Action::Clear),
@@ -238,6 +243,8 @@ impl NativeMenu {
             Some(Accelerator::new(Some(primary), Code::KeyP)),
         );
         let about = MenuItem::with_id("about", "About BearCAD", true, None);
+        let export_session_commands =
+            MenuItem::with_id("export_session_commands", "Export Session Commands…", true, None);
 
         let mut pane_checks = Vec::new();
         let mut pane_ids = Vec::new();
@@ -280,6 +287,8 @@ impl NativeMenu {
         view_menu.append(&command_palette)?;
         view_menu.append(&PredefinedMenuItem::separator())?;
         view_menu.append(&panes_menu)?;
+        help_menu.append(&export_session_commands)?;
+        help_menu.append(&PredefinedMenuItem::separator())?;
         help_menu.append(&about)?;
 
         menu.append_items(&[&file_menu, &edit_menu, &view_menu, &help_menu])?;
@@ -295,6 +304,7 @@ impl NativeMenu {
             save: save.id().clone(),
             save_as: save_as.id().clone(),
             export_stl: export_stl.id().clone(),
+            export_session_commands: export_session_commands.id().clone(),
             quit: quit.id().clone(),
             undo: undo.id().clone(),
             clear: clear.id().clone(),
@@ -380,6 +390,7 @@ mod tests {
             save: MenuId::new("save"),
             save_as: MenuId::new("save_as"),
             export_stl: MenuId::new("export_stl"),
+            export_session_commands: MenuId::new("export_session_commands"),
             quit: MenuId::new("quit"),
             undo: MenuId::new("undo"),
             clear: MenuId::new("clear"),
@@ -416,6 +427,10 @@ mod tests {
         assert_eq!(
             command_for_id(&ids.clear, &ids, |_| true),
             Some(MenuCommand::Clear)
+        );
+        assert_eq!(
+            command_for_id(&ids.export_session_commands, &ids, |_| true),
+            Some(MenuCommand::ExportSessionCommands)
         );
     }
 

@@ -7,6 +7,4 @@ bearcad.new()
 -- 80 x 50 mm rectangle with locked dimensions and names it.
 bearcad.rect{ width = 80, height = 50, name = "Preview box" }
 
-bearcad.wait_ms(100)
-bearcad.screenshot("rectangle_preview.png")
 bearcad.quit()

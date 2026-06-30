@@ -65,26 +65,25 @@ cargo run -- --script examples/rectangle.lua --exit
 cargo run -- examples/rectangle.lua --exit
 ```
 
-**Minimal script** — open a sketch, draw an 80×50 mm rectangle, save a screenshot:
+**Minimal script** — the primary API is *declarative* (OpenSCAD-style): describe geometry
+directly instead of simulating clicks. An 80×50 mm rectangle is a single call:
 
 ```lua
 bearcad.new()
-bearcad.begin_sketch("construction_plane", 0)
-bearcad.tool("rectangle")
-bearcad.click(480, 320)
-bearcad.move(580, 380)
-bearcad.set_dim("width", "80")
-bearcad.key("tab")
-bearcad.set_dim("height", "50")
-bearcad.key("enter")
-bearcad.exit_sketch()
-bearcad.wait_ms(100)
-bearcad.screenshot("rectangle_preview.png")
+-- Enters a ground-plane sketch if none is open, then makes the rectangle.
+bearcad.rect{ width = 80, height = 50, name = "Main box" }
 ```
 
-Use `bearcad.click_ground(50, 25)` / `bearcad.move_ground(…)` for millimetre positions on
-the active sketch plane (XY on the default construction plane). Use `bearcad.click(480, 320)`
-for pixel coordinates in the 3D viewport panel.
+**GUI/UI manipulation** (simulated mouse/keyboard, camera, tools, panes) lives under the
+`bearcad.ui.*` sub-namespace, kept separate so scripts can focus on modeling. Prefer the
+declarative API; reach for `bearcad.ui.*` only when the UI interaction is the point:
+
+```lua
+bearcad.ui.tool("rectangle")
+bearcad.ui.click_ground(0, 0)     -- millimetres on the active sketch plane
+bearcad.ui.move_ground(80, 50)
+bearcad.ui.view("front")          -- bearcad.ui.click(x, y) uses viewport pixels instead
+```
 
 **Named elements** — set a name when creating geometry or after committing a sketch shape,
 then look it up later:
@@ -108,13 +107,15 @@ The Lua bindings live in `src/lua_script.rs`; the internal instruction runner is
 
 ## Lua API reference
 
-All functions are on the global `bearcad` table. Call `bearcad.import()` once at the top of a
-script to copy those functions into the global namespace, so you can write `new()` instead
-of `bearcad.new()`. You can also bind individual functions with `local new, tool = bearcad.new,
-bearcad.tool`.
+Declarative modeling/document functions are on the global `bearcad` table; GUI/UI
+manipulation lives under `bearcad.ui.*` (see "Camera, UI, and input" below). Call
+`bearcad.import()` once at the top of a script to copy the top-level modeling functions into
+the global namespace, so you can write `new()` instead of `bearcad.new()` (the `bearcad.ui.*`
+functions stay namespaced). You can also bind individual functions with `local new, rect =
+bearcad.new, bearcad.rect`.
 
-Scripts run in a coroutine; calls that need to wait (`wait`, `wait_ms`, `screenshot`,
-camera `view` commands) yield until the next frame.
+Scripts run in a coroutine; calls that need to wait (`bearcad.ui.wait`, `bearcad.ui.wait_ms`,
+`bearcad.ui.screenshot`, camera `bearcad.ui.view` commands) yield until the next frame.
 
 ### Document
 
@@ -131,7 +132,7 @@ camera `view` commands) yield until the next frame.
 
 | Function | Description |
 |---|---|
-| `bearcad.tool("rectangle")` | Select a tool (`select`, `line`, `circle`, `sketch`, …) |
+| `bearcad.ui.tool("rectangle")` | Select a tool (`select`, `line`, `circle`, `sketch`, …) — UI |
 | `bearcad.begin_sketch("construction_plane", 0)` | Start sketching on a face |
 | `bearcad.open_sketch(0)` | Re-open an existing sketch |
 | `bearcad.exit_sketch()` | Leave the active sketch |
@@ -158,12 +159,12 @@ Pass a table `{ kind = "rect", index = 0, edge = "bottom" }` when an edge is nee
 | Function | Description |
 |---|---|
 | `bearcad.set_dim("width", "80")` | Set a dimension while drawing |
-| `bearcad.focus_dim("length")` | Focus a dimension field |
+| `bearcad.ui.focus_dim("length")` | Focus a dimension field — UI |
 | `bearcad.edit_dim("width")` / `bearcad.commit_dim()` | Edit a committed dimension label |
 | `bearcad.add_constraint({ kind="line", index=0 }, "25mm")` | Add a distance constraint |
 | `bearcad.add_geometric_constraint("parallel")` | Add a geometric constraint |
-| `bearcad.drag_vertex({ kind="line", index=0, end="end" }, u, v)` | Drag a constrained point |
-| `bearcad.drag_line({ kind="line", index=0 }, au, av, u, v)` | Drag a line segment |
+| `bearcad.ui.drag_vertex({ kind="line", index=0, end="end" }, u, v)` | Drag a constrained point — UI |
+| `bearcad.ui.drag_line({ kind="line", index=0 }, au, av, u, v)` | Drag a line segment — UI |
 
 ### Parameters
 
@@ -174,22 +175,24 @@ Pass a table `{ kind = "rect", index = 0, edge = "bottom" }` when an edge is nee
 | `bearcad.parameter("name", 0, "Len")` | Rename a parameter |
 | `bearcad.parameter("delete", 1)` | Delete a parameter |
 
-### Camera, UI, and input
+### Camera, UI, and input (`bearcad.ui.*`)
+
+All GUI/UI manipulation is under the `bearcad.ui` sub-namespace.
 
 | Function | Description |
 |---|---|
-| `bearcad.orbit(dx, dy)` / `bearcad.pan(dx, dy)` | Camera motion |
-| `bearcad.wheel(scroll)` | Mouse wheel zoom |
-| `bearcad.view("front")` | Standard view (waits for animation) |
-| `bearcad.view("edge", "front_top")` | View-cube edge |
-| `bearcad.view_home()` | Return to home view |
-| `bearcad.pane("hierarchy", "hide")` | Show / hide / toggle a pane |
-| `bearcad.palette("run", "view top")` | Run a palette command |
-| `bearcad.click(x, y)` / `bearcad.move(x, y)` | Synthetic viewport input |
-| `bearcad.click_ground(x, y)` | Click on sketch plane (mm) |
-| `bearcad.key("enter")` / `bearcad.type("12.5")` | Keyboard / text input |
-| `bearcad.wait(5)` | Wait 5 UI frames |
-| `bearcad.wait_ms(100)` | Wait 100 milliseconds |
-| `bearcad.screenshot("out.png")` | Capture the viewport |
+| `bearcad.ui.orbit(dx, dy)` / `bearcad.ui.pan(dx, dy)` | Camera motion |
+| `bearcad.ui.wheel(scroll)` | Mouse wheel zoom |
+| `bearcad.ui.view("front")` | Standard view (waits for animation) |
+| `bearcad.ui.view("edge", "front_top")` | View-cube edge |
+| `bearcad.ui.view_home()` | Return to home view |
+| `bearcad.ui.pane("hierarchy", "hide")` | Show / hide / toggle a pane |
+| `bearcad.ui.palette("run", "view top")` | Run a palette command |
+| `bearcad.ui.click(x, y)` / `bearcad.ui.move(x, y)` | Synthetic viewport input |
+| `bearcad.ui.click_ground(x, y)` | Click on sketch plane (mm) |
+| `bearcad.ui.key("enter")` / `bearcad.ui.type("12.5")` | Keyboard / text input |
+| `bearcad.ui.wait(5)` | Wait 5 UI frames |
+| `bearcad.ui.wait_ms(100)` | Wait 100 milliseconds |
+| `bearcad.ui.screenshot("out.png")` | Capture the viewport |
 
 Use `cargo run -- --show-commands` to echo GUI actions as `bearcad.*` calls on stdout.

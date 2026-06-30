@@ -1,0 +1,1 @@
+Export session commands: Help menu and command palette entry 'Export Session Commands…' writes everything done since the app opened as a timestamped, replayable Lua script. The interactive session is now always recorded (the --show-commands flag now only controls stdout echo).

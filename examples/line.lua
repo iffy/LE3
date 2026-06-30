@@ -8,6 +8,4 @@ bearcad.new()
 bearcad.line{ length = 80, name = "Guide line" }
 assert(bearcad.find("Guide line") ~= nil)
 
-bearcad.wait_ms(100)
-bearcad.screenshot("line_preview.png")
 bearcad.quit()
