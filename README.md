@@ -1,6 +1,6 @@
-# LE3 — Local CAD
+# LE3
 
-<p align="center">
+<p align="left">
   <img src="src/assets/appicon.png" alt="LE3 app icon" width="128" height="128">
 </p>
 
