@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Analyze and autonomously fix a doing-labeled LE3 issue on devel.
+# Analyze and autonomously fix a doing-labeled BearCAD issue on devel.
 set -euo pipefail
 
-REPO="iffy/LE3"
+REPO="${GITHUB_REPO_SLUG:-iffy/BearCAD}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="${REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 STATE_DIR="$SCRIPT_DIR/monitor-state"

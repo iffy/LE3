@@ -19,8 +19,8 @@ use eframe::egui::{self, Color32, Id, Key, RichText};
 
 pub const PANE_TITLE: &str = "Parameters";
 
-const NEW_NAME_ID: &str = "le3_parameters_new_name";
-const NEW_VALUE_ID: &str = "le3_parameters_new_value";
+const NEW_NAME_ID: &str = "bearcad_parameters_new_name";
+const NEW_VALUE_ID: &str = "bearcad_parameters_new_value";
 const INVALID_TEXT: Color32 = Color32::from_rgb(220, 80, 80);
 const UNSTABLE_TEXT: Color32 = Color32::from_rgb(255, 180, 60);
 
@@ -34,11 +34,11 @@ fn styled_parameter_label(label: &str, status: HealthStatus) -> RichText {
 }
 
 fn param_name_id(index: usize) -> Id {
-    Id::new(("le3_parameters_name", index))
+    Id::new(("bearcad_parameters_name", index))
 }
 
 fn param_value_id(index: usize) -> Id {
-    Id::new(("le3_parameters_value", index))
+    Id::new(("bearcad_parameters_value", index))
 }
 
 /// Whether a stored parameter value should show computed + expression text.

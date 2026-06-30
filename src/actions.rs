@@ -1246,7 +1246,7 @@ impl AppState {
                         }
                     }
                     None => (
-                        "le3".to_string(),
+                        "bearcad".to_string(),
                         Some(crate::extrude::document_solid_mesh(&self.doc)),
                     ),
                 };
@@ -3233,7 +3233,7 @@ mod tests {
         state.apply(Action::CommitExtrusion);
         assert_eq!(state.doc.bodies.len(), 1);
 
-        let path = std::env::temp_dir().join(format!("le3_export_{}.stl", std::process::id()));
+        let path = std::env::temp_dir().join(format!("bearcad_export_{}.stl", std::process::id()));
         let path_str = path.to_string_lossy().to_string();
         let result = state.apply(Action::ExportStl {
             path: path_str.clone(),
@@ -3270,7 +3270,7 @@ mod tests {
         state.apply(Action::CommitExtrusion);
         assert_eq!(state.doc.bodies.len(), 1);
 
-        let path = std::env::temp_dir().join(format!("le3_export_idx_{}.stl", std::process::id()));
+        let path = std::env::temp_dir().join(format!("bearcad_export_idx_{}.stl", std::process::id()));
         let path_str = path.to_string_lossy().to_string();
         // Index-based export works even for an unnamed body (the context-menu path).
         let result = state.apply(Action::ExportStlBody {
@@ -3396,7 +3396,7 @@ mod tests {
         state.doc.rects.push(Rect::from_local_corners(sketch, 0., 0., 10., 10.));
         state.doc.lines.push(Line::from_local_endpoints(sketch, 0., 0., 1., 0.));
         state.doc.shape_order.push(ShapeKind::Line);
-        state.path = Some("/tmp/test.le3".to_string());
+        state.path = Some("/tmp/test.bearcad".to_string());
         state.apply(Action::NewDocument);
         assert!(state.doc.rects.is_empty());
         assert!(state.doc.lines.is_empty());
@@ -5001,7 +5001,7 @@ mod tests {
         use crate::model::{Constraint, ConstraintKind, ConstraintLine};
 
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_open_health.le3");
+        let path = dir.join("bearcad_open_health.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 

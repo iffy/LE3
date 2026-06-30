@@ -53,13 +53,13 @@ impl BearGpuResources {
         let target_format = render_state.target_format;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("le3_bear_hud_shader"),
+            label: Some("bearcad_bear_hud_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("le3_bear_hud_uniform_layout"),
+                label: Some("bearcad_bear_hud_uniform_layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -73,7 +73,7 @@ impl BearGpuResources {
             });
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("le3_bear_hud_uniform"),
+            label: Some("bearcad_bear_hud_uniform"),
             contents: bytemuck::bytes_of(&BearHudUniforms {
                 center: [0.0, 0.0],
                 scale: 1.0,
@@ -87,7 +87,7 @@ impl BearGpuResources {
         });
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("le3_bear_hud_uniform_bind_group"),
+            label: Some("bearcad_bear_hud_uniform_bind_group"),
             layout: &uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -97,13 +97,13 @@ impl BearGpuResources {
 
         let bear_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("le3_bear_hud_bear_layout"),
+                label: Some("bearcad_bear_hud_bear_layout"),
                 bind_group_layouts: &[&uniform_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
         let bear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("le3_bear_hud_bear_pipeline"),
+            label: Some("bearcad_bear_hud_bear_pipeline"),
             layout: Some(&bear_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -155,7 +155,7 @@ impl BearGpuResources {
 
         let blit_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("le3_bear_hud_blit_layout"),
+                label: Some("bearcad_bear_hud_blit_layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -178,13 +178,13 @@ impl BearGpuResources {
 
         let blit_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("le3_bear_hud_blit_layout"),
+                label: Some("bearcad_bear_hud_blit_layout"),
                 bind_group_layouts: &[&blit_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("le3_bear_hud_blit_pipeline"),
+            label: Some("bearcad_bear_hud_blit_pipeline"),
             layout: Some(&blit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -210,20 +210,20 @@ impl BearGpuResources {
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("le3_bear_hud_sampler"),
+            label: Some("bearcad_bear_hud_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("le3_bear_hud_vertices"),
+            label: Some("bearcad_bear_hud_vertices"),
             size: 4096,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("le3_bear_hud_indices"),
+            label: Some("bearcad_bear_hud_indices"),
             size: 4096,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -266,7 +266,7 @@ impl BearGpuResources {
         };
 
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("le3_bear_hud_color"),
+            label: Some("bearcad_bear_hud_color"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
@@ -278,7 +278,7 @@ impl BearGpuResources {
         let color_view = color_texture.create_view(&Default::default());
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("le3_bear_hud_depth"),
+            label: Some("bearcad_bear_hud_depth"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
@@ -291,7 +291,7 @@ impl BearGpuResources {
 
         let blit_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("le3_bear_hud_blit_layout_runtime"),
+                label: Some("bearcad_bear_hud_blit_layout_runtime"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -313,7 +313,7 @@ impl BearGpuResources {
             });
 
         let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("le3_bear_hud_blit_bind_group"),
+            label: Some("bearcad_bear_hud_blit_bind_group"),
             layout: &blit_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -343,7 +343,7 @@ impl BearGpuResources {
         if vertex_bytes > self.vertex_capacity {
             self.vertex_capacity = vertex_bytes.next_power_of_two().max(4096);
             self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("le3_bear_hud_vertices"),
+                label: Some("bearcad_bear_hud_vertices"),
                 size: self.vertex_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -352,7 +352,7 @@ impl BearGpuResources {
         if index_bytes > self.index_capacity {
             self.index_capacity = index_bytes.next_power_of_two().max(4096);
             self.index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("le3_bear_hud_indices"),
+                label: Some("bearcad_bear_hud_indices"),
                 size: self.index_capacity,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -406,11 +406,11 @@ impl BearGpuResources {
         let depth_view = self.depth_view.as_ref().expect("depth view");
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("le3_bear_hud_encoder"),
+            label: Some("bearcad_bear_hud_encoder"),
         });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("le3_bear_hud_pass"),
+                label: Some("bearcad_bear_hud_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: color_view,
                     resolve_target: None,

@@ -106,13 +106,13 @@ impl ViewportGpuResources {
         let msaa_sample_count = msaa_sample_count_for_format(&format_features);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("le3_viewport_shader"),
+            label: Some("bearcad_viewport_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("le3_viewport_uniform_layout"),
+                label: Some("bearcad_viewport_uniform_layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -126,7 +126,7 @@ impl ViewportGpuResources {
             });
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("le3_viewport_uniform"),
+            label: Some("bearcad_viewport_uniform"),
             contents: bytemuck::bytes_of(&GpuUniforms {
                 view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             }),
@@ -134,7 +134,7 @@ impl ViewportGpuResources {
         });
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("le3_viewport_uniform_bind_group"),
+            label: Some("bearcad_viewport_uniform_bind_group"),
             layout: &uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -144,13 +144,13 @@ impl ViewportGpuResources {
 
         let scene_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("le3_viewport_scene_layout"),
+                label: Some("bearcad_viewport_scene_layout"),
                 bind_group_layouts: &[&uniform_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
         let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("le3_viewport_scene_pipeline"),
+            label: Some("bearcad_viewport_scene_pipeline"),
             layout: Some(&scene_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -212,7 +212,7 @@ impl ViewportGpuResources {
             pass_op: wgpu::StencilOperation::IncrementClamp,
         };
         let sketch_fill_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("le3_viewport_sketch_fill_pipeline"),
+            label: Some("bearcad_viewport_sketch_fill_pipeline"),
             layout: Some(&scene_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -269,7 +269,7 @@ impl ViewportGpuResources {
 
         let scene_transparent_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("le3_viewport_scene_transparent_pipeline"),
+                label: Some("bearcad_viewport_scene_transparent_pipeline"),
                 layout: Some(&scene_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
@@ -328,7 +328,7 @@ impl ViewportGpuResources {
 
         let text_texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("le3_viewport_text_texture_layout"),
+                label: Some("bearcad_viewport_text_texture_layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -351,13 +351,13 @@ impl ViewportGpuResources {
 
         let text_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("le3_viewport_text_layout"),
+                label: Some("bearcad_viewport_text_layout"),
                 bind_group_layouts: &[&uniform_bind_group_layout, &text_texture_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
         let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("le3_viewport_text_pipeline"),
+            label: Some("bearcad_viewport_text_pipeline"),
             layout: Some(&text_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -414,7 +414,7 @@ impl ViewportGpuResources {
 
         let blit_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("le3_viewport_blit_layout"),
+                label: Some("bearcad_viewport_blit_layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -437,13 +437,13 @@ impl ViewportGpuResources {
 
         let blit_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("le3_viewport_blit_layout"),
+                label: Some("bearcad_viewport_blit_layout"),
                 bind_group_layouts: &[&blit_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("le3_viewport_blit_pipeline"),
+            label: Some("bearcad_viewport_blit_pipeline"),
             layout: Some(&blit_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -469,38 +469,38 @@ impl ViewportGpuResources {
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("le3_viewport_sampler"),
+            label: Some("bearcad_viewport_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("le3_viewport_font_sampler"),
+            label: Some("bearcad_viewport_font_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("le3_viewport_vertices"),
+            label: Some("bearcad_viewport_vertices"),
             size: 4096,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("le3_viewport_indices"),
+            label: Some("bearcad_viewport_indices"),
             size: 4096,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let text_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("le3_viewport_text_vertices"),
+            label: Some("bearcad_viewport_text_vertices"),
             size: 4096,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let text_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("le3_viewport_text_indices"),
+            label: Some("bearcad_viewport_text_indices"),
             size: 4096,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -554,7 +554,7 @@ impl ViewportGpuResources {
         };
         let view = wgpu_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("le3_viewport_font_bind_group"),
+            label: Some("bearcad_viewport_font_bind_group"),
             layout: &self.text_texture_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -586,7 +586,7 @@ impl ViewportGpuResources {
         };
 
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("le3_viewport_color_resolve"),
+            label: Some("bearcad_viewport_color_resolve"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
@@ -599,7 +599,7 @@ impl ViewportGpuResources {
 
         let (msaa_color_texture, msaa_color_view) = if self.msaa_sample_count > 1 {
             let msaa_color_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("le3_viewport_color_msaa"),
+                label: Some("bearcad_viewport_color_msaa"),
                 size: extent,
                 mip_level_count: 1,
                 sample_count: self.msaa_sample_count,
@@ -616,7 +616,7 @@ impl ViewportGpuResources {
         };
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("le3_viewport_depth"),
+            label: Some("bearcad_viewport_depth"),
             size: extent,
             mip_level_count: 1,
             sample_count: self.msaa_sample_count,
@@ -628,7 +628,7 @@ impl ViewportGpuResources {
         let depth_view = depth_texture.create_view(&Default::default());
 
         let blit_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("le3_viewport_blit_layout_runtime"),
+            label: Some("bearcad_viewport_blit_layout_runtime"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -650,7 +650,7 @@ impl ViewportGpuResources {
         });
 
         let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("le3_viewport_blit_bind_group"),
+            label: Some("bearcad_viewport_blit_bind_group"),
             layout: &blit_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -682,7 +682,7 @@ impl ViewportGpuResources {
         if vertex_bytes > self.text_vertex_capacity {
             self.text_vertex_capacity = vertex_bytes.next_power_of_two().max(4096);
             self.text_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("le3_viewport_text_vertices"),
+                label: Some("bearcad_viewport_text_vertices"),
                 size: self.text_vertex_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -691,7 +691,7 @@ impl ViewportGpuResources {
         if index_bytes > self.text_index_capacity {
             self.text_index_capacity = index_bytes.next_power_of_two().max(4096);
             self.text_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("le3_viewport_text_indices"),
+                label: Some("bearcad_viewport_text_indices"),
                 size: self.text_index_capacity,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -708,7 +708,7 @@ impl ViewportGpuResources {
         if vertex_bytes > self.vertex_capacity {
             self.vertex_capacity = vertex_bytes.next_power_of_two().max(4096);
             self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("le3_viewport_vertices"),
+                label: Some("bearcad_viewport_vertices"),
                 size: self.vertex_capacity,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -717,7 +717,7 @@ impl ViewportGpuResources {
         if index_bytes > self.index_capacity {
             self.index_capacity = index_bytes.next_power_of_two().max(4096);
             self.index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("le3_viewport_indices"),
+                label: Some("bearcad_viewport_indices"),
                 size: self.index_capacity,
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -807,11 +807,11 @@ impl ViewportGpuResources {
             };
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("le3_viewport_scene_encoder"),
+            label: Some("bearcad_viewport_scene_encoder"),
         });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("le3_viewport_scene_pass"),
+                label: Some("bearcad_viewport_scene_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: color_attachment_view,
                     resolve_target,

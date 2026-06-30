@@ -11,24 +11,24 @@ version() {
 }
 
 package_linux() {
-  local out="le3-linux-x86_64.tar.gz"
+  local out="bearcad-linux-x86_64.tar.gz"
   mkdir -p dist
-  cp target/release/le3 dist/
-  tar czvf "$out" -C dist le3
+  cp target/release/bearcad dist/
+  tar czvf "$out" -C dist bearcad
   echo "Created $out"
 }
 
 package_macos() {
   local version app_name app_dir dmg
   version="$(version)"
-  app_name="LE3"
+  app_name="BearCAD"
   app_dir="dist/${app_name}.app"
-  dmg="le3-macos-aarch64.dmg"
+  dmg="bearcad.dmg"
 
   rm -rf dist
   mkdir -p "${app_dir}/Contents/MacOS" "${app_dir}/Contents/Resources"
-  cp target/release/le3 "${app_dir}/Contents/MacOS/le3"
-  chmod +x "${app_dir}/Contents/MacOS/le3"
+  cp target/release/bearcad "${app_dir}/Contents/MacOS/bearcad"
+  chmod +x "${app_dir}/Contents/MacOS/bearcad"
   bash scripts/generate-macos-icns.sh dist/AppIcon.icns
   cp dist/AppIcon.icns "${app_dir}/Contents/Resources/AppIcon.icns"
 
@@ -40,9 +40,9 @@ package_macos() {
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleExecutable</key>
-  <string>le3</string>
+  <string>bearcad</string>
   <key>CFBundleIdentifier</key>
-  <string>com.le3.app</string>
+  <string>com.bearcad.app</string>
   <key>CFBundleName</key>
   <string>${app_name}</string>
   <key>CFBundleIconFile</key>

@@ -1,6 +1,6 @@
 //! Lua script runner and internal instruction dispatch (SPEC §8).
 //!
-//! Scripts are `.lua` files that call the global `le3` API. They drive the
+//! Scripts are `.lua` files that call the global `bearcad` API. They drive the
 //! live UI via synthetic pointer/keyboard events and headless actions.
 
 use crate::actions::{
@@ -177,39 +177,39 @@ impl Instruction {
     /// Format this instruction as a Lua API call (for `--show-commands` logging).
     pub fn as_lua(&self) -> String {
         match self {
-            Instruction::New => "le3.new()".to_string(),
-            Instruction::Open(path) => format!("le3.open({path:?})"),
-            Instruction::Save(None) => "le3.save()".to_string(),
-            Instruction::Save(Some(path)) => format!("le3.save({path:?})"),
-            Instruction::ExportStl { path, body: None } => format!("le3.export_stl({path:?})"),
+            Instruction::New => "bearcad.new()".to_string(),
+            Instruction::Open(path) => format!("bearcad.open({path:?})"),
+            Instruction::Save(None) => "bearcad.save()".to_string(),
+            Instruction::Save(Some(path)) => format!("bearcad.save({path:?})"),
+            Instruction::ExportStl { path, body: None } => format!("bearcad.export_stl({path:?})"),
             Instruction::ExportStl {
                 path,
                 body: Some(body),
-            } => format!("le3.export_stl({path:?}, {body:?})"),
-            Instruction::Clear => "le3.clear()".to_string(),
-            Instruction::Undo => "le3.undo()".to_string(),
-            Instruction::Tool(tool) => format!("le3.tool({:?})", tool_lua_name(*tool)),
+            } => format!("bearcad.export_stl({path:?}, {body:?})"),
+            Instruction::Clear => "bearcad.clear()".to_string(),
+            Instruction::Undo => "bearcad.undo()".to_string(),
+            Instruction::Tool(tool) => format!("bearcad.tool({:?})", tool_lua_name(*tool)),
             Instruction::BeginSketch { face } => {
                 let (kind, index) = face_lua_parts(*face);
-                format!("le3.begin_sketch({kind:?}, {index})")
+                format!("bearcad.begin_sketch({kind:?}, {index})")
             }
-            Instruction::OpenSketch { sketch } => format!("le3.open_sketch({sketch})"),
-            Instruction::ExitSketch => "le3.exit_sketch()".to_string(),
+            Instruction::OpenSketch { sketch } => format!("bearcad.open_sketch({sketch})"),
+            Instruction::ExitSketch => "bearcad.exit_sketch()".to_string(),
             Instruction::CreateRect {
                 x,
                 y,
                 width,
                 height,
-            } => format!("le3.rect{{ x = {x}, y = {y}, width = {width}, height = {height} }}"),
+            } => format!("bearcad.rect{{ x = {x}, y = {y}, width = {width}, height = {height} }}"),
             Instruction::CreateLine { x0, y0, x1, y1 } => {
-                format!("le3.line{{ x = {x0}, y = {y0}, x1 = {x1}, y1 = {y1} }}")
+                format!("bearcad.line{{ x = {x0}, y = {y0}, x1 = {x1}, y1 = {y1} }}")
             }
             Instruction::CreateCircle { cx, cy, r } => {
-                format!("le3.circle{{ x = {cx}, y = {cy}, r = {r} }}")
+                format!("bearcad.circle{{ x = {cx}, y = {cy}, r = {r} }}")
             }
             Instruction::Extrude {
                 faces, distance, ..
-            } => format!("le3.extrude{{ faces = {}, distance = {distance} }}", faces.len()),
+            } => format!("bearcad.extrude{{ faces = {}, distance = {distance} }}", faces.len()),
             Instruction::SetElementVisible { element, visible } => {
                 let target = element_lua_ref(*element);
                 let verb = match visible {
@@ -217,72 +217,72 @@ impl Instruction {
                     Some(false) => "hide",
                     None => "toggle",
                 };
-                format!("le3.set_visible({target}, {verb:?})")
+                format!("bearcad.set_visible({target}, {verb:?})")
             }
             Instruction::SelectSceneElement { element, additive } => {
                 let target = element_lua_ref(*element);
                 if *additive {
-                    format!("le3.select({target}, {{ additive = true }})")
+                    format!("bearcad.select({target}, {{ additive = true }})")
                 } else {
-                    format!("le3.select({target})")
+                    format!("bearcad.select({target})")
                 }
             }
-            Instruction::ClearSceneSelection => "le3.clear_selection()".to_string(),
+            Instruction::ClearSceneSelection => "bearcad.clear_selection()".to_string(),
             Instruction::SetShapeConstruction { element, construction } => {
                 format!(
-                    "le3.set_construction({}, {})",
+                    "bearcad.set_construction({}, {})",
                     element_lua_ref(*element),
                     construction
                 )
             }
             Instruction::ApplyConstruction { construction } => {
-                format!("le3.apply_construction({construction})")
+                format!("bearcad.apply_construction({construction})")
             }
-            Instruction::ToggleConstruction => "le3.toggle_construction()".to_string(),
+            Instruction::ToggleConstruction => "bearcad.toggle_construction()".to_string(),
             Instruction::SetElementName { element, name } => {
                 format!(
-                    "le3.set_name({}, {name:?})",
+                    "bearcad.set_name({}, {name:?})",
                     element_lua_ref(*element)
                 )
             }
-            Instruction::FocusElementName => "le3.focus_name()".to_string(),
+            Instruction::FocusElementName => "bearcad.focus_name()".to_string(),
             Instruction::SetDim { axis, value } => {
                 format!(
-                    "le3.set_dim({:?}, {value:?})",
+                    "bearcad.set_dim({:?}, {value:?})",
                     rect_axis_lua_name(*axis)
                 )
             }
             Instruction::SetDimLabelOffset { axis, offset } => {
                 format!(
-                    "le3.set_dim_label_offset({:?}, {offset})",
+                    "bearcad.set_dim_label_offset({:?}, {offset})",
                     dim_label_axis_lua_name(*axis)
                 )
             }
             Instruction::BeginEditCommittedDim { axis } => {
                 format!(
-                    "le3.edit_dim({:?})",
+                    "bearcad.edit_dim({:?})",
                     dim_label_axis_lua_name(*axis)
                 )
             }
-            Instruction::CommitCommittedDim => "le3.commit_dim()".to_string(),
+            Instruction::CommitCommittedDim => "bearcad.commit_dim()".to_string(),
             Instruction::AddDistanceConstraint { target, expression } => {
                 format!(
-                    "le3.add_constraint({}, {expression:?})",
+                    "bearcad.add_constraint({}, {expression:?})",
                     distance_target_lua_ref(target)
                 )
             }
             Instruction::AddGeometricConstraint(kind) => {
                 format!(
-                    "le3.add_geometric_constraint({:?})",
+                    "bearcad.add_geometric_constraint({:?})",
                     geometric_constraint_lua_name(*kind)
                 )
             }
             Instruction::ApplyConstraintShortcut(key) => {
-                format!("le3.constraint_shortcut({key:?})")
+                format!("bearcad.constraint_shortcut({key:?})")
             }
             Instruction::DragVertex { point, u, v } => {
                 format!(
-                    "le3.drag_vertex({}, {u}, {v})",
+                    "bearcad.drag_vertex({}, {u}, {v})",
                     constraint_point_lua_ref(*point)
                 )
             }
@@ -293,113 +293,113 @@ impl Instruction {
                 u,
                 v,
             } => format!(
-                "le3.drag_line({}, {anchor_u}, {anchor_v}, {u}, {v})",
+                "bearcad.drag_line({}, {anchor_u}, {anchor_v}, {u}, {v})",
                 constraint_line_lua_ref(*target)
             ),
             Instruction::SetLineLength { value } => {
-                format!("le3.set_dim(\"length\", {value:?})")
+                format!("bearcad.set_dim(\"length\", {value:?})")
             }
             Instruction::SetCircleDiameter { value } => {
-                format!("le3.set_dim(\"diameter\", {value:?})")
+                format!("bearcad.set_dim(\"diameter\", {value:?})")
             }
             Instruction::BeginEditConstructionPlane { index } => {
-                format!("le3.edit_plane({index})")
+                format!("bearcad.edit_plane({index})")
             }
-            Instruction::CommitConstructionPlane => "le3.commit_plane()".to_string(),
+            Instruction::CommitConstructionPlane => "bearcad.commit_plane()".to_string(),
             Instruction::SetPlaneOffset { value } => {
-                format!("le3.set_dim(\"offset\", {value:?})")
+                format!("bearcad.set_dim(\"offset\", {value:?})")
             }
             Instruction::SetPlaneAngle { value } => {
-                format!("le3.set_dim(\"angle\", {value:?})")
+                format!("bearcad.set_dim(\"angle\", {value:?})")
             }
             Instruction::FocusDim(axis) => {
-                format!("le3.focus_dim({:?})", rect_axis_lua_name(*axis))
+                format!("bearcad.focus_dim({:?})", rect_axis_lua_name(*axis))
             }
-            Instruction::FocusLineLength => "le3.focus_dim(\"length\")".to_string(),
-            Instruction::FocusCircleDiameter => "le3.focus_dim(\"diameter\")".to_string(),
+            Instruction::FocusLineLength => "bearcad.focus_dim(\"length\")".to_string(),
+            Instruction::FocusCircleDiameter => "bearcad.focus_dim(\"diameter\")".to_string(),
             Instruction::FocusPlaneDim(dim) => {
-                format!("le3.focus_dim({:?})", plane_dim_lua_name(*dim))
+                format!("bearcad.focus_dim({:?})", plane_dim_lua_name(*dim))
             }
-            Instruction::Orbit { dx, dy } => format!("le3.orbit({dx}, {dy})"),
-            Instruction::Pan { dx, dy } => format!("le3.pan({dx}, {dy})"),
-            Instruction::Zoom { scroll } => format!("le3.wheel({scroll})"),
-            Instruction::View(view) => format!("le3.view({:?})", view_script_name(*view)),
+            Instruction::Orbit { dx, dy } => format!("bearcad.orbit({dx}, {dy})"),
+            Instruction::Pan { dx, dy } => format!("bearcad.pan({dx}, {dy})"),
+            Instruction::Zoom { scroll } => format!("bearcad.wheel({scroll})"),
+            Instruction::View(view) => format!("bearcad.view({:?})", view_script_name(*view)),
             Instruction::ViewEdge(edge) => {
-                format!("le3.view(\"edge\", {:?})", edge_script_name(*edge))
+                format!("bearcad.view(\"edge\", {:?})", edge_script_name(*edge))
             }
             Instruction::ViewCorner(corner) => format!(
-                "le3.view(\"corner\", {:?})",
+                "bearcad.view(\"corner\", {:?})",
                 corner_script_name(*corner)
             ),
-            Instruction::ViewHome => "le3.view_home()".to_string(),
-            Instruction::SetHomeView => "le3.set_home_view()".to_string(),
+            Instruction::ViewHome => "bearcad.view_home()".to_string(),
+            Instruction::SetHomeView => "bearcad.set_home_view()".to_string(),
             Instruction::ProjectionMode(mode) => {
-                format!("le3.view({:?})", projection_mode_script_name(*mode))
+                format!("bearcad.view({:?})", projection_mode_script_name(*mode))
             }
-            Instruction::ToggleProjectionMode => "le3.toggle_projection()".to_string(),
+            Instruction::ToggleProjectionMode => "bearcad.toggle_projection()".to_string(),
             Instruction::SetPane { pane, visible } => {
                 let verb = match visible {
                     Some(true) => "show",
                     Some(false) => "hide",
                     None => "toggle",
                 };
-                format!("le3.pane({:?}, {verb:?})", pane.script_name())
+                format!("bearcad.pane({:?}, {verb:?})", pane.script_name())
             }
             Instruction::AddParameter { name, expression } => {
-                format!("le3.parameter(\"add\", {name:?}, {expression:?})")
+                format!("bearcad.parameter(\"add\", {name:?}, {expression:?})")
             }
             Instruction::CreateParameterFromLineLength { line_index, name } => match name {
                 Some(name) => format!(
-                    "le3.parameter(\"from_line_length\", {line_index}, {name:?})"
+                    "bearcad.parameter(\"from_line_length\", {line_index}, {name:?})"
                 ),
-                None => format!("le3.parameter(\"from_line_length\", {line_index})"),
+                None => format!("bearcad.parameter(\"from_line_length\", {line_index})"),
             },
             Instruction::SetParameterName { index, name } => {
-                format!("le3.parameter(\"name\", {index}, {name:?})")
+                format!("bearcad.parameter(\"name\", {index}, {name:?})")
             }
             Instruction::SetParameterExpression { index, expression } => {
-                format!("le3.parameter(\"value\", {index}, {expression:?})")
+                format!("bearcad.parameter(\"value\", {index}, {expression:?})")
             }
             Instruction::DeleteParameter { index } => {
-                format!("le3.parameter(\"delete\", {index})")
+                format!("bearcad.parameter(\"delete\", {index})")
             }
-            Instruction::DeleteSelection => "le3.delete_selection()".to_string(),
+            Instruction::DeleteSelection => "bearcad.delete_selection()".to_string(),
             Instruction::SetCommandPalette { open } => {
                 let verb = match open {
                     Some(true) => "show",
                     Some(false) => "hide",
                     None => "toggle",
                 };
-                format!("le3.palette({verb:?})")
+                format!("bearcad.palette({verb:?})")
             }
             Instruction::RunPaletteCommand { query } => {
-                format!("le3.palette(\"run\", {query:?})")
+                format!("bearcad.palette(\"run\", {query:?})")
             }
-            Instruction::Move { x, y } => format!("le3.move({x}, {y})"),
-            Instruction::Click { x, y } => format!("le3.click({x}, {y})"),
-            Instruction::MoveGround { x, y } => format!("le3.move_ground({x}, {y})"),
-            Instruction::ClickGround { x, y } => format!("le3.click_ground({x}, {y})"),
+            Instruction::Move { x, y } => format!("bearcad.move({x}, {y})"),
+            Instruction::Click { x, y } => format!("bearcad.click({x}, {y})"),
+            Instruction::MoveGround { x, y } => format!("bearcad.move_ground({x}, {y})"),
+            Instruction::ClickGround { x, y } => format!("bearcad.click_ground({x}, {y})"),
             Instruction::Drag { x0, y0, x1, y1 } => {
-                format!("le3.drag({x0}, {y0}, {x1}, {y1})")
+                format!("bearcad.drag({x0}, {y0}, {x1}, {y1})")
             }
-            Instruction::RightDrag { dx, dy } => format!("le3.right_drag({dx}, {dy})"),
+            Instruction::RightDrag { dx, dy } => format!("bearcad.right_drag({dx}, {dy})"),
             Instruction::RightDragShift { dx, dy } => {
-                format!("le3.right_drag_pan({dx}, {dy})")
+                format!("bearcad.right_drag_pan({dx}, {dy})")
             }
-            Instruction::Key(key) => format!("le3.key({:?})", key_name(*key)),
-            Instruction::KeyDown(key) => format!("le3.keydown({:?})", key_name(*key)),
-            Instruction::KeyUp(key) => format!("le3.keyup({:?})", key_name(*key)),
-            Instruction::Type(text) => format!("le3.type({text:?})"),
-            Instruction::WaitMs(ms) => format!("le3.wait_ms({ms})"),
-            Instruction::WaitFrames(n) => format!("le3.wait({n})"),
+            Instruction::Key(key) => format!("bearcad.key({:?})", key_name(*key)),
+            Instruction::KeyDown(key) => format!("bearcad.keydown({:?})", key_name(*key)),
+            Instruction::KeyUp(key) => format!("bearcad.keyup({:?})", key_name(*key)),
+            Instruction::Type(text) => format!("bearcad.type({text:?})"),
+            Instruction::WaitMs(ms) => format!("bearcad.wait_ms({ms})"),
+            Instruction::WaitFrames(n) => format!("bearcad.wait({n})"),
             Instruction::Screenshot { path, whole_window } => {
                 if *whole_window {
-                    format!("le3.screenshot({path:?}, true)")
+                    format!("bearcad.screenshot({path:?}, true)")
                 } else {
-                    format!("le3.screenshot({path:?})")
+                    format!("bearcad.screenshot({path:?})")
                 }
             }
-            Instruction::Quit => "le3.quit()".to_string(),
+            Instruction::Quit => "bearcad.quit()".to_string(),
         }
     }
 }
@@ -1914,10 +1914,10 @@ pub enum CliOutcome {
 pub fn print_usage() {
     println!(
         "\
-LE3 — parametric CAD prototype
+BearCAD — parametric CAD prototype
 
 Usage:
-  le3 [options] [script.lua]
+  bearcad [options] [script.lua]
 
 Options:
   --script <path>       Run a Lua script
@@ -1927,11 +1927,11 @@ Options:
   -h, --help            Show this help and exit
 
 Examples:
-  le3
-  le3 --exit
-  le3 drawing.le3 --exit
-  le3 --script demo.lua
-  le3 demo.lua --exit
+  bearcad
+  bearcad --exit
+  bearcad drawing.bearcad --exit
+  bearcad --script demo.lua
+  bearcad demo.lua --exit
 "
     );
 }
@@ -1985,8 +1985,8 @@ fn parse_args_from_vec(args: &[String]) -> ScriptOptions {
                 {
                     opts.script_path = Some(arg.to_string());
                 } else if opts.document_path.is_none()
-                    && (arg.ends_with(".le3")
-                        || Path::new(arg).extension().is_some_and(|e| e == "le3"))
+                    && (arg.ends_with(".bearcad")
+                        || Path::new(arg).extension().is_some_and(|e| e == "bearcad"))
                 {
                     opts.document_path = Some(arg.to_string());
                 }
@@ -2042,13 +2042,13 @@ mod tests {
 
     #[test]
     fn parse_cli_help_flags() {
-        assert_eq!(parse_cli(["le3", "--help"]), CliOutcome::Help);
-        assert_eq!(parse_cli(["le3", "-h"]), CliOutcome::Help);
+        assert_eq!(parse_cli(["bearcad", "--help"]), CliOutcome::Help);
+        assert_eq!(parse_cli(["bearcad", "-h"]), CliOutcome::Help);
     }
 
     #[test]
     fn parse_show_commands_flag() {
-        let opts = parse_args(["le3", "--show-commands"]);
+        let opts = parse_args(["bearcad", "--show-commands"]);
         assert!(opts.show_commands);
     }
 
@@ -2063,7 +2063,7 @@ mod tests {
     #[test]
     fn parse_cli_run_delegates_to_script_options() {
         assert_eq!(
-            parse_cli(["le3", "--script", "test.lua", "--exit"]),
+            parse_cli(["bearcad", "--script", "test.lua", "--exit"]),
             CliOutcome::Run(ScriptOptions {
                 script_path: Some("test.lua".to_string()),
                 document_path: None,
@@ -2075,28 +2075,28 @@ mod tests {
 
     #[test]
     fn parse_args_finds_script_flag() {
-        let opts = parse_args(["le3", "--script", "test.lua", "--exit"]);
+        let opts = parse_args(["bearcad", "--script", "test.lua", "--exit"]);
         assert_eq!(opts.script_path.as_deref(), Some("test.lua"));
         assert!(opts.exit_on_complete);
     }
 
     #[test]
     fn parse_args_finds_positional_script() {
-        let opts = parse_args(["le3", "demo.lua"]);
+        let opts = parse_args(["bearcad", "demo.lua"]);
         assert_eq!(opts.script_path.as_deref(), Some("demo.lua"));
     }
 
     #[test]
     fn parse_args_finds_positional_document_and_exit() {
-        let opts = parse_args(["le3", "/tmp/test.le3", "--exit"]);
-        assert_eq!(opts.document_path.as_deref(), Some("/tmp/test.le3"));
+        let opts = parse_args(["bearcad", "/tmp/test.bearcad", "--exit"]);
+        assert_eq!(opts.document_path.as_deref(), Some("/tmp/test.bearcad"));
         assert!(opts.exit_on_complete);
         assert!(opts.script_path.is_none());
     }
 
     #[test]
     fn parse_args_exit_without_paths_exits_after_startup() {
-        let opts = parse_args(["le3", "--exit"]);
+        let opts = parse_args(["bearcad", "--exit"]);
         assert!(opts.exit_on_complete);
         assert!(opts.script_path.is_none());
         assert!(opts.document_path.is_none());
@@ -2105,7 +2105,7 @@ mod tests {
     #[test]
     fn instruction_as_lua_formats_click() {
         let ins = Instruction::Click { x: 100.0, y: 200.0 };
-        assert_eq!(ins.as_lua(), "le3.click(100, 200)");
+        assert_eq!(ins.as_lua(), "bearcad.click(100, 200)");
     }
 
     #[test]

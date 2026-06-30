@@ -1,6 +1,6 @@
-//! `.le3` file persistence (SPEC §7).
+//! `.bearcad` file persistence (SPEC §7).
 //!
-//! A `.le3` is a SQLite database. This early version implements only a small
+//! A `.bearcad` is a SQLite database. This early version implements only a small
 //! part of the schema from the spec — enough to round-trip sketch primitives —
 //! but keeps the pieces that matter for forward compatibility: a `meta` table
 //! and a `schema_migrations` table, and shapes stored as DAG nodes with a
@@ -372,7 +372,7 @@ mod tests {
     #[test]
     fn round_trips_rectangle_dimension_label_offsets() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_rect_dim_offset_test.le3");
+        let path = dir.join("bearcad_rect_dim_offset_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn round_trips_rectangle_dimension_locks() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_rect_locks_test.le3");
+        let path = dir.join("bearcad_rect_locks_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn round_trips_rectangles() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_roundtrip_test.le3");
+        let path = dir.join("bearcad_roundtrip_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn round_trips_rectangle_edge_construction_flags() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_rect_edge_construction_test.le3");
+        let path = dir.join("bearcad_rect_edge_construction_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn world_positions_round_trip_through_save() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_world_positions_test.le3");
+        let path = dir.join("bearcad_world_positions_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -605,7 +605,7 @@ mod tests {
     #[test]
     fn default_construction_plane_origin_round_trips() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_plane0_origin_test.le3");
+        let path = dir.join("bearcad_plane0_origin_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn construction_planes_round_trip() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_construction_plane_test.le3");
+        let path = dir.join("bearcad_construction_plane_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn legacy_files_without_planes_get_placeholder_indices() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_legacy_plane_ref_test.le3");
+        let path = dir.join("bearcad_legacy_plane_ref_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -722,7 +722,7 @@ mod tests {
     #[test]
     fn round_trips_mixed_shapes_in_order() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_mixed_shapes_test.le3");
+        let path = dir.join("bearcad_mixed_shapes_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn round_trips_circles() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_circle_roundtrip_test.le3");
+        let path = dir.join("bearcad_circle_roundtrip_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -784,7 +784,7 @@ mod tests {
     #[test]
     fn round_trips_sketches() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_sketch_roundtrip.le3");
+        let path = dir.join("bearcad_sketch_roundtrip.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -809,7 +809,7 @@ mod tests {
     fn round_trips_extrusions_and_bodies() {
         use crate::model::{Body, BodySource, ExtrudeFace, Extrusion};
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_extrusion_roundtrip.le3");
+        let path = dir.join("bearcad_extrusion_roundtrip.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn save_rejects_circular_parameters() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_circular_params_test.le3");
+        let path = dir.join("bearcad_circular_params_test.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -880,7 +880,7 @@ mod tests {
     #[test]
     fn round_trips_parameters() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_parameters_roundtrip.le3");
+        let path = dir.join("bearcad_parameters_roundtrip.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn round_trips_tombstoned_entities() {
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_tombstone_roundtrip.le3");
+        let path = dir.join("bearcad_tombstone_roundtrip.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
@@ -945,7 +945,7 @@ mod tests {
         use crate::model::{Constraint, ConstraintKind, ConstraintLine};
 
         let dir = std::env::temp_dir();
-        let path = dir.join("le3_tombstone_sibling.le3");
+        let path = dir.join("bearcad_tombstone_sibling.bearcad");
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 

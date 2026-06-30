@@ -1,8 +1,8 @@
-# LE3 — Specification
+# BearCAD — Specification
 
-LE3 is an on-device, parametric CAD program comparable to Autodesk Fusion, FreeCAD,
+BearCAD is an on-device, parametric CAD program comparable to Autodesk Fusion, FreeCAD,
 and OpenSCAD. This document is the implementation specification: it should contain
-enough detail for an engineer to build LE3 without further design decisions. Where a
+enough detail for an engineer to build BearCAD without further design decisions. Where a
 section says **TBD**, that detail is deliberately deferred and must be resolved before
 the relevant work begins.
 
@@ -19,8 +19,8 @@ These are settled. Do not re-litigate them during implementation.
 | Embedded scripting | **Lua** | Small, fast, sandboxable. No custom DSL. See §8. |
 | GUI toolkit | **egui** | Immediate-mode; easy tiling/docking, command palette, theming. |
 | 3D rendering | **wgpu** | Cross-platform GPU backend; the 3D viewport is a wgpu surface composited with egui. |
-| Save file | **SQLite**, extension `.le3` | Schema in §7. |
-| License | **MIT OR Apache-2.0** (dual) | LE3's own code is permissively licensed. OCCT is LGPL and MUST be **dynamically linked** so the permissive license is preserved; bundle the LGPL text and OCCT's. Audit STEP/3MF/AMF library licenses for the same constraint. |
+| Save file | **SQLite**, extension `.bearcad` | Schema in §7. |
+| License | **MIT OR Apache-2.0** (dual) | BearCAD's own code is permissively licensed. OCCT is LGPL and MUST be **dynamically linked** so the permissive license is preserved; bundle the LGPL text and OCCT's. Audit STEP/3MF/AMF library licenses for the same constraint. |
 
 ### 1.1 Platforms
 
@@ -35,7 +35,7 @@ as a CLI when given a subcommand (see §9).
 
 ### 2.1 Document
 
-A document is one `.le3` file. A document contains:
+A document is one `.bearcad` file. A document contains:
 
 - One or more **components**.
 - A set of document-level **parameters** (see §5).
@@ -120,8 +120,8 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
     distance along the plane normal, and generates a solid mesh (prism per rect, cylinder per
     circle). Each extrusion produces a **Body** (the solid result) that depends on it: the body
     nests under the extrusion in the Elements pane and is removed if the extrusion is deleted.
-    Created in script via `le3.extrude{ rect|circle|rects|circles, distance, name? }`.
-  - Implemented: the data model (Extrusion + Body) with `.le3` persistence; mesh generation;
+    Created in script via `bearcad.extrude{ rect|circle|rects|circles, distance, name? }`.
+  - Implemented: the data model (Extrusion + Body) with `.bearcad` persistence; mesh generation;
     both hierarchy elements; depth-tested flat-shaded rendering; and the interactive **Extrude
     tool** (`E`): click coplanar faces to toggle inclusion (hover-highlighted), drag the normal
     gizmo or type a distance (expressions/variables) to set the depth (positive or negative),
@@ -160,7 +160,7 @@ recoverable error on the relevant feature node, not a crash.
 
 ## 4. Action DAG (history & non-linear undo)
 
-LE3 replaces Fusion's linear timeline with a **directed acyclic graph of actions**. This
+BearCAD replaces Fusion's linear timeline with a **directed acyclic graph of actions**. This
 is the source of truth for the model; geometry is derived from it (see §4.4).
 
 ### 4.1 Nodes and edges
@@ -179,7 +179,7 @@ is the source of truth for the model; geometry is derived from it (see §4.4).
 
 ### 4.3 Undo / redo / time travel
 - Undo is **infinite and persistent** — it survives closing and reopening the file
-  (the full history lives in the `.le3`; see §7).
+  (the full history lives in the `.bearcad`; see §7).
 - The history is a **commit graph**: each user-visible change creates a new state. Undo
   moves to the parent state; redo moves forward. Because history is a graph (branches
   allowed) rather than a line, redo may present multiple forward branches; the UI MUST
@@ -190,7 +190,7 @@ is the source of truth for the model; geometry is derived from it (see §4.4).
 
 ### 4.4 Evaluation, caching & recompute
 - The **action DAG is the source of truth**; evaluated geometry is **derived and cached**.
-  Evaluated geometry **is persisted in the `.le3`** so files open fast — open should
+  Evaluated geometry **is persisted in the `.bearcad`** so files open fast — open should
   display cached geometry without a full rebuild. Speed is a priority for this app.
 - Each DAG node caches its evaluated output (per-node BREP and/or tessellation; granularity
   **TBD**, but at least per-feature). Editing a node invalidates only that node and its
@@ -265,7 +265,7 @@ is the source of truth for the model; geometry is derived from it (see §4.4).
 
 ## 6. Constraints
 
-LE3 has a geometric **constraint solver** supporting both 2D (sketch) and 3D constraints,
+BearCAD has a geometric **constraint solver** supporting both 2D (sketch) and 3D constraints,
 modeled on SolveSpace (https://solvespace.com).
 
 ### 6.0 Constraint tool (implemented subset)
@@ -324,9 +324,9 @@ back the assembly joints/mates (§2.3).
 
 ---
 
-## 7. File format (`.le3` / SQLite)
+## 7. File format (`.bearcad` / SQLite)
 
-A `.le3` is a SQLite database. The schema below is the starting point; refine during
+A `.bearcad` is a SQLite database. The schema below is the starting point; refine during
 implementation but keep the migration mechanism.
 
 ### 7.1 Versioning & migrations
@@ -338,8 +338,8 @@ implementation but keep the migration mechanism.
     applied_at  TEXT NOT NULL          -- ISO-8601 timestamp
   );
   ```
-- On open, LE3 applies any migrations whose id is newer than the file's latest applied
-  migration. A file from a newer LE3 than the running binary must be detected and refused
+- On open, BearCAD applies any migrations whose id is newer than the file's latest applied
+  migration. A file from a newer BearCAD than the running binary must be detected and refused
   (or opened read-only) rather than corrupted.
 - A `meta` key/value table records app version, **OCCT version used** (for deterministic
   recompute, §4.4), document units defaults, etc.
@@ -389,14 +389,14 @@ Everything achievable in the GUI must be achievable by programming, and vice ver
 - The API surface is versioned and documented. Exact module layout and function signatures
   are **TBD**, but must be designed so that the GUI's command set maps 1:1 onto API calls
   (this also powers the CLI, §9, and the command palette, §11).
-- `le3.screenshot([path], [whole_window])` captures the 3D viewport only by default (the
+- `bearcad.screenshot([path], [whole_window])` captures the 3D viewport only by default (the
   view-cube HUD is suppressed for that frame); passing `whole_window = true` captures the
-  entire window. With no `path`, the image is written to `screenshot-le3.png`.
+  entire window. With no `path`, the image is written to `screenshot-bearcad.png`.
 - Geometry-creation helpers are single calls that create the thing directly (no simulated
-  mouse/keyboard) and enter a ground-plane sketch if none is open: `le3.rect{ width, height,
-  x?, y?, name? }` and `le3.line{ length, angle?, x?, y?, name? }` (or explicit endpoints
-  `le3.line{ x, y, x1, y1 }`).
-- `le3.begin_sketch{ … }` starts a sketch on any face. Besides `kind = "rect"|"circle"|"plane"`
+  mouse/keyboard) and enter a ground-plane sketch if none is open: `bearcad.rect{ width, height,
+  x?, y?, name? }` and `bearcad.line{ length, angle?, x?, y?, name? }` (or explicit endpoints
+  `bearcad.line{ x, y, x1, y1 }`).
+- `bearcad.begin_sketch{ … }` starts a sketch on any face. Besides `kind = "rect"|"circle"|"plane"`
   with `index`, it accepts **3D body faces**: `kind = "extrude_cap", extrusion, profile =
   "rect"|"circle", profile_index, top?` and `kind = "extrude_side", extrusion, profile,
   profile_index, edge?`. (This makes sketching on a solid's face scriptable, e.g. for testing.)
@@ -415,12 +415,12 @@ they exist specifically so that interactive flows can be driven programmatically
 and automation (including screenshot capture of the live UI).
 
 ### 9.1 v1 subcommands
-- `export` — export a `.le3` to `.3mf`, `.stl`, `.obj`, `.amf`, or `.step`/`.stp`.
-- `run` — execute a Lua script headless against a new or existing `.le3`.
+- `export` — export a `.bearcad` to `.3mf`, `.stl`, `.obj`, `.amf`, or `.step`/`.stp`.
+- `run` — execute a Lua script headless against a new or existing `.bearcad`.
 - `render` — render the model to an image (e.g. PNG) from a specified camera.
 - `set` / parameter override + re-export — override named parameters from the command line
   and export, enabling part families from one file.
-- `import` / `convert` — import STEP/STL/etc. into a `.le3`, or convert between formats.
+- `import` / `convert` — import STEP/STL/etc. into a `.bearcad`, or convert between formats.
 
 The command set is expected to **grow over time** toward full GUI parity. New GUI actions
 should be added to the shared action layer so they become available headlessly by default.
@@ -435,7 +435,7 @@ tessellation + writers (or dedicated libraries — license-audited per §1).
 
 The application must be fully scriptable via a file containing a sequence of instructions.
 
-- Invocation: `le3 <script-file>` or `le3 --script <script-file>` (or equivalent).
+- Invocation: `bearcad <script-file>` or `bearcad --script <script-file>` (or equivalent).
 - When a script is provided the app shall open, sequentially execute every instruction in order,
   and apply the effects exactly as a user would (updating document, tools, camera, in-progress
   interactions, UI state, etc.).
@@ -467,7 +467,7 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
 ## 10. Geometry kernel integration (OCCT)
 
 - Integrate OCCT via Rust FFI. Either use/extend an existing binding crate or generate a
-  thin C++ shim exposing only the operations LE3 needs (sketch profiles, prism/revol,
+  thin C++ shim exposing only the operations BearCAD needs (sketch profiles, prism/revol,
   boolean, fillet/chamfer, shell, sweep/loft, STEP/mesh I/O, tessellation). Binding
   strategy: **TBD**, but isolate all `unsafe`/FFI behind a safe Rust `kernel` module.
 - OCCT must be **dynamically linked** (license, §1) and bundled in each platform package.
@@ -495,7 +495,7 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
   regression tests, §9.3, and stays consistent across platforms.)
 - **STL export from the GUI:** **File → Export STL…** exports all bodies (via a save
   dialog); right-clicking a **body** row in the Elements pane exports just that body. Both
-  mirror the scriptable `le3.export_stl` (§8, §9.2).
+  mirror the scriptable `bearcad.export_stl` (§8, §9.2).
 
 ### 11.2 Command palette
 - VS Code-style palette listing **context-pertinent** commands. Commands come from the
@@ -549,7 +549,7 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
 
 ## 12. Technical drawings & printable schematics
 
-LE3 supports **2D technical drawings** derived from 3D models — dimensioned, annotated
+BearCAD supports **2D technical drawings** derived from 3D models — dimensioned, annotated
 sheets suitable for printing/manufacturing.
 
 ### 12.1 Model
@@ -574,7 +574,7 @@ sheets suitable for printing/manufacturing.
   drawing export must be available from the CLI as well (§9), consistent with the
   GUI-parity principle.
 - Drawing definitions (sheets, views, annotations, placements) are persisted in the
-  `.le3` (§7); like geometry, computed view projections (HLR vector output) are **cached**
+  `.bearcad` (§7); like geometry, computed view projections (HLR vector output) are **cached**
   in the file and invalidated when the source model changes, so drawings open fast (cache
   strategy mirrors §4.4). HLR is expensive, so caching it is especially important here.
 

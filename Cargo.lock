@@ -425,6 +425,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bearcad"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "eframe",
+ "egui",
+ "glam",
+ "ico",
+ "image",
+ "mlua",
+ "muda",
+ "raw-window-handle",
+ "resvg",
+ "rfd",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tiny-skia",
+ "usvg",
+ "winit",
+ "winres",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2179,30 +2203,6 @@ dependencies = [
  "arrayvec",
  "euclid",
  "smallvec",
-]
-
-[[package]]
-name = "le3"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "eframe",
- "egui",
- "glam",
- "ico",
- "image",
- "mlua",
- "muda",
- "raw-window-handle",
- "resvg",
- "rfd",
- "rusqlite",
- "serde",
- "serde_json",
- "tiny-skia",
- "usvg",
- "winit",
- "winres",
 ]
 
 [[package]]

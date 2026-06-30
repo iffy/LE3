@@ -4,9 +4,10 @@
 # Local release packaging output
 /dist/
 /target/generated/
-le3-*.tar.gz
-le3-*.dmg
-le3-*.exe
+bearcad-*.tar.gz
+bearcad-*.dmg
+bearcad-*.exe
+/bearcad.exe
 
 # Backtrace/debug artifacts
 *.pdb
@@ -24,5 +25,5 @@ le3-*.exe
 .todoer
 .mcp.json
 
-# Issue monitor runtime state (scripts/le3-monitor.sh)
+# Issue monitor runtime state (scripts/bearcad-monitor.sh)
 scripts/monitor-state/

@@ -58,14 +58,14 @@ jobs:
           fi
           cargo test
 
-      # cargo test builds a test harness, not target/debug/le3 — needed for smoke/scripts.
+      # cargo test builds a test harness, not target/debug/bearcad — needed for smoke/scripts.
       - name: cargo build
         run: cargo build
 
       - name: Launch smoke test
         run: |
           set +e
-          timeout 2 xvfb-run -a ./target/debug/le3
+          timeout 2 xvfb-run -a ./target/debug/bearcad
           code=$?
           set -e
           if [[ $code -eq 0 || $code -eq 124 ]]; then
@@ -85,7 +85,7 @@ jobs:
           fi
           for script in "${scripts[@]}"; do
             echo "Running $script"
-            xvfb-run -a ./target/debug/le3 --script "$script" --exit
+            xvfb-run -a ./target/debug/bearcad --script "$script" --exit
           done
 
   build-release:
@@ -97,13 +97,13 @@ jobs:
         include:
           - runner: ubuntu-latest
             os_slug: linux-x86_64
-            artifact: le3-linux-x86_64.tar.gz
+            artifact: bearcad-linux-x86_64.tar.gz
           - runner: macos-latest
             os_slug: macos-aarch64
-            artifact: le3-macos-aarch64.dmg
+            artifact: bearcad-macos-aarch64.dmg
           - runner: windows-latest
             os_slug: windows-x86_64
-            artifact: le3-windows-x86_64.exe
+            artifact: bearcad.exe
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -154,7 +154,7 @@ jobs:
       - name: Upload release artifact
         uses: actions/upload-artifact@v5
         with:
-          name: le3-${{ matrix.os_slug }}
+          name: bearcad-${{ matrix.os_slug }}
           path: ${{ matrix.artifact }}
 
   release:

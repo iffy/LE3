@@ -1,4 +1,4 @@
-//! Lua scripting API (`le3` global) for driving the live application.
+//! Lua scripting API (`bearcad` global) for driving the live application.
 
 use crate::actions::{DimLabelAxis, Pane, RectAxis, Tool};
 use crate::camera::{ProjectionMode, StandardView};
@@ -161,7 +161,7 @@ fn resolve_element(lua: &Lua, value: Value) -> mlua::Result<SceneElement> {
             if let Ok(el) = ud.borrow::<LuaElement>() {
                 return Ok(el.element);
             }
-            Err(mlua::Error::external("expected le3 element"))
+            Err(mlua::Error::external("expected bearcad element"))
         }
         Value::Table(table) => parse_element_table(lua, table),
         Value::String(s) => {
@@ -298,7 +298,7 @@ fn apply_optional_name(
     unsafe { tick.exec(Instruction::SetElementName { element, name }) }
 }
 
-/// Register the global `le3` API table on a Lua state.
+/// Register the global `bearcad` API table on a Lua state.
 pub fn register_api(lua: &Lua) -> mlua::Result<()> {
     let api = lua.create_table()?;
 
@@ -1121,7 +1121,7 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
             let path = path
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| "screenshot-le3.png".to_string());
+                .unwrap_or_else(|| "screenshot-bearcad.png".to_string());
             unsafe {
                 tick.exec(Instruction::Screenshot {
                     path,
@@ -1265,8 +1265,8 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
         "import",
         lua.create_function(|lua, ()| {
             let globals = lua.globals();
-            let le3: Table = globals.get("le3")?;
-            for pair in le3.pairs::<String, Value>() {
+            let bearcad: Table = globals.get("bearcad")?;
+            for pair in bearcad.pairs::<String, Value>() {
                 let (name, value) = pair?;
                 if name.starts_with('_') || name == "import" {
                     continue;
@@ -1279,12 +1279,12 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
 
-    lua.globals().set("le3", api)?;
+    lua.globals().set("bearcad", api)?;
     lua.load(
         r#"
         local function yielding(name, native_name)
-            local native = le3[native_name or name]
-            le3[name] = function(...)
+            local native = bearcad[native_name or name]
+            bearcad[name] = function(...)
                 native(...)
                 coroutine.yield()
             end
@@ -1334,8 +1334,8 @@ mod tests {
         // A single call should enter a ground-plane sketch and make the rectangle.
         let state = run_lua(
             r#"
-            le3.new()
-            le3.rect{ width = 80, height = 50, name = "Box" }
+            bearcad.new()
+            bearcad.rect{ width = 80, height = 50, name = "Box" }
         "#,
         );
         assert_eq!(state.doc.rects.len(), 1);
@@ -1352,8 +1352,8 @@ mod tests {
     fn lua_line_creates_line_on_ground_plane() {
         let state = run_lua(
             r#"
-            le3.new()
-            le3.line{ length = 80, name = "Guide" }
+            bearcad.new()
+            bearcad.line{ length = 80, name = "Guide" }
         "#,
         );
         assert_eq!(state.doc.lines.len(), 1);
@@ -1368,8 +1368,8 @@ mod tests {
     fn lua_circle_creates_circle_on_ground_plane() {
         let state = run_lua(
             r#"
-            le3.new()
-            le3.circle{ x = 10, y = 5, r = 12, name = "Hole" }
+            bearcad.new()
+            bearcad.circle{ x = 10, y = 5, r = 12, name = "Hole" }
         "#,
         );
         assert_eq!(state.doc.circles.len(), 1);
@@ -1386,8 +1386,8 @@ mod tests {
     fn lua_circle_accepts_diameter() {
         let state = run_lua(
             r#"
-            le3.new()
-            le3.circle{ diameter = 30 }
+            bearcad.new()
+            bearcad.circle{ diameter = 30 }
         "#,
         );
         assert_eq!(state.doc.circles.len(), 1);
@@ -1398,9 +1398,9 @@ mod tests {
     fn lua_extrude_creates_solid_in_hierarchy() {
         let state = run_lua(
             r#"
-            le3.new()
-            le3.rect{ width = 80, height = 50 }
-            le3.extrude{ rect = 0, distance = 20, name = "Boss" }
+            bearcad.new()
+            bearcad.rect{ width = 80, height = 50 }
+            bearcad.extrude{ rect = 0, distance = 20, name = "Boss" }
         "#,
         );
         assert_eq!(state.doc.extrusions.len(), 1);
@@ -1428,10 +1428,10 @@ mod tests {
     fn lua_begin_sketch_on_extrude_cap_face() {
         let state = run_lua(
             r#"
-            le3.new()
-            le3.rect{ width = 80, height = 50 }
-            le3.extrude{ rect = 0, distance = 20 }
-            le3.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
+            bearcad.new()
+            bearcad.rect{ width = 80, height = 50 }
+            bearcad.extrude{ rect = 0, distance = 20 }
+            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
         "#,
         );
         let face = state.doc.sketches.last().map(|s| s.face);
@@ -1450,10 +1450,10 @@ mod tests {
     fn lua_begin_sketch_on_extrude_side_face() {
         let state = run_lua(
             r#"
-            le3.new()
-            le3.rect{ width = 80, height = 50 }
-            le3.extrude{ rect = 0, distance = 20 }
-            le3.begin_sketch{ kind = "extrude_side", extrusion = 0, profile = "rect", profile_index = 0, edge = 1 }
+            bearcad.new()
+            bearcad.rect{ width = 80, height = 50 }
+            bearcad.extrude{ rect = 0, distance = 20 }
+            bearcad.begin_sketch{ kind = "extrude_side", extrusion = 0, profile = "rect", profile_index = 0, edge = 1 }
         "#,
         );
         let face = state.doc.sketches.last().map(|s| s.face);
@@ -1472,9 +1472,9 @@ mod tests {
     fn deleting_extrusion_removes_its_body() {
         let mut state = run_lua(
             r#"
-            le3.new()
-            le3.rect{ width = 80, height = 50 }
-            le3.extrude{ rect = 0, distance = 20 }
+            bearcad.new()
+            bearcad.rect{ width = 80, height = 50 }
+            bearcad.extrude{ rect = 0, distance = 20 }
         "#,
         );
         assert_eq!(state.doc.bodies.len(), 1);
@@ -1490,9 +1490,9 @@ mod tests {
     fn lua_new_and_tool() {
         let state = run_lua(
             r#"
-            le3.new()
-            le3.begin_sketch("construction_plane", 0)
-            le3.tool("rectangle")
+            bearcad.new()
+            bearcad.begin_sketch("construction_plane", 0)
+            bearcad.tool("rectangle")
         "#,
         );
         assert_eq!(state.tool, Tool::Rectangle);
@@ -1503,8 +1503,8 @@ mod tests {
     fn lua_find_and_set_name() {
         let mut runner = ScriptRunner::from_lua_source(
             r#"
-            le3.set_name({ kind = "line", index = 0 }, "Main box")
-            local found = le3.find("Main box")
+            bearcad.set_name({ kind = "line", index = 0 }, "Main box")
+            local found = bearcad.find("Main box")
             assert(found ~= nil)
         "#,
         )
@@ -1530,12 +1530,12 @@ mod tests {
     fn lua_sketch_dof_reports_remaining_degrees_of_freedom() {
         let mut runner = ScriptRunner::from_lua_source(
             r#"
-            le3.begin_sketch("construction_plane", 0)
-            le3.tool("line")
-            le3.click(0, 0)
-            le3.click(100, 0)
-            le3.commit()
-            assert(le3.sketch_dof() > 0)
+            bearcad.begin_sketch("construction_plane", 0)
+            bearcad.tool("line")
+            bearcad.click(0, 0)
+            bearcad.click(100, 0)
+            bearcad.commit()
+            assert(bearcad.sketch_dof() > 0)
         "#,
         )
         .unwrap();
@@ -1552,7 +1552,7 @@ mod tests {
     fn lua_import_exposes_globals() {
         let mut runner = ScriptRunner::from_lua_source(
             r#"
-            le3.import()
+            bearcad.import()
             new()
             tool("select")
         "#,
@@ -1572,8 +1572,8 @@ mod tests {
     fn lua_wait_frames_advances() {
         let mut runner = ScriptRunner::from_lua_source(
             r#"
-            le3.wait(2)
-            le3.clear()
+            bearcad.wait(2)
+            bearcad.clear()
         "#,
         )
         .unwrap();

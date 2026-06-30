@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Poll iffy/LE3 for activity on issues labeled `doing` and dispatch the handler.
+# Poll iffy/BearCAD for activity on issues labeled `doing` and dispatch the handler.
 set -euo pipefail
 
-REPO="iffy/LE3"
+REPO="${GITHUB_REPO_SLUG:-iffy/BearCAD}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATE_DIR="$SCRIPT_DIR/monitor-state"
@@ -120,7 +120,7 @@ for c in json.load(sys.stdin):
         print(n)
 " | while read -r num; do
       [[ -z "$num" ]] && continue
-      if ! REPO_DIR="$REPO_ROOT" "$SCRIPT_DIR/le3-issue-handler.sh" "$num"; then
+      if ! REPO_DIR="$REPO_ROOT" "$SCRIPT_DIR/bearcad-issue-handler.sh" "$num"; then
         log "WARN handler failed for #$num"
       fi
     done
@@ -132,7 +132,7 @@ for c in json.load(sys.stdin):
 main() {
   acquire_lock
   init_checkpoint
-  log "START LE3 doing-issue monitor repo=$REPO interval=${POLL_INTERVAL}s max_cycles=$MAX_CYCLES"
+  log "START BearCAD doing-issue monitor repo=$REPO interval=${POLL_INTERVAL}s max_cycles=$MAX_CYCLES"
   local cycle=0
   while true; do
     cycle=$((cycle + 1))

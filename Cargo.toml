@@ -1,12 +1,13 @@
 [package]
-name = "le3"
+name = "bearcad"
 version = "0.1.0"
 edition = "2021"
-description = "LE3 — on-device parametric CAD (early prototype)"
+description = "BearCAD — on-device parametric CAD (early prototype)"
+repository = "https://github.com/iffy/BearCAD"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "le3"
+name = "bearcad"
 path = "src/main.rs"
 
 [build-dependencies]

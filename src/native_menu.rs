@@ -161,12 +161,12 @@ impl NativeMenu {
 
         #[cfg(target_os = "macos")]
         {
-            let app_menu = Submenu::new("LE3", true);
+            let app_menu = Submenu::new("BearCAD", true);
             app_menu.append_items(&[
                 &PredefinedMenuItem::about(
-                    Some("About LE3"),
+                    Some("About BearCAD"),
                     Some(AboutMetadata {
-                        name: Some("LE3".to_string()),
+                        name: Some("BearCAD".to_string()),
                         version: Some(env!("CARGO_PKG_VERSION").to_string()),
                         copyright: Some("On-device parametric CAD (prototype)".to_string()),
                         ..Default::default()
@@ -237,7 +237,7 @@ impl NativeMenu {
             true,
             Some(Accelerator::new(Some(primary), Code::KeyP)),
         );
-        let about = MenuItem::with_id("about", "About LE3", true, None);
+        let about = MenuItem::with_id("about", "About BearCAD", true, None);
 
         let mut pane_checks = Vec::new();
         let mut pane_ids = Vec::new();

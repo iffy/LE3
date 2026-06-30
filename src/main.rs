@@ -1,14 +1,14 @@
-//! LE3 — early prototype GUI.
+//! BearCAD — early prototype GUI.
 //!
 //! Rectangle tool: click to fix first corner, move mouse for second, with live
 //! dimension inputs on the sides. Type to constrain a side, Tab to cycle,
-//! Enter to commit. Right-drag orbit, wheel zoom. Save/Open .le3. (prototype)
+//! Enter to commit. Right-drag orbit, wheel zoom. Save/Open .bearcad. (prototype)
 //!
 //! Fully scriptable via Lua files (SPEC §8):
-//!   le3 --script demo.lua
-//!   le3 --exit
-//!   le3 drawing.le3 --exit
-//!   le3 demo.lua --exit
+//!   bearcad --script demo.lua
+//!   bearcad --exit
+//!   bearcad drawing.bearcad --exit
+//!   bearcad demo.lua --exit
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -150,7 +150,7 @@ fn tick_launch_maximize(frames_remaining: &mut u8, ctx: &egui::Context) {
 fn native_options() -> eframe::NativeOptions {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([960.0, 640.0])
-        .with_title("LE3")
+        .with_title("BearCAD")
         .with_icon(app_icon::load());
     if !uses_deferred_launch_maximize() {
         viewport = viewport.with_maximized(true);
@@ -203,7 +203,7 @@ fn run_app(script_opts: script::ScriptOptions) -> eframe::Result<()> {
         ))))?;
 
     eframe::run_native(
-        "LE3",
+        "BearCAD",
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
@@ -232,7 +232,7 @@ mod cli_tests {
     #[test]
     fn help_outcome_is_distinct_from_default_run() {
         assert_ne!(
-            script::parse_cli(["le3", "--help"]),
+            script::parse_cli(["bearcad", "--help"]),
             script::CliOutcome::Run(script::ScriptOptions::default())
         );
     }
@@ -349,8 +349,8 @@ impl App {
 
     fn save_as(&mut self) {
         let start = rfd::FileDialog::new()
-            .add_filter("LE3 document", &["le3"])
-            .set_file_name("untitled.le3");
+            .add_filter("BearCAD document", &["bearcad"])
+            .set_file_name("untitled.bearcad");
         if let Some(path) = start.save_file() {
             let path = path.to_string_lossy().to_string();
             self.state.apply(Action::Save {
@@ -403,7 +403,7 @@ impl App {
 
     fn open(&mut self) {
         let picked = rfd::FileDialog::new()
-            .add_filter("LE3 document", &["le3"])
+            .add_filter("BearCAD document", &["bearcad"])
             .pick_file();
         if let Some(path) = picked {
             let path = path.to_string_lossy().to_string();
@@ -426,7 +426,7 @@ impl App {
                 MenuCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 MenuCommand::About => {
                     self.state.status =
-                        "LE3 — on-device parametric CAD (prototype)".to_string();
+                        "BearCAD — on-device parametric CAD (prototype)".to_string();
                 }
                 _ => {
                     if let Some(action) = command.to_action() {

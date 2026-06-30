@@ -1,6 +1,6 @@
 //! In-memory document model.
 //!
-//! This is the very first slice of LE3 (see SPEC.md): a document is a flat list
+//! This is the very first slice of BearCAD (see SPEC.md): a document is a flat list
 //! of rectangles and lines on a single 2D sketch. As the action-DAG, components,
 //! and the OCCT kernel come online this will grow, but the persistence boundary
 //! (`storage.rs`) is kept narrow so the file format can evolve underneath it.
