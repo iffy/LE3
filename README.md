@@ -4,8 +4,16 @@ On-device parametric CAD. See [SPEC.md](SPEC.md) for the full design.
 
 ## Download
 
-Download the latest from
-[GitHub Releases](https://github.com/iffy/LE3/releases/latest).
+Pre-built binaries are published on every push to `master`:
+
+| Platform | Download |
+|----------|----------|
+| Linux (x86_64) | [le3-linux-x86_64.tar.gz](https://github.com/iffy/LE3/releases/latest/download/le3-linux-x86_64.tar.gz) |
+| macOS (Apple Silicon) | [le3-macos-aarch64.dmg](https://github.com/iffy/LE3/releases/latest/download/le3-macos-aarch64.dmg) |
+| Windows (x86_64) | [le3-windows-x86_64.exe](https://github.com/iffy/LE3/releases/latest/download/le3-windows-x86_64.exe) |
+
+Extract the Linux archive or mount the macOS disk image, then run `le3`. On Windows,
+download and run `le3-windows-x86_64.exe`.
 
 ## Status
 

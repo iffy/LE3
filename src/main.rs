@@ -37,6 +37,7 @@ mod parameters;
 mod model;
 mod native_menu;
 mod lua_script;
+mod release_artifacts;
 mod script;
 mod selection;
 mod shortcuts;

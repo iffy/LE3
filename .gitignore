@@ -1,6 +1,12 @@
 # Compiled output
 /target/
 
+# Local release packaging output
+/dist/
+le3-*.tar.gz
+le3-*.dmg
+le3-*.exe
+
 # Backtrace/debug artifacts
 *.pdb
 

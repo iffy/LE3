@@ -97,13 +97,13 @@ jobs:
         include:
           - runner: ubuntu-latest
             os_slug: linux-x86_64
-            binary: le3
+            artifact: le3-linux-x86_64.tar.gz
           - runner: macos-latest
             os_slug: macos-aarch64
-            binary: le3
+            artifact: le3-macos-aarch64.dmg
           - runner: windows-latest
             os_slug: windows-x86_64
-            binary: le3.exe
+            artifact: le3-windows-x86_64.exe
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -138,26 +138,24 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
-      - name: Package binary (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p dist
-          cp "target/release/${{ matrix.binary }}" dist/
-          tar czvf "le3-${{ matrix.os_slug }}.tar.gz" -C dist "${{ matrix.binary }}"
+      - name: Package Linux release
+        if: matrix.os_slug == 'linux-x86_64'
+        run: bash scripts/package-release.sh linux
 
-      - name: Package binary (Windows)
-        if: runner.os == 'Windows'
+      - name: Package macOS release
+        if: matrix.os_slug == 'macos-aarch64'
+        run: bash scripts/package-release.sh macos
+
+      - name: Package Windows release
+        if: matrix.os_slug == 'windows-x86_64'
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/release/${{ matrix.binary }}" dist/
-          Compress-Archive -Path "dist/${{ matrix.binary }}" -DestinationPath "le3-${{ matrix.os_slug }}.zip"
+        run: pwsh scripts/package-windows.ps1
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v5
         with:
           name: le3-${{ matrix.os_slug }}
-          path: le3-${{ matrix.os_slug }}.*
+          path: ${{ matrix.artifact }}
 
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
