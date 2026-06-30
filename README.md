@@ -1,23 +1,23 @@
 # LE3 — Local CAD
 
-On-device parametric CAD. See [SPEC.md](SPEC.md) for the full design.
+<p align="center">
+  <img src="src/assets/appicon.png" alt="LE3 app icon" width="128" height="128">
+</p>
+
+Local-first, parametric CAD. Built by robots.
 
 ## Download
 
-Pre-built binaries are published on every push to `master`:
-
 | Platform | Download |
 |----------|----------|
-| Linux (x86_64) | [le3-linux-x86_64.tar.gz](https://github.com/iffy/LE3/releases/latest/download/le3-linux-x86_64.tar.gz) |
 | macOS (Apple Silicon) | [le3-macos-aarch64.dmg](https://github.com/iffy/LE3/releases/latest/download/le3-macos-aarch64.dmg) |
 | Windows (x86_64) | [le3-windows-x86_64.exe](https://github.com/iffy/LE3/releases/latest/download/le3-windows-x86_64.exe) |
+| Linux (x86_64) | [le3-linux-x86_64.tar.gz](https://github.com/iffy/LE3/releases/latest/download/le3-linux-x86_64.tar.gz) |
 
 Extract the Linux archive or mount the macOS disk image, then run `le3`. On Windows,
 download and run `le3-windows-x86_64.exe`.
 
 ## Status
-
-Very early prototype. Currently implemented:
 
 - **GUI** with a **wgpu**-accelerated 3D viewport (orbit/pan/zoom, view cube, HUD bear).
 - **Sketch tools** on construction planes and face-hosted sketches: **rectangle**, **line**,
