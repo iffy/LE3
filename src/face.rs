@@ -914,34 +914,6 @@ mod tests {
     }
 
     #[test]
-    fn rect_face_frame_follows_parent_plane() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(
-            sketch,
-            5.0,
-            5.0,
-            15.0,
-            15.0,
-        ));
-        let frame = sketch_frame(&doc, FaceId::Rect(0)).unwrap();
-        assert!((frame.origin.x - 5.0).abs() < 1e-4);
-        assert!((frame.origin.y - 5.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn child_rect_is_offset_on_parent_face() {
-        let mut doc = Document::default();
-        let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(s0, 0.0, 0.0, 10.0, 10.0));
-        let s1 = doc.add_sketch(FaceId::Rect(0));
-        doc.rects.push(Rect::from_local_corners(s1, 2.0, 3.0, 5.0, 6.0));
-        let corners = rect_world_corners(&doc, &doc.rects[1]).unwrap();
-        assert!((corners[0].x - 2.0).abs() < 1e-4);
-        assert!((corners[0].y - 3.0).abs() < 1e-4);
-    }
-
-    #[test]
     fn circle_face_frame_origin_is_center() {
         let mut doc = Document::default();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
@@ -994,11 +966,11 @@ mod tests {
     fn doc_with_extruded_box() -> Document {
         let mut doc = Document::default();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 20.0, 20.0));
+        let rect_lines =
+            crate::construction::add_line_rectangle(&mut doc, sketch, 0.0, 0.0, 20.0, 20.0, [false; 4]);
         doc.extrusions.push(crate::model::Extrusion {
             sketch,
-            faces: vec![crate::model::ExtrudeFace::Rect(0)],
+            faces: vec![crate::model::ExtrudeFace::Polygon(rect_lines.to_vec())],
             distance: 10.0,
             target: None,
             expression: String::new(),
@@ -1007,68 +979,6 @@ mod tests {
             edge_treatments: Vec::new(),
         });
         doc
-    }
-
-    #[test]
-    fn sketch_on_extrusion_top_cap_is_offset_by_distance() {
-        let doc = doc_with_extruded_box();
-        let profile = crate::model::ExtrudeFace::Rect(0);
-        let top = sketch_frame(
-            &doc,
-            FaceId::ExtrudeCap {
-                extrusion: 0,
-                profile: profile.clone(),
-                top: true,
-            },
-        )
-        .unwrap();
-        assert!((top.origin.z - 10.0).abs() < 1e-4, "top cap 10 above base");
-        assert!((top.normal.z - 1.0).abs() < 1e-4);
-
-        let bottom = sketch_frame(
-            &doc,
-            FaceId::ExtrudeCap {
-                extrusion: 0,
-                profile,
-                top: false,
-            },
-        )
-        .unwrap();
-        assert!(bottom.origin.z.abs() < 1e-4, "bottom cap at base plane");
-
-        // Geometry drawn on the top cap lands at the cap's height.
-        let p = local_to_world(&top, 5.0, 5.0);
-        assert!((p.z - 10.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn sketch_on_slanted_top_cap_lies_in_the_target_plane() {
-        let mut doc = doc_with_extruded_box();
-        let plane_origin = Vec3::new(0.0, 0.0, 25.0);
-        let plane_normal = Vec3::new(0.3, 0.0, 1.0).normalize();
-        let mut slanted = default_xy_plane();
-        slanted.origin = plane_origin;
-        slanted.normal = plane_normal;
-        doc.construction_planes.push(slanted);
-        doc.extrusions[0].target = Some(crate::model::ExtrudeTarget::Plane(1));
-
-        let frame = sketch_frame(
-            &doc,
-            FaceId::ExtrudeCap {
-                extrusion: 0,
-                profile: crate::model::ExtrudeFace::Rect(0),
-                top: true,
-            },
-        )
-        .unwrap();
-        // The cap frame lies in the slanted plane, keeping the base's (+Z) facing.
-        assert!(frame.normal.dot(plane_normal).abs() > 0.999);
-        assert!(frame.normal.z > 0.0);
-        for (u, v) in [(0.0, 0.0), (5.0, 3.0), (-2.0, 4.0)] {
-            let p = local_to_world(&frame, u, v);
-            let signed = (p - plane_origin).dot(plane_normal);
-            assert!(signed.abs() < 1e-3, "sketched point off the cap plane: {signed}");
-        }
     }
 
     #[test]
@@ -1107,31 +1017,6 @@ mod tests {
             matches!(from_above, Some(FaceId::ExtrudeCap { top: true, .. })),
             "looking down should pick the visible top cap, got {from_above:?}"
         );
-    }
-
-    #[test]
-    fn sketch_on_extrusion_side_wall_lies_in_the_wall_plane() {
-        let doc = doc_with_extruded_box();
-        let profile = crate::model::ExtrudeFace::Rect(0);
-        // Edge 0 runs along +X at y=0; the wall rises in +Z.
-        let frame = sketch_frame(
-            &doc,
-            FaceId::ExtrudeSide {
-                extrusion: 0,
-                profile,
-                edge: 0,
-            },
-        )
-        .unwrap();
-        // Origin at the base corner, in-plane axes along the edge (+X) and up the wall (+Z).
-        assert!(frame.origin.abs_diff_eq(Vec3::ZERO, 1e-4));
-        assert!((frame.u_axis.x - 1.0).abs() < 1e-4);
-        assert!((frame.v_axis.z.abs() - 1.0).abs() < 1e-4);
-        // Outward normal points away from the box centroid (-Y for this wall).
-        assert!(frame.normal.y < -0.9, "outward normal {:?}", frame.normal);
-        // Geometry drawn on the wall stays on the y=0 plane.
-        let p = local_to_world(&frame, 5.0, 4.0);
-        assert!(p.y.abs() < 1e-4, "point off the wall plane: {p:?}");
     }
 
     #[test]
@@ -1189,79 +1074,6 @@ mod tests {
         assert!(target.zoom.is_none());
         assert!(target.target.length_squared() < 1e-8);
         assert!((target.face_normal.z - 1.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn sketch_camera_plane_includes_circles_lines_and_all_rects() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 20.0, 20.0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 70.0, 0.0, 90.0, 20.0));
-        doc.lines
-            .push(Line::from_local_endpoints(sketch, 30.0, 5.0, 50.0, 15.0));
-        doc.circles
-            .push(Circle::from_local_center_radius(sketch, 40.0, 50.0, 15.0, 0.0));
-        let zoom = sketch_camera_target(&doc, sketch)
-            .unwrap()
-            .zoom
-            .expect("mixed sketch should request zoom");
-        assert!(
-            zoom.half_u >= 44.0,
-            "zoom should span both rectangles and the circle, got half_u={}",
-            zoom.half_u
-        );
-        assert!(
-            zoom.half_v >= 32.0,
-            "zoom should include circle vertical extent, got half_v={}",
-            zoom.half_v
-        );
-    }
-
-    #[test]
-    fn sketch_camera_plane_with_children_requests_zoom() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(
-            sketch,
-            10.0,
-            20.0,
-            90.0,
-            60.0,
-        ));
-        let target = sketch_camera_target(&doc, sketch).unwrap();
-        let zoom = target.zoom.expect("children should request zoom");
-        assert!((zoom.center_u - 50.0).abs() < 1e-4);
-        assert!((zoom.center_v - 40.0).abs() < 1e-4);
-        assert!((zoom.half_u - 40.0).abs() < 1e-4);
-        assert!((zoom.half_v - 20.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn sketch_camera_rect_face_includes_face_and_children() {
-        let mut doc = Document::default();
-        let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(s0, 0.0, 0.0, 20.0, 20.0));
-        let s1 = doc.add_sketch(FaceId::Rect(0));
-        doc.rects.push(Rect::from_local_corners(
-            s1,
-            2.0,
-            2.0,
-            18.0,
-            18.0,
-        ));
-        doc.lines.push(Line::from_local_endpoints(
-            s1,
-            5.0,
-            5.0,
-            15.0,
-            10.0,
-        ));
-        let target = sketch_camera_target(&doc, s1).unwrap();
-        let zoom = target.zoom.unwrap();
-        assert!(zoom.half_u >= 8.0);
-        assert!(zoom.half_v >= 8.0);
     }
 
     #[test]

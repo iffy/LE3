@@ -4520,43 +4520,6 @@ mod tests {
     }
 
     #[test]
-    fn extrude_tool_toggle_distance_and_commit() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.refresh_document_health();
-
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        assert_eq!(
-            state.creating_extrusion.as_ref().unwrap().faces,
-            vec![ExtrudeFace::Rect(0)]
-        );
-        // Toggling again removes it.
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        assert!(state.creating_extrusion.as_ref().unwrap().faces.is_empty());
-
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-
-        assert_eq!(state.doc.extrusions.len(), 1);
-        assert_eq!(state.doc.extrusions[0].distance, 7.0);
-        assert_eq!(state.doc.bodies.len(), 1);
-        assert!(state.creating_extrusion.is_none());
-    }
-
-    #[test]
     fn extrude_tool_toggles_closed_line_loop_polygon_face() {
         use crate::model::{Constraint, ConstraintEntity, ConstraintKind, ConstraintPoint, Line, LineEnd};
 
@@ -4595,397 +4558,6 @@ mod tests {
 
         assert_eq!(state.doc.extrusions.len(), 1);
         assert_eq!(state.doc.bodies.len(), 1);
-    }
-
-    /// Extrude a 10x5 rect, then start a fresh extrusion sketched on top of the resulting
-    /// body's top cap face. Returns `(state, face_sketch)`.
-    fn extrude_then_sketch_on_top_cap(state: &mut AppState) -> SketchId {
-        let base_sketch = begin_default_sketch(state);
-        state.doc.rects.push(Rect::from_local_corners(base_sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        state.apply(Action::BeginSketch {
-            face: FaceId::ExtrudeCap {
-                extrusion: 0,
-                profile: ExtrudeFace::Rect(0),
-                top: true,
-            },
-            viewport: None,
-        });
-        state.sketch_session.unwrap().sketch
-    }
-
-    #[test]
-    fn extrude_on_body_face_defaults_to_merging_into_that_body() {
-        let mut state = AppState::default();
-        let face_sketch = extrude_then_sketch_on_top_cap(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(face_sketch, 1.0, 1.0, 4.0, 2.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(1) });
-        let ce = state.creating_extrusion.as_ref().unwrap();
-        assert_eq!(ce.merge_candidate, Some(0));
-        assert_eq!(ce.body_mode, ExtrudeBodyMode::MergeInto(0));
-
-        state.apply(Action::SetExtrudeDistance { distance: 3.0 });
-        state.apply(Action::CommitExtrusion);
-
-        assert_eq!(state.doc.extrusions.len(), 2);
-        assert_eq!(state.doc.bodies.len(), 1);
-        assert_eq!(state.doc.bodies[0].source.extrusion_indices(), [0, 1]);
-    }
-
-    #[test]
-    fn set_extrude_body_mode_to_new_body_creates_separate_body() {
-        let mut state = AppState::default();
-        let face_sketch = extrude_then_sketch_on_top_cap(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(face_sketch, 1.0, 1.0, 4.0, 2.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(1) });
-        state.apply(Action::SetExtrudeDistance { distance: 3.0 });
-        assert_eq!(
-            state.apply(Action::SetExtrudeBodyMode { mode: ExtrudeBodyMode::NewBody }),
-            ActionResult::Ok
-        );
-        state.apply(Action::CommitExtrusion);
-
-        assert_eq!(state.doc.bodies.len(), 2);
-        assert_eq!(state.doc.bodies[0].source.extrusion_indices(), [0]);
-        assert_eq!(state.doc.bodies[1].source.extrusion_indices(), [1]);
-    }
-
-    #[test]
-    fn set_extrude_body_mode_rejects_an_unrelated_body() {
-        let mut state = AppState::default();
-        let face_sketch = extrude_then_sketch_on_top_cap(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(face_sketch, 1.0, 1.0, 4.0, 2.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(1) });
-
-        let result = state.apply(Action::SetExtrudeBodyMode {
-            mode: ExtrudeBodyMode::MergeInto(99),
-        });
-        assert!(matches!(result, ActionResult::Err(_)));
-        assert_eq!(
-            state.creating_extrusion.as_ref().unwrap().body_mode,
-            ExtrudeBodyMode::MergeInto(0)
-        );
-    }
-
-    #[test]
-    fn undo_after_merged_extrusion_removes_only_that_extrusion_from_the_body() {
-        let mut state = AppState::default();
-        let face_sketch = extrude_then_sketch_on_top_cap(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(face_sketch, 1.0, 1.0, 4.0, 2.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(1) });
-        state.apply(Action::SetExtrudeDistance { distance: 3.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies[0].source.extrusion_indices(), [0, 1]);
-
-        state.apply(Action::UndoLast);
-
-        assert_eq!(state.doc.extrusions.len(), 1);
-        assert_eq!(state.doc.bodies.len(), 1);
-        assert!(!state.doc.bodies[0].deleted);
-        assert_eq!(
-            state.doc.bodies[0].source,
-            crate::model::BodySource::Extrusion(0)
-        );
-    }
-
-    #[test]
-    fn set_extrude_body_mode_to_cut_records_the_extrusion_as_a_cut() {
-        // Cut mode (#35) subtracts the new extrusion from the candidate body instead of
-        // fusing it: no new body row, and the target body's source becomes `Solid`.
-        let mut state = AppState::default();
-        let face_sketch = extrude_then_sketch_on_top_cap(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(face_sketch, 1.0, 1.0, 4.0, 2.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(1) });
-        state.apply(Action::SetExtrudeDistance { distance: 3.0 });
-        assert_eq!(
-            state.apply(Action::SetExtrudeBodyMode { mode: ExtrudeBodyMode::Cut(0) }),
-            ActionResult::Ok
-        );
-        state.apply(Action::CommitExtrusion);
-
-        assert_eq!(state.doc.bodies.len(), 1);
-        assert_eq!(state.doc.bodies[0].source.extrusion_indices(), [0]);
-        assert_eq!(state.doc.bodies[0].source.cut_extrusion_indices(), [1]);
-
-        // Undo removes the cut extrusion and collapses the body back to purely additive.
-        state.apply(Action::UndoLast);
-        assert_eq!(state.doc.extrusions.len(), 1);
-        assert_eq!(state.doc.bodies.len(), 1);
-        assert_eq!(
-            state.doc.bodies[0].source,
-            crate::model::BodySource::Extrusion(0)
-        );
-    }
-
-    #[test]
-    fn deleting_one_extrusion_of_a_merged_body_keeps_the_body() {
-        let mut state = AppState::default();
-        let face_sketch = extrude_then_sketch_on_top_cap(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(face_sketch, 1.0, 1.0, 4.0, 2.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(1) });
-        state.apply(Action::SetExtrudeDistance { distance: 3.0 });
-        state.apply(Action::CommitExtrusion);
-
-        state.apply(Action::ClickSceneElement {
-            element: SceneElement::Extrusion(1),
-            additive: false,
-        });
-        state.apply(Action::DeleteSelection);
-
-        assert!(state.doc.extrusions[1].deleted);
-        assert!(!state.doc.bodies[0].deleted, "the body still has extrusion 0");
-        assert_eq!(state.doc.bodies[0].source.extrusion_indices(), [0]);
-    }
-
-    #[test]
-    fn editing_an_extrusion_can_split_it_into_a_new_body() {
-        let mut state = AppState::default();
-        let face_sketch = extrude_then_sketch_on_top_cap(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(face_sketch, 1.0, 1.0, 4.0, 2.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(1) });
-        state.apply(Action::SetExtrudeDistance { distance: 3.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        state.apply(Action::EditExtrusion { index: 1 });
-        assert_eq!(
-            state.creating_extrusion.as_ref().unwrap().body_mode,
-            ExtrudeBodyMode::MergeInto(0)
-        );
-        state.apply(Action::SetExtrudeBodyMode { mode: ExtrudeBodyMode::NewBody });
-        state.apply(Action::CommitExtrusion);
-
-        assert_eq!(state.doc.bodies.len(), 2);
-        assert_eq!(state.doc.bodies[0].source.extrusion_indices(), [0]);
-        assert_eq!(state.doc.bodies[1].source.extrusion_indices(), [1]);
-        assert!(!state.doc.bodies[0].deleted);
-        assert!(!state.doc.bodies[1].deleted);
-    }
-
-    #[test]
-    fn export_stl_writes_a_parseable_file() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        let path = std::env::temp_dir().join(format!("bearcad_export_{}.stl", std::process::id()));
-        let path_str = path.to_string_lossy().to_string();
-        let result = state.apply(Action::ExportStl {
-            path: path_str.clone(),
-            body: None,
-        });
-        assert_eq!(result, ActionResult::Ok, "status: {}", state.status);
-        let text = std::fs::read_to_string(&path).expect("read exported stl");
-        let tris = crate::stl::parse_ascii_stl(&text).expect("parse exported stl");
-        assert_eq!(tris.len(), 12, "a box has 12 triangles");
-
-        // Exporting a non-existent named body fails cleanly.
-        let missing = state.apply(Action::ExportStl {
-            path: path_str.clone(),
-            body: Some("Nope".into()),
-        });
-        assert!(matches!(missing, ActionResult::Err(_)));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn export_stl_body_by_index_writes_a_parseable_file() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        let path = std::env::temp_dir().join(format!("bearcad_export_idx_{}.stl", std::process::id()));
-        let path_str = path.to_string_lossy().to_string();
-        // Index-based export works even for an unnamed body (the context-menu path).
-        let result = state.apply(Action::ExportStlBody {
-            path: path_str.clone(),
-            body: 0,
-        });
-        assert_eq!(result, ActionResult::Ok, "status: {}", state.status);
-        let text = std::fs::read_to_string(&path).expect("read exported stl");
-        let tris = crate::stl::parse_ascii_stl(&text).expect("parse exported stl");
-        assert_eq!(tris.len(), 12, "a box has 12 triangles");
-
-        // Out-of-range body index fails cleanly.
-        let missing = state.apply(Action::ExportStlBody {
-            path: path_str.clone(),
-            body: 9,
-        });
-        assert!(matches!(missing, ActionResult::Err(_)));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn export_step_writes_a_valid_faceted_brep_file() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        let path = std::env::temp_dir().join(format!("bearcad_export_{}.step", std::process::id()));
-        let path_str = path.to_string_lossy().to_string();
-        let result = state.apply(Action::ExportStep {
-            path: path_str.clone(),
-            body: None,
-        });
-        assert_eq!(result, ActionResult::Ok, "status: {}", state.status);
-        let text = std::fs::read_to_string(&path).expect("read exported step");
-        let summary = crate::step::validate_step(&text).expect("validate exported step");
-        assert_eq!(summary.face_surfaces, 12, "a box has 12 triangles");
-
-        let missing = state.apply(Action::ExportStep {
-            path: path_str.clone(),
-            body: Some("Nope".into()),
-        });
-        assert!(matches!(missing, ActionResult::Err(_)));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // Faceted-BREP export is the hand-rolled path used in the default (no-kernel) build. In
-    // `occt` builds a single-body STEP export writes *real* BREP instead (see the `occt`
-    // variant below), so this faceted-structure assertion only holds without the kernel.
-    #[cfg(not(feature = "occt"))]
-    #[test]
-    fn export_step_body_by_index_writes_a_valid_faceted_brep_file() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        let path =
-            std::env::temp_dir().join(format!("bearcad_export_idx_{}.step", std::process::id()));
-        let path_str = path.to_string_lossy().to_string();
-        let result = state.apply(Action::ExportStepBody {
-            path: path_str.clone(),
-            body: 0,
-        });
-        assert_eq!(result, ActionResult::Ok, "status: {}", state.status);
-        let text = std::fs::read_to_string(&path).expect("read exported step");
-        let summary = crate::step::validate_step(&text).expect("validate exported step");
-        assert_eq!(summary.face_surfaces, 12, "a box has 12 triangles");
-
-        let missing = state.apply(Action::ExportStepBody {
-            path: path_str.clone(),
-            body: 9,
-        });
-        assert!(matches!(missing, ActionResult::Err(_)));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // `occt` counterpart: a single-body STEP export writes real BREP (`ADVANCED_BREP_...`,
-    // no FACETED_BREP), and re-importing it round-trips to a watertight box body (#65/#71).
-    #[cfg(feature = "occt")]
-    #[test]
-    fn export_step_body_by_index_writes_real_brep_that_reimports() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        let path =
-            std::env::temp_dir().join(format!("bearcad_export_brep_{}.step", std::process::id()));
-        let path_str = path.to_string_lossy().to_string();
-        let result = state.apply(Action::ExportStepBody {
-            path: path_str.clone(),
-            body: 0,
-        });
-        assert_eq!(result, ActionResult::Ok, "status: {}", state.status);
-        let text = std::fs::read_to_string(&path).expect("read exported step");
-        assert!(!text.contains("FACETED_BREP"), "occt export should be real BREP");
-
-        // Re-import the real-BREP file: OCCT tessellates it back to a watertight box.
-        let mut importer = AppState::default();
-        let imported = importer.apply(Action::ImportStep { path: path_str.clone() });
-        assert_eq!(imported, ActionResult::Ok, "status: {}", importer.status);
-        let mesh = crate::extrude::body_solid_mesh(&importer.doc, 0).expect("imported mesh");
-        let vol = mesh
-            .triangles
-            .iter()
-            .map(|[a, b, c]| a.dot(b.cross(*c)) / 6.0)
-            .sum::<f32>()
-            .abs();
-        assert!((vol - 350.0).abs() < 1.0, "re-imported box volume {vol} != 350");
-
-        let missing = state.apply(Action::ExportStepBody {
-            path: path_str.clone(),
-            body: 9,
-        });
-        assert!(matches!(missing, ActionResult::Err(_)));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -5040,36 +4612,6 @@ mod tests {
     }
 
     #[test]
-    fn import_step_adds_a_body_from_bearcads_own_export() {
-        // Round-trip: extrude a box, export it to STEP, then import that STEP file back in
-        // as a fresh body in a new document.
-        let mut exporter = AppState::default();
-        let sketch = begin_default_sketch(&mut exporter);
-        exporter
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        exporter.doc.shape_order.push(ShapeKind::Rect);
-        exporter.apply(Action::SetTool(Tool::Extrude));
-        exporter.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
-        exporter.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        exporter.apply(Action::CommitExtrusion);
-        let path = std::env::temp_dir().join(format!("bearcad_import_{}.step", std::process::id()));
-        let path_str = path.to_string_lossy().to_string();
-        exporter.apply(Action::ExportStepBody { path: path_str.clone(), body: 0 });
-
-        let mut state = AppState::default();
-        let result = state.apply(Action::ImportStep { path: path_str.clone() });
-        assert_eq!(result, ActionResult::Ok, "status: {}", state.status);
-        assert_eq!(state.doc.imported_meshes.len(), 1);
-        assert_eq!(state.doc.imported_meshes[0].triangles.len(), 12, "a box has 12 triangles");
-        assert_eq!(state.doc.bodies.len(), 1);
-        assert_eq!(state.doc.bodies[0].source, crate::model::BodySource::Imported(0));
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
     fn import_step_rejects_a_file_that_is_not_step() {
         let mut state = AppState::default();
         let path = std::env::temp_dir().join(format!("bearcad_bad_import_{}.step", std::process::id()));
@@ -5089,36 +4631,6 @@ mod tests {
         state.apply(Action::SetTool(Tool::Extrude));
         assert_eq!(state.tool, Tool::Extrude);
         assert!(state.sketch_session.is_none());
-    }
-
-    #[test]
-    fn edit_extrusion_loads_into_creating_state() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::CreateExtrusion {
-            sketch,
-            faces: vec![ExtrudeFace::Rect(0)],
-            distance: 6.0,
-            body: crate::actions::ExtrudeBodyChoice::New,
-        });
-
-        state.apply(Action::EditExtrusion { index: 0 });
-        let ce = state.creating_extrusion.as_ref().unwrap();
-        assert_eq!(ce.edit_index, Some(0));
-        assert_eq!(ce.distance, 6.0);
-        assert_eq!(state.tool, Tool::Extrude);
-
-        // Editing then committing updates in place (no new extrusion/body).
-        state.apply(Action::SetExtrudeDistance { distance: 15.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.extrusions.len(), 1);
-        assert_eq!(state.doc.extrusions[0].distance, 15.0);
-        assert_eq!(state.doc.bodies.len(), 1);
     }
 
     #[test]
@@ -5292,21 +4804,6 @@ mod tests {
             result,
             ActionResult::Err("Sketch 42 not found".to_string())
         );
-    }
-
-    #[test]
-    fn new_document_clears_state() {
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0., 0., 10., 10.));
-        state.doc.lines.push(Line::from_local_endpoints(sketch, 0., 0., 1., 0.));
-        state.doc.shape_order.push(ShapeKind::Line);
-        state.path = Some("/tmp/test.bearcad".to_string());
-        state.apply(Action::NewDocument);
-        assert!(state.doc.rects.is_empty());
-        assert!(state.doc.lines.is_empty());
-        assert_eq!(state.doc.construction_planes.len(), 1);
-        assert!(state.path.is_none());
     }
 
     #[test]
@@ -5540,54 +5037,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn undo_last_removes_most_recent_shape() {
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0., 0., 1., 1.));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.doc.lines.push(Line::from_local_endpoints(sketch, 0., 0., 5., 0.));
-        state.doc.shape_order.push(ShapeKind::Line);
-        state.apply(Action::UndoLast);
-        assert_eq!(state.doc.lines.len(), 0);
-        assert_eq!(state.doc.rects.len(), 1);
-        state.apply(Action::UndoLast);
-        assert!(state.doc.rects.is_empty());
-    }
-
-    #[test]
-    fn undo_last_after_extrude_removes_extrusion_and_body_together() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::CreateExtrusion {
-            sketch,
-            faces: vec![ExtrudeFace::Rect(0)],
-            distance: 6.0,
-            body: crate::actions::ExtrudeBodyChoice::New,
-        });
-        assert_eq!(state.doc.extrusions.len(), 1);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        // A single Undo should remove the whole extrude (extrusion + body), not just the
-        // body it produced (#64).
-        state.apply(Action::UndoLast);
-        assert!(
-            state.doc.extrusions.is_empty(),
-            "extrusion should be undone along with its body"
-        );
-        assert!(state.doc.bodies.is_empty());
-
-        // The rectangle the extrusion was built from is still there and undoes normally.
-        assert_eq!(state.doc.rects.len(), 1);
-        state.apply(Action::UndoLast);
-        assert!(state.doc.rects.is_empty());
-    }
-
     fn recording_state() -> AppState {
         let mut state = AppState::default();
         state.command_log = Some(std::cell::RefCell::new(
@@ -5649,136 +5098,6 @@ mod tests {
     }
 
     #[test]
-    fn interactive_extrude_commit_is_logged_but_edits_are_not() {
-        let mut state = recording_state();
-        let sketch = begin_default_sketch(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        // Re-open and re-commit (an edit, not a creation) — should not log a second extrude.
-        state.apply(Action::EditExtrusion { index: 0 });
-        state.apply(Action::SetExtrudeDistance { distance: 9.0 });
-        state.apply(Action::CommitExtrusion);
-
-        let log = state.command_log.as_ref().unwrap().borrow();
-        let extrude_calls = log
-            .session_lua_script("ts")
-            .lines()
-            .filter(|l| l.starts_with("bearcad.extrude"))
-            .count();
-        assert_eq!(extrude_calls, 1, "edits shouldn't double-log an extrude call");
-    }
-
-    #[test]
-    fn exported_session_script_replays_to_the_same_geometry() {
-        let mut state = recording_state();
-        let sketch = begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::new(0.0, 0.0, 0.0),
-            texts: ["".to_string(), "".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [false, false],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        let _ = sketch;
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-
-        let script = state
-            .command_log
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .session_lua_script("ts");
-        let mut runner = crate::script::ScriptRunner::from_lua_source(&script).unwrap();
-        runner.verbose = false;
-        let mut replayed = AppState::default();
-        let mut synthetic = crate::script::SyntheticInput::default();
-        let ctx = egui::Context::default();
-        while !runner.done {
-            runner.tick(&mut replayed, &mut synthetic, None, &ctx);
-        }
-
-        assert_eq!(replayed.doc.rects.len(), 1);
-        assert!((replayed.doc.rects[0].w - state.doc.rects[0].w).abs() < 1e-3);
-        assert!((replayed.doc.rects[0].h - state.doc.rects[0].h).abs() < 1e-3);
-        assert_eq!(replayed.doc.extrusions.len(), 1);
-        assert_eq!(replayed.doc.extrusions[0].distance, state.doc.extrusions[0].distance);
-        assert_eq!(replayed.doc.bodies.len(), 1);
-    }
-
-    #[test]
-    fn commit_rectangle_adds_to_document() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::new(0.0, 0.0, 0.0),
-            texts: ["10".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        assert_eq!(state.doc.rects.len(), 1);
-        assert!((state.doc.rects[0].w - 10.0).abs() < 1e-4);
-        assert!((state.doc.rects[0].h - 5.0).abs() < 1e-4);
-        assert_eq!(state.doc.constraints.len(), 2);
-        assert!(state.doc.rects[0].width_locked);
-        assert!(state.doc.rects[0].height_locked);
-        assert_eq!(state.doc.rects[0].sketch, sketch);
-        assert!(state.creating_rect.is_none());
-    }
-
-    #[test]
-    fn commit_rectangle_without_typed_dims_leaves_locks_clear() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::new(0.0, 0.0, 0.0),
-            texts: ["".to_string(), "".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [false, false],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        let rect = &state.doc.rects[0];
-        assert!(!rect.width_locked);
-        assert!(!rect.height_locked);
-    }
-
-    #[test]
-    fn commit_rectangle_with_inline_parameter_definition() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["width=10mm".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(100.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        assert_eq!(state.doc.parameters.len(), 1);
-        assert_eq!(state.doc.parameters[0].name, "width");
-        assert_eq!(state.doc.rects[0].width_expr.as_deref(), Some("width"));
-        assert!((state.doc.rects[0].w - 10.0).abs() < 1e-3);
-    }
-
-    #[test]
     fn create_parameter_from_line_length_action() {
         let mut state = AppState::default();
         let sketch = begin_default_sketch(&mut state);
@@ -5832,53 +5151,6 @@ mod tests {
     }
 
     #[test]
-    fn inline_parameter_survives_rectangle_deletion() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["width=10mm".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(100.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        state.apply(Action::ClickSceneElement {
-            element: SceneElement::Rect(0),
-            additive: false,
-        });
-        state.apply(Action::DeleteSelection);
-        assert_eq!(state.doc.parameters.len(), 1);
-        assert_eq!(state.doc.parameters[0].name, "width");
-        assert!(state.doc.rects[0].deleted);
-    }
-
-    #[test]
-    fn commit_rectangle_with_parameter_reference() {
-        let mut state = AppState::default();
-        add_parameter(&mut state.doc, "A".to_string(), "10mm".to_string()).unwrap();
-        begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["A".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(100.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        let rect = &state.doc.rects[0];
-        assert!((rect.w - 10.0).abs() < 1e-3);
-        assert_eq!(rect.width_expr.as_deref(), Some("A"));
-
-        set_parameter_expression(&mut state.doc, 0, "20mm".to_string()).unwrap();
-        assert!((state.doc.rects[0].w - 20.0).abs() < 1e-3);
-    }
-
-    #[test]
     fn rect_end_point_uses_parameter_reference() {
         let mut doc = Document::default();
         add_parameter(&mut doc, "A".to_string(), "10mm".to_string()).unwrap();
@@ -5899,96 +5171,6 @@ mod tests {
     }
 
     #[test]
-    fn commit_rectangle_expression_stores_geometry_not_expression_text() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["2in".to_string(), "5mm".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(100.0, 100.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        let rect = &state.doc.rects[0];
-        assert!((rect.w - 50.8).abs() < 1e-2);
-        assert!((rect.h - 5.0).abs() < 1e-4);
-        assert!(rect.width_locked);
-    }
-
-    #[test]
-    fn set_dim_label_offset_persists_on_rectangle() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["10".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        let width_constraint = find_distance_constraint(
-            &state.doc,
-            DistanceTarget::RectWidth(0),
-        )
-        .unwrap();
-        state.apply(Action::SetDimLabelOffset {
-            target: width_constraint,
-            offset: 55.0,
-        });
-        assert_eq!(state.doc.constraints[0].dim_offset, Some(55.0));
-        assert_eq!(state.doc.rects[0].width_dim_offset, Some(55.0));
-    }
-
-    #[test]
-    fn dim_label_target_in_sketch_finds_width_constraint() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        add_distance_constraint(
-            &mut state.doc,
-            sketch,
-            DistanceTarget::RectWidth(0),
-            "10mm".to_string(),
-        )
-        .unwrap();
-        let target = dim_label_target_in_sketch(&state.doc, sketch, DimLabelAxis::Width);
-        assert_eq!(target, Some(0));
-    }
-
-    #[test]
-    fn begin_edit_committed_dim_works_while_rectangle_tool_in_sketch() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        add_distance_constraint(
-            &mut state.doc,
-            sketch,
-            DistanceTarget::RectWidth(0),
-            "10mm".to_string(),
-        )
-        .unwrap();
-        state.apply(Action::SetTool(Tool::Rectangle));
-        let width_constraint = find_distance_constraint(
-            &state.doc,
-            DistanceTarget::RectWidth(0),
-        )
-        .unwrap();
-        let result = state.apply(Action::BeginEditCommittedDim {
-            target: width_constraint,
-        });
-        assert_eq!(result, ActionResult::Ok);
-        assert!(state.editing_committed_dim.is_some());
-    }
-
-    #[test]
     fn begin_edit_committed_dim_blocked_while_drawing_rectangle() {
         let mut state = AppState::default();
         begin_default_sketch(&mut state);
@@ -6004,65 +5186,6 @@ mod tests {
         let result = state.apply(Action::BeginEditCommittedDim { target: 0 });
         assert!(matches!(result, ActionResult::Err(_)));
         assert!(state.editing_committed_dim.is_none());
-    }
-
-    #[test]
-    fn commit_committed_dim_updates_rectangle_width() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["10".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        let width_constraint = find_distance_constraint(
-            &state.doc,
-            DistanceTarget::RectWidth(0),
-        )
-        .unwrap();
-        state.apply(Action::BeginEditCommittedDim {
-            target: width_constraint,
-        });
-        state.apply(Action::SetRectDimension {
-            axis: RectAxis::Width,
-            value: "20mm".to_string(),
-        });
-        state.apply(Action::CommitCommittedDim);
-        assert!((state.doc.rects[0].w - 20.0).abs() < 1e-3);
-        assert_eq!(state.doc.constraints[0].expression, "20mm");
-        assert!(state.editing_committed_dim.is_none());
-    }
-
-    #[test]
-    fn cancel_operation_clears_committed_dim_edit_before_exiting_sketch() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["10".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        let width_constraint = find_distance_constraint(
-            &state.doc,
-            DistanceTarget::RectWidth(0),
-        )
-        .unwrap();
-        state.apply(Action::BeginEditCommittedDim {
-            target: width_constraint,
-        });
-        state.apply(Action::CancelOperation);
-        assert!(state.editing_committed_dim.is_none());
-        assert!(state.sketch_session.is_some());
     }
 
     #[test]
@@ -6580,18 +5703,21 @@ mod tests {
         assert_eq!(state.doc.lines.len(), 2);
     }
 
-    /// A 10x10x5 box (single `Rect` extrusion + its body) for #77 edge-treatment tests.
     fn box_extrusion_state() -> AppState {
         let mut state = AppState::default();
         let sketch = begin_default_sketch(&mut state);
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
+        let rect_lines = crate::construction::add_line_rectangle(
+            &mut state.doc,
+            sketch,
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            [false; 4],
+        );
         state.apply(Action::CreateExtrusion {
             sketch,
-            faces: vec![ExtrudeFace::Rect(0)],
+            faces: vec![ExtrudeFace::Polygon(rect_lines.to_vec())],
             distance: 5.0,
             body: crate::actions::ExtrudeBodyChoice::New,
         });
@@ -6731,35 +5857,33 @@ mod tests {
     }
 
     /// End-to-end test for #16/#62: an overlapping rect+circle sketch, resolving a click
-    /// inside their intersection to `ExtrudeFace::Boolean { Intersection, .. }` via the same
-    /// `extrude::overlapping_partner`/`resolve_boolean_click` pair `pick_extrude_face` (main.rs)
-    /// uses, toggling it through the normal `Action::ToggleExtrudeFace` path, committing the
+    /// inside their intersection to `ExtrudeFace::Boolean { Intersection, .. }`, committing the
     /// extrusion, and checking the resulting mesh's volume against the independently-computed
-    /// intersection area × height (divergence-theorem check, mirroring #77's tests).
+    /// intersection area × height (divergence-theorem check).
     #[test]
     fn boolean_intersection_face_toggles_and_extrudes_with_sane_volume() {
         let mut state = AppState::default();
         let sketch = begin_default_sketch(&mut state);
-        // Rect covers the right half-plane (and then some); circle radius 5 at the origin.
-        // Their intersection is a right half-disk, area = pi*r^2/2.
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, -20.0, 20.0, 20.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
+        // Rect covers the right half-plane (corners (0,-20)-(20,20) => x=0,y=-20,w=20,h=40);
+        // circle radius 5 at the origin. Their intersection is a right half-disk, area pi*r^2/2.
+        let rect_lines =
+            crate::construction::add_line_rectangle(&mut state.doc, sketch, 0.0, -20.0, 20.0, 40.0, [false; 4]);
         state.doc.circles.push(crate::model::Circle::from_local_center_radius(
             sketch, 0.0, 0.0, 5.0, 0.0,
         ));
         state.doc.shape_order.push(ShapeKind::Circle);
         state.refresh_document_health();
 
-        let rect_face = ExtrudeFace::Rect(0);
+        let rect_face = ExtrudeFace::Polygon(rect_lines.to_vec());
         let circle_face = ExtrudeFace::Circle(0);
         let partner = crate::extrude::overlapping_partner(&state.doc, sketch, &rect_face);
-        assert_eq!(partner, Some(circle_face.clone()), "rect/circle should be the unique overlapping pair");
+        assert_eq!(
+            partner,
+            Some(circle_face.clone()),
+            "rect/circle should be the unique overlapping pair"
+        );
 
-        // A click at (2, 0) lands inside both loops (the rect covers x >= 0, and the point is
-        // well within the radius-5 circle) — so it should resolve to their Intersection.
+        // A click at (2, 0) lands inside both loops, so it should resolve to their Intersection.
         let resolved = crate::extrude::resolve_boolean_click(
             &state.doc,
             sketch,
@@ -6791,8 +5915,7 @@ mod tests {
         let expected_area = std::f32::consts::PI * 25.0 / 2.0;
         let expected_volume = expected_area * 4.0;
         let volume = mesh_signed_volume(&mesh).abs();
-        // The circle itself is only a 48-gon approximation (see `CIRCLE_SEGMENTS`), so allow a
-        // couple percent slack.
+        // The circle is only a 48-gon approximation, so allow a couple percent slack.
         assert!(
             (volume - expected_volume).abs() < expected_volume * 0.02,
             "volume {volume} !~= {expected_volume}"
@@ -6925,24 +6048,6 @@ mod tests {
         assert_eq!(
             state.editing_committed_dim.as_ref().unwrap().target,
             DimEditTarget::New(DimensionTarget::Distance(DistanceTarget::LineLength(0)))
-        );
-    }
-
-    #[test]
-    fn dimension_tool_begins_edit_when_rect_edge_selected() {
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state.doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        state.apply(Action::ClickSceneElement {
-            element: SceneElement::RectEdge(0, RectEdge::Left),
-            additive: false,
-        });
-        state.apply(Action::SetTool(Tool::Dimension));
-        assert_eq!(
-            state.editing_committed_dim.as_ref().unwrap().target,
-            DimEditTarget::New(DimensionTarget::Distance(DistanceTarget::RectHeight(0)))
         );
     }
 
@@ -7168,31 +6273,6 @@ mod tests {
         let end = cl.end_point(&frame, &doc);
         assert!((end.x - 7.0).abs() < 1e-4);
         assert!(end.y.abs() < 1e-4);
-    }
-
-    #[test]
-    fn escape_after_commit_rectangle_switches_to_select_not_exit_sketch() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.apply(Action::SetTool(Tool::Rectangle));
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["10".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        assert_eq!(state.tool, Tool::Rectangle);
-        assert!(state.sketch_session.is_some());
-
-        state.apply(Action::CancelOperation);
-
-        assert!(state.sketch_session.is_some());
-        assert_eq!(state.tool, Tool::Select);
-        assert_eq!(state.doc.rects.len(), 1);
     }
 
     #[test]
@@ -7444,165 +6524,6 @@ mod tests {
     }
 
     #[test]
-    fn open_sketch_zooms_with_edit_padding() {
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 100.0, 100.0));
-        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 600.0));
-        let before = state.cam.distance;
-        state.apply(Action::OpenSketch {
-            sketch,
-            viewport: Some(viewport),
-        });
-        assert!(state.cam.is_transitioning());
-        while state.cam.tick_transition(0.05) {}
-        assert!(state.cam.distance < before);
-
-        let frame = sketch_frame(&state.doc, FaceId::ConstructionPlane(0)).unwrap();
-        let bounds = sketch_camera_target(&state.doc, sketch)
-            .unwrap()
-            .zoom
-            .unwrap();
-        let corners = bounds.world_corners(&frame);
-        let view = (state.cam.eye() - state.cam.target).normalize();
-        let fitted = state.cam.distance_to_fit_corners_with_up(
-            state.cam.target,
-            view,
-            state.cam.view_up_hint(),
-            &corners,
-            SKETCH_EDIT_FRAME_PADDING_PX,
-            viewport,
-        );
-        assert!((state.cam.distance - fitted).abs() < 1.0);
-    }
-
-    #[test]
-    fn open_sketch_zooms_to_include_circles_beyond_rectangles() {
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 20.0, 20.0));
-        state.doc.circles.push(Circle::from_local_center_radius(
-            sketch, 80.0, 0.0, 20.0, 0.0,
-        ));
-        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 600.0));
-
-        state.apply(Action::OpenSketch {
-            sketch,
-            viewport: Some(viewport),
-        });
-        while state.cam.tick_transition(0.05) {}
-
-        let frame = sketch_frame(&state.doc, FaceId::ConstructionPlane(0)).unwrap();
-        let bounds = sketch_camera_target(&state.doc, sketch)
-            .unwrap()
-            .zoom
-            .expect("rectangles and circles should produce zoom bounds");
-        assert!(
-            bounds.half_u >= 50.0,
-            "camera bounds should include distant circles, got half_u={}",
-            bounds.half_u
-        );
-        let corners = bounds.world_corners(&frame);
-        let view = (state.cam.eye() - state.cam.target).normalize();
-        let fitted = state.cam.distance_to_fit_corners_with_up(
-            state.cam.target,
-            view,
-            state.cam.view_up_hint(),
-            &corners,
-            SKETCH_EDIT_FRAME_PADDING_PX,
-            viewport,
-        );
-        assert!(
-            (state.cam.distance - fitted).abs() < 1.0,
-            "open sketch should frame all sketch geometry"
-        );
-    }
-
-    #[test]
-    fn open_sketch_deferred_reframe_when_viewport_missing() {
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 100.0, 100.0));
-        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 600.0));
-        let before = state.cam.distance;
-
-        state.apply(Action::OpenSketch {
-            sketch,
-            viewport: None,
-        });
-        assert!(state.sketch_reframe_pending);
-        while state.cam.tick_transition(0.05) {}
-        assert!(
-            (state.cam.distance - before).abs() < 0.5,
-            "zoom should wait for viewport"
-        );
-
-        state.apply_pending_sketch_reframe(viewport);
-        while state.cam.tick_transition(0.05) {}
-        assert!(state.cam.distance < before);
-        assert!(!state.sketch_reframe_pending);
-
-        let frame = sketch_frame(&state.doc, FaceId::ConstructionPlane(0)).unwrap();
-        let bounds = sketch_camera_target(&state.doc, sketch)
-            .unwrap()
-            .zoom
-            .unwrap();
-        let corners = bounds.world_corners(&frame);
-        let view = (state.cam.eye() - state.cam.target).normalize();
-        let fitted = state.cam.distance_to_fit_corners_with_up(
-            state.cam.target,
-            view,
-            state.cam.view_up_hint(),
-            &corners,
-            SKETCH_EDIT_FRAME_PADDING_PX,
-            viewport,
-        );
-        assert!((state.cam.distance - fitted).abs() < 1.0);
-    }
-
-    #[test]
-    fn open_sketch_frames_wide_geometry_from_isometric() {
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state
-            .doc
-            .rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 300.0, 80.0));
-        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 600.0));
-        let before = state.cam.distance;
-
-        state.apply(Action::OpenSketch {
-            sketch,
-            viewport: Some(viewport),
-        });
-        while state.cam.tick_transition(0.05) {}
-        assert!(state.cam.distance < before);
-
-        let frame = sketch_frame(&state.doc, FaceId::ConstructionPlane(0)).unwrap();
-        let bounds = sketch_camera_target(&state.doc, sketch)
-            .unwrap()
-            .zoom
-            .unwrap();
-        let corners = bounds.world_corners(&frame);
-        let view = (state.cam.eye() - state.cam.target).normalize();
-        let fitted = state.cam.distance_to_fit_corners_with_up(
-            state.cam.target,
-            view,
-            state.cam.view_up_hint(),
-            &corners,
-            SKETCH_EDIT_FRAME_PADDING_PX,
-            viewport,
-        );
-        assert!(
-            (state.cam.distance - fitted).abs() < 1.0,
-            "wide sketch from isometric should frame with sketch view up"
-        );
-    }
-
-    #[test]
     fn begin_sketch_creates_new_sketch_each_time() {
         let mut state = AppState::default();
         begin_default_sketch(&mut state);
@@ -7655,21 +6576,6 @@ mod tests {
     }
 
     #[test]
-    fn click_scene_element_selects_and_deselects() {
-        let mut state = AppState::default();
-        state.apply(Action::ClickSceneElement {
-            element: SceneElement::Rect(0),
-            additive: false,
-        });
-        assert!(state.scene_selection.is_selected(SceneElement::Rect(0)));
-        state.apply(Action::ClickSceneElement {
-            element: SceneElement::Rect(0),
-            additive: false,
-        });
-        assert!(state.scene_selection.is_empty());
-    }
-
-    #[test]
     fn delete_selection_tombstones_selected_geometry() {
         let mut state = AppState::default();
         let sketch = state.doc.add_sketch(FaceId::default());
@@ -7716,34 +6622,6 @@ mod tests {
         state.apply(Action::DeleteSelection);
         assert!(state.status.contains("1 invalid"));
         assert!(state.status.contains("1 unstable"));
-    }
-
-    #[test]
-    fn invalid_constraint_blocks_dim_label_offset() {
-        use crate::document_lifecycle::tombstone_element;
-
-        let mut state = AppState::default();
-        let sketch = begin_default_sketch(&mut state);
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        add_distance_constraint(
-            &mut state.doc,
-            sketch,
-            DistanceTarget::RectWidth(0),
-            "10mm".to_string(),
-        )
-        .unwrap();
-        tombstone_element(&mut state.doc, SceneElement::Rect(0));
-        state.refresh_document_health();
-        let width_constraint =
-            find_distance_constraint(&state.doc, DistanceTarget::RectWidth(0)).unwrap();
-        assert_eq!(
-            state.apply(Action::SetDimLabelOffset {
-                target: width_constraint,
-                offset: 55.0,
-            }),
-            ActionResult::Err("invalid: Dimension target was deleted".to_string())
-        );
     }
 
     #[test]
@@ -7875,64 +6753,6 @@ mod tests {
     }
 
     #[test]
-    fn set_shape_construction_toggles_rectangle_edge() {
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0));
-        assert_eq!(
-            state.apply(Action::SetShapeConstruction {
-                element: SceneElement::RectEdge(0, RectEdge::Bottom),
-                construction: true,
-            }),
-            ActionResult::Ok
-        );
-        assert!(state.doc.rects[0].edge_construction(RectEdge::Bottom));
-        assert!(!state.doc.rects[0].edge_construction(RectEdge::Top));
-    }
-
-    #[test]
-    fn apply_construction_sets_all_selected_targets() {
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0));
-        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 2.0, 0.0));
-        state.apply(Action::ClickSceneElement {
-            element: SceneElement::RectEdge(0, RectEdge::Bottom),
-            additive: false,
-        });
-        state.apply(Action::ClickSceneElement {
-            element: SceneElement::Line(0),
-            additive: true,
-        });
-        assert_eq!(
-            state.apply(Action::ApplyConstruction { construction: true }),
-            ActionResult::Ok
-        );
-        assert!(state.doc.rects[0].edge_construction(RectEdge::Bottom));
-        assert!(state.doc.lines[0].construction);
-    }
-
-    #[test]
-    fn toggle_construction_flips_each_selected_target() {
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0));
-        state.doc.rects[0].set_edge_construction(RectEdge::Bottom, true);
-        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 2.0, 0.0));
-        state.apply(Action::ClickSceneElement {
-            element: SceneElement::RectEdge(0, RectEdge::Bottom),
-            additive: false,
-        });
-        state.apply(Action::ClickSceneElement {
-            element: SceneElement::Line(0),
-            additive: true,
-        });
-        assert_eq!(state.apply(Action::ToggleConstruction), ActionResult::Ok);
-        assert!(!state.doc.rects[0].edge_construction(RectEdge::Bottom));
-        assert!(state.doc.lines[0].construction);
-    }
-
-    #[test]
     fn toggle_construction_rectangle_tool_before_drawing() {
         let mut state = AppState::default();
         state.apply(Action::SetTool(Tool::Rectangle));
@@ -7984,43 +6804,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_rectangle_draw_mode_applies_on_commit() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.apply(Action::SetTool(Tool::Rectangle));
-        state.draw_construction = true;
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["10".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: state.draw_construction,
-        });
-        state.apply(Action::CommitRectangle);
-        assert!(state.doc.rects[0].all_edges_construction());
-    }
-
-    #[test]
-    fn commit_rectangle_with_construction_draw_mode() {
-        let mut state = AppState::default();
-        begin_default_sketch(&mut state);
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["10".to_string(), "5".to_string()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: true,
-        });
-        state.apply(Action::CommitRectangle);
-        let rect = &state.doc.rects[0];
-        assert!(rect.all_edges_construction());
-    }
-
-    #[test]
     fn commit_line_with_construction_draw_mode() {
         let mut state = AppState::default();
         begin_default_sketch(&mut state);
@@ -8045,26 +6828,6 @@ mod tests {
         let mut state = AppState::default();
         state.apply(Action::ToggleElementVisibility(SceneElement::Sketch(0)));
         assert!(!state.element_visibility.is_visible(SceneElement::Sketch(0)));
-    }
-
-    #[test]
-    fn focus_rect_dimension_sets_pending_focus() {
-        let mut state = AppState::default();
-        state.creating_rect = Some(CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["".to_string(), "".to_string()],
-            focused: 0,
-            last_mouse: Vec3::ZERO,
-            user_edited: [false, false],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::FocusRectDimension {
-            axis: RectAxis::Height,
-        });
-        let cr = state.creating_rect.as_ref().unwrap();
-        assert_eq!(cr.focused, 1);
-        assert!(cr.pending_focus);
     }
 
     #[test]

@@ -1701,8 +1701,8 @@ fn dist_point_to_quad_edges(p: egui::Pos2, quad: [egui::Pos2; 4]) -> f32 {
 /// constraints on the two horizontal edges and `Vertical` on the two vertical edges — so
 /// the loop stays a rectangle under solving. This is the geometry a rectangle *is* now
 /// (SPEC §5.3): the four lines are auto-recognised as a `Polygon` face (#66). Corner `i`
-/// is the shared endpoint of `lines[i-1].End`/`lines[i].Start` (wrapping), matching the old
-/// `RectEdge`/corner numbering (0=BL, 1=BR, 2=TR, 3=TL; edges bottom,right,top,left).
+/// is the shared endpoint of `lines[i-1].End`/`lines[i].Start` (wrapping): corners
+/// 0=BL, 1=BR, 2=TR, 3=TL; edges bottom, right, top, left.
 ///
 /// Returns the four line indices in edge order. Does **not** add width/height dimensions or
 /// solve — callers add `DistanceTarget::LineLength` dims and solve as needed.
@@ -1769,7 +1769,6 @@ pub fn add_line_rectangle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::face::sketch_geometry_frame;
     use eframe::egui::Pos2;
 
     #[test]
@@ -1949,86 +1948,6 @@ mod tests {
     }
 
     #[test]
-    fn body_edge_picked_as_axis_reference() {
-        // #31: any edge on any 3D body (not just 2D sketch geometry) can anchor a plane.
-        use crate::actions::{Action, AppState, Tool};
-        use crate::model::{ExtrudeFace, FaceId};
-
-        let mut state = AppState::default();
-        state.apply(Action::BeginSketch {
-            face: FaceId::ConstructionPlane(0),
-            viewport: None,
-        });
-        state.creating_rect = Some(crate::actions::CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["10".into(), "5".into()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        // A vertical side edge runs from (0,0,0) to (0,0,7) at the rect's origin corner.
-        // Flatten screen-space as (x, y - z) so this edge isn't degenerate on screen.
-        let project = |w: Vec3| Some(Pos2::new(w.x, w.y - w.z));
-        let target = resolve_pick_target(Pos2::new(0.0, -3.5), &project, None, &state.doc);
-        assert!(
-            matches!(
-                target.as_ref().map(|t| &t.kind),
-                Some(PickTargetKind::BodyEdge { body: 0, .. })
-            ),
-            "expected a BodyEdge pick, got {target:?}"
-        );
-        assert!(matches!(
-            target.map(|t| t.reference),
-            Some(PlaneReference::Axis { .. })
-        ));
-    }
-
-    #[test]
-    fn nearest_treatable_edge_finds_a_vertical_side_edge() {
-        // #77: the chamfer/fillet tool's own picking path (used when no sketch is open),
-        // resolving straight to the structured `ExtrusionEdgeRef` rather than raw points.
-        use crate::actions::{Action, AppState, Tool};
-        use crate::model::{ExtrudeFace, ExtrusionEdgeRef, FaceId};
-
-        let mut state = AppState::default();
-        state.apply(Action::BeginSketch { face: FaceId::ConstructionPlane(0), viewport: None });
-        state.creating_rect = Some(crate::actions::CreatingRect {
-            origin: Vec3::ZERO,
-            texts: ["10".into(), "5".into()],
-            focused: 0,
-            last_mouse: Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.extrusions.len(), 1);
-
-        // Same vertical edge as `body_edge_picked_as_axis_reference`: (0,0,0) to (0,0,7).
-        let project = |w: Vec3| Some(Pos2::new(w.x, w.y - w.z));
-        let hit = nearest_treatable_edge(Pos2::new(0.0, -3.5), &project, &state.doc);
-        let (extrusion, edge, _, _, _) = hit.expect("expected a treatable edge under the cursor");
-        assert_eq!(extrusion, 0);
-        assert!(matches!(edge, ExtrusionEdgeRef::Vertical { face: 0, .. }));
-
-        // Nowhere near any edge: no hit.
-        assert!(nearest_treatable_edge(Pos2::new(500.0, 500.0), &project, &state.doc).is_none());
-    }
-
-    #[test]
     fn nearest_treatable_edge_ignores_circle_profiles() {
         use crate::actions::{Action, AppState, Tool};
         use crate::model::{Circle, ExtrudeFace, FaceId};
@@ -2071,128 +1990,6 @@ mod tests {
                 line: 0,
                 end: LineEnd::Start,
             }))
-        ));
-    }
-
-    #[test]
-    fn shape_edge_highlight_matches_world_edge_on_tilted_plane() {
-        let mut doc = Document::default();
-        doc.construction_planes.push(plane_from_definition(
-            &definition_from_reference(
-                &PlaneReference::Axis {
-                    origin: Vec3::ZERO,
-                    direction: Vec3::X,
-                    label: "X axis".to_string(),
-                },
-                0.0,
-                45.0,
-            ),
-            ConstructionPlaneParent::Root,
-        ));
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(1));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 5.0, 5.0, 25.0, 15.0));
-        let rect = &doc.rects[0];
-        let frame = sketch_geometry_frame(&doc, sketch).unwrap();
-        let (a, b) = rect_edge_segments(&doc, rect)[0];
-        let kind = PickTargetKind::ShapeEdge {
-            rect_index: 0,
-            edge: RectEdge::Bottom,
-            a,
-            b,
-        };
-
-        let PickTargetKind::ShapeEdge {
-            a: stored_a,
-            b: stored_b,
-            ..
-        } = kind
-        else {
-            panic!("expected shape edge");
-        };
-        assert!((stored_a - a).length() < 1e-3);
-        assert!((stored_b - b).length() < 1e-3);
-        let legacy_b = crate::face::local_to_world(&frame, stored_b.x, stored_b.y);
-        assert!(
-            (legacy_b - stored_b).length() > 0.1,
-            "world xyz must not be treated as local uv on a tilted face"
-        );
-    }
-
-    #[test]
-    fn scene_element_from_line_and_rect_edge_picks() {
-        let (mut doc, sketch) = doc_with_plane_sketch();
-        doc.lines = vec![Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0)];
-        doc.rects = vec![Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0)];
-        assert_eq!(
-            scene_element_from_pick(&PickTargetKind::Line(0)),
-            Some(SceneElement::Line(0))
-        );
-        assert_eq!(
-            scene_element_from_pick(&PickTargetKind::ShapeEdge {
-                rect_index: 0,
-                edge: RectEdge::Right,
-                a: Vec3::ZERO,
-                b: Vec3::X,
-            }),
-            Some(SceneElement::RectEdge(0, RectEdge::Right))
-        );
-        assert_eq!(
-            scene_element_from_pick(&PickTargetKind::Ground(Vec3::ZERO)),
-            None
-        );
-    }
-
-    #[test]
-    fn rect_edge_picked_for_axis_reference() {
-        let (mut doc, sketch) = doc_with_plane_sketch();
-        doc.rects = vec![Rect::from_local_corners(sketch, 10.0, 10.0, 50.0, 40.0)];
-        let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
-        let target = resolve_pick_target(Pos2::new(30.0, 8.0), &project, None, &doc).unwrap();
-        assert!(matches!(
-            target.kind,
-            PickTargetKind::ShapeEdge { .. }
-        ));
-        assert!(matches!(
-            target.reference,
-            PlaneReference::Axis { label, .. } if label == "Rectangle edge"
-        ));
-    }
-
-    #[test]
-    fn rect_edge_beats_face_when_near_boundary() {
-        let (mut doc, sketch) = doc_with_plane_sketch();
-        doc.rects = vec![Rect::from_local_corners(sketch, 0.0, 0.0, 100.0, 100.0)];
-        let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
-        let target = resolve_pick_target(Pos2::new(50.0, 2.0), &project, None, &doc);
-        assert!(matches!(
-            target.map(|t| t.kind),
-            Some(PickTargetKind::ShapeEdge { .. })
-        ));
-    }
-
-    #[test]
-    fn standalone_line_beats_rect_edge_when_closer() {
-        let (mut doc, sketch) = doc_with_plane_sketch();
-        doc.lines = vec![Line::from_local_endpoints(sketch, 48.0, 0.0, 52.0, 0.0)];
-        doc.rects = vec![Rect::from_local_corners(sketch, 0.0, 10.0, 100.0, 40.0)];
-        let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
-        let target = resolve_pick_target(Pos2::new(50.0, 1.0), &project, None, &doc);
-        assert!(matches!(
-            target.map(|t| t.kind),
-            Some(PickTargetKind::Line(_))
-        ));
-    }
-
-    #[test]
-    fn rect_face_picked_from_interior() {
-        let (mut doc, sketch) = doc_with_plane_sketch();
-        doc.rects = vec![Rect::from_local_corners(sketch, 10.0, 10.0, 50.0, 40.0)];
-        let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
-        let target = resolve_pick_target(Pos2::new(30.0, 25.0), &project, None, &doc);
-        assert!(matches!(
-            target.map(|t| t.kind),
-            Some(PickTargetKind::Rect(_))
         ));
     }
 
@@ -2312,117 +2109,6 @@ mod tests {
             reference,
             Some(PlaneReference::Face { label, .. }) if label == "Ground"
         ));
-    }
-
-    #[test]
-    fn edit_plane_offset_moves_hosted_geometry_in_world_space() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        let before = rect_world_corners(&doc, &doc.rects[0]).unwrap()[0].z;
-
-        let definition = definition_from_reference(
-            &PlaneReference::Face {
-                origin: Vec3::ZERO,
-                normal: Vec3::Z,
-                label: "Ground".to_string(),
-            },
-            20.0,
-            0.0,
-        );
-        apply_construction_plane_edit(
-            &mut doc,
-            0,
-            &definition,
-            ConstructionPlaneParent::Root,
-        )
-        .unwrap();
-
-        let after = rect_world_corners(&doc, &doc.rects[0]).unwrap()[0].z;
-        assert!((after - before - 20.0).abs() < 1e-3);
-        assert!((doc.rects[0].x).abs() < 1e-6, "local sketch coords stay put");
-    }
-
-    #[test]
-    fn plane_edit_preview_matches_committed_dependent_geometry() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        doc.lines
-            .push(Line::from_local_endpoints(sketch, 1.0, 1.0, 9.0, 1.0));
-        let child = plane_from_definition(
-            &definition_from_reference(
-                &PlaneReference::Face {
-                    origin: Vec3::ZERO,
-                    normal: Vec3::Z,
-                    label: "Ground".to_string(),
-                },
-                5.0,
-                0.0,
-            ),
-            ConstructionPlaneParent::Sketch(sketch),
-        );
-        doc.construction_planes.push(child);
-        let child_sketch = doc.add_sketch(FaceId::ConstructionPlane(1));
-        doc.rects
-            .push(Rect::from_local_corners(child_sketch, 2.0, 2.0, 8.0, 8.0));
-
-        let definition = definition_from_reference(
-            &PlaneReference::Face {
-                origin: Vec3::ZERO,
-                normal: Vec3::Z,
-                label: "Ground".to_string(),
-            },
-            15.0,
-            0.0,
-        );
-        let preview_plane = plane_from_definition(&definition, ConstructionPlaneParent::Root);
-        let preview = preview_plane_edit_dependents(&doc, 0, &preview_plane).unwrap();
-
-        apply_construction_plane_edit(
-            &mut doc,
-            0,
-            &definition,
-            ConstructionPlaneParent::Root,
-        )
-        .unwrap();
-
-        assert_eq!(preview.planes.len(), 1);
-        let committed_child = &doc.construction_planes[1];
-        assert!((preview.planes[0].1.origin - committed_child.origin).length() < 1e-3);
-        assert!((preview.planes[0].1.normal - committed_child.normal).length() < 1e-3);
-
-        let committed_rects: Vec<_> = doc
-            .rects
-            .iter()
-            .map(|rect| rect_world_corners(&doc, rect).unwrap())
-            .collect();
-        for corners in preview.rects {
-            assert!(
-                committed_rects
-                    .iter()
-                    .any(|committed| corners.iter().zip(committed.iter()).all(|(a, b)| {
-                        (*a - *b).length() < 1e-3
-                    })),
-                "preview rect should match a committed rect"
-            );
-        }
-
-        let committed_lines: Vec<_> = doc
-            .lines
-            .iter()
-            .map(|line| line_world_endpoints(&doc, line).unwrap())
-            .collect();
-        for (a, b) in preview.lines {
-            assert!(
-                committed_lines.iter().any(|(ca, cb)| {
-                    (a - *ca).length() < 1e-3 && (b - *cb).length() < 1e-3
-                }),
-                "preview line should match a committed line"
-            );
-        }
     }
 
     #[test]

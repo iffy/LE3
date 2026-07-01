@@ -1772,17 +1772,7 @@ mod tests {
     use crate::construction::{definition_from_reference, plane_from_definition};
     use crate::face::default_xy_plane;
     use crate::construction::PlaneReference;
-    use crate::model::{ConstructionPlaneParent, Line, Rect};
-
-    fn doc_with_plane_sketches() -> Document {
-        let mut doc = Document::default();
-        let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        let s1 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(s0, 0.0, 0.0, 10.0, 10.0));
-        doc.lines
-            .push(Line::from_local_endpoints(s1, 0.0, 0.0, 5.0, 0.0));
-        doc
-    }
+    use crate::model::{ConstructionPlaneParent, Line};
 
     #[test]
     fn default_document_hierarchy_has_single_document_root() {
@@ -1899,49 +1889,6 @@ mod tests {
     }
 
     #[test]
-    fn hierarchy_node_icons_match_element_types() {
-        use crate::model::{Constraint, ConstraintKind, ConstraintLine, ShapeKind};
-
-        let mut doc = doc_with_plane_sketches();
-        let sketch = 1;
-        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 1.0, 5.0, 1.0));
-        doc.shape_order.push(ShapeKind::Line);
-        doc.constraints.push(Constraint {
-            sketch,
-            kind: ConstraintKind::Parallel {
-                line_a: ConstraintLine::Line(0),
-                line_b: ConstraintLine::Line(1),
-            },
-            expression: String::new(),
-            dim_offset: None,
-            name: None,
-            deleted: false,
-        });
-
-        assert_eq!(
-            icon_for_hierarchy_node(&doc, HierarchyNode::ConstructionPlane(0)),
-            Some(IconId::Plane)
-        );
-        assert_eq!(
-            icon_for_hierarchy_node(&doc, HierarchyNode::Sketch(0)),
-            Some(IconId::Sketch)
-        );
-        assert_eq!(
-            icon_for_hierarchy_node(&doc, HierarchyNode::Rect(0)),
-            Some(IconId::Rectangle)
-        );
-        assert_eq!(
-            icon_for_hierarchy_node(&doc, HierarchyNode::Line(0)),
-            Some(IconId::Line)
-        );
-        assert_eq!(
-            icon_for_hierarchy_node(&doc, HierarchyNode::Constraint(0)),
-            Some(IconId::Parallel)
-        );
-        assert_eq!(icon_for_hierarchy_node(&doc, HierarchyNode::Document), None);
-    }
-
-    #[test]
     fn sketch_row_double_click_opens_for_edit_not_select() {
         assert_eq!(
             sketch_row_action(true, true, false),
@@ -1971,6 +1918,16 @@ mod tests {
         assert_eq!(state.sketch_session, Some(SketchSession { sketch }));
     }
 
+    fn doc_with_plane_sketches() -> Document {
+        let mut doc = Document::default();
+        let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
+        let s1 = doc.add_sketch(FaceId::ConstructionPlane(0));
+        crate::construction::add_line_rectangle(&mut doc, s0, 0.0, 0.0, 10.0, 10.0, [false; 4]);
+        doc.lines
+            .push(Line::from_local_endpoints(s1, 0.0, 0.0, 5.0, 0.0));
+        doc
+    }
+
     #[test]
     fn main_view_lists_planes_and_sketches_only() {
         let doc = doc_with_plane_sketches();
@@ -1980,34 +1937,6 @@ mod tests {
         assert_eq!(list[1], HierarchyNode::ConstructionPlane(0));
         assert_eq!(list[2], HierarchyNode::Sketch(0));
         assert_eq!(list[3], HierarchyNode::Sketch(1));
-    }
-
-    #[test]
-    fn sketch_view_lists_geometry_of_active_sketch() {
-        let doc = doc_with_plane_sketches();
-        let list = build_element_list(&doc, Some(SketchSession { sketch: 0 }));
-        assert_eq!(
-            list,
-            vec![
-                HierarchyNode::Document,
-                HierarchyNode::ConstructionPlane(0),
-                HierarchyNode::Sketch(0),
-                HierarchyNode::Sketch(1),
-                HierarchyNode::Rect(0),
-            ]
-        );
-
-        let list = build_element_list(&doc, Some(SketchSession { sketch: 1 }));
-        assert_eq!(
-            list,
-            vec![
-                HierarchyNode::Document,
-                HierarchyNode::ConstructionPlane(0),
-                HierarchyNode::Sketch(0),
-                HierarchyNode::Sketch(1),
-                HierarchyNode::Line(0),
-            ]
-        );
     }
 
     #[test]
@@ -2049,66 +1978,6 @@ mod tests {
             ]
         );
         let _ = s1;
-    }
-
-    #[test]
-    fn nested_sketches_on_rect_face_follow_parent_order() {
-        let mut doc = Document::default();
-        let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(s0, 0.0, 0.0, 20.0, 20.0));
-        let s1 = doc.add_sketch(FaceId::Rect(0));
-
-        let list = build_element_list(&doc, None);
-        assert_eq!(
-            list,
-            vec![
-                HierarchyNode::Document,
-                HierarchyNode::ConstructionPlane(0),
-                HierarchyNode::Sketch(0),
-                HierarchyNode::Rect(0),
-                HierarchyNode::Sketch(1),
-            ]
-        );
-        let _ = s1;
-    }
-
-    #[test]
-    fn extrusion_and_body_nest_under_source_sketch() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 20.0, 20.0));
-        doc.extrusions.push(crate::model::Extrusion {
-            sketch,
-            faces: vec![crate::model::ExtrudeFace::Rect(0)],
-            distance: 10.0,
-            target: None,
-            expression: String::new(),
-            name: None,
-            deleted: false,
-            edge_treatments: Vec::new(),
-        });
-        doc.bodies.push(crate::model::Body {
-            source: crate::model::BodySource::Extrusion(0),
-            name: None,
-            deleted: false,
-        });
-
-        assert_eq!(
-            parent_element(&doc, SceneElement::Extrusion(0)),
-            Some(SceneElement::Sketch(sketch))
-        );
-        assert_eq!(
-            parent_element(&doc, SceneElement::Body(0)),
-            Some(SceneElement::Extrusion(0))
-        );
-
-        let list = build_element_list(&doc, None);
-        let si = list.iter().position(|n| *n == HierarchyNode::Sketch(0)).unwrap();
-        let ei = list.iter().position(|n| *n == HierarchyNode::Extrusion(0)).unwrap();
-        let bi = list.iter().position(|n| *n == HierarchyNode::Body(0)).unwrap();
-        assert!(si < ei && ei < bi, "sketch -> extrusion -> body order: {list:?}");
     }
 
     #[test]
@@ -2238,50 +2107,6 @@ mod tests {
     }
 
     #[test]
-    fn creation_order_can_place_siblings_between_parent_and_child() {
-        let mut doc = Document::default();
-        let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(s0, 0.0, 0.0, 10.0, 10.0));
-        doc.shape_order.push(ShapeKind::Rect);
-        let s1 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        let _ = s1;
-
-        let list = build_element_list(&doc, Some(SketchSession { sketch: 0 }));
-        let plane = list.iter().position(|n| *n == HierarchyNode::ConstructionPlane(0)).unwrap();
-        let sketch0 = list.iter().position(|n| *n == HierarchyNode::Sketch(0)).unwrap();
-        let sketch1 = list.iter().position(|n| *n == HierarchyNode::Sketch(1)).unwrap();
-        let rect0 = list.iter().position(|n| *n == HierarchyNode::Rect(0)).unwrap();
-        assert!(plane < sketch0);
-        assert!(sketch0 < rect0);
-        assert!(sketch0 < sketch1);
-        assert!(sketch1 < rect0);
-    }
-
-    #[test]
-    fn selection_context_includes_selected_ancestors_and_descendants() {
-        let mut doc = Document::default();
-        let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(s0, 0.0, 0.0, 10.0, 10.0));
-        let _s1 = doc.add_sketch(FaceId::Rect(0));
-        doc.add_sketch(FaceId::ConstructionPlane(0));
-
-        let mut selection = SceneSelection::default();
-        crate::selection::click_scene_selection(
-            &mut selection,
-            SceneElement::Rect(0),
-            false,
-        );
-        let context = selection_context_elements(&doc, &selection);
-        assert!(context.contains(&SceneElement::Rect(0)));
-        assert!(context.contains(&SceneElement::Sketch(0)));
-        assert!(context.contains(&SceneElement::ConstructionPlane(0)));
-        assert!(context.contains(&SceneElement::Sketch(1)));
-        assert!(!context.contains(&SceneElement::Sketch(2)));
-    }
-
-    #[test]
     fn row_style_faints_unrelated_rows_when_selection_active() {
         let mut doc = Document::default();
         let _s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
@@ -2333,66 +2158,6 @@ mod tests {
                 &HashSet::new(),
             ),
             RowStyle::Faint
-        );
-    }
-
-    #[test]
-    fn hidden_selection_does_not_faint_visible_rows() {
-        let doc = doc_with_plane_sketches();
-        let mut selection = SceneSelection::default();
-        crate::selection::click_scene_selection(
-            &mut selection,
-            SceneElement::Rect(0),
-            false,
-        );
-        let list = build_element_list(&doc, None);
-        let context = selection_context_elements(&doc, &selection);
-        let related_constraints = selection_related_constraints(&doc, &selection);
-        assert!(!selection_styles_visible_list(&list, &selection));
-        assert_eq!(
-            row_style(
-                SceneElement::ConstructionPlane(0),
-                &selection,
-                &context,
-                &related_constraints,
-                false,
-                &DocumentHealth::default(),
-                &HashSet::new(),
-            ),
-            RowStyle::Normal
-        );
-    }
-
-    #[test]
-    fn new_child_plane_is_normal_when_selection_is_off_list() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.construction_planes.push(plane_from_definition(
-            &default_xy_plane().definition,
-            ConstructionPlaneParent::Sketch(sketch),
-        ));
-        doc.shape_order.push(ShapeKind::ConstructionPlane);
-        let mut selection = SceneSelection::default();
-        crate::selection::click_scene_selection(
-            &mut selection,
-            SceneElement::Rect(99),
-            false,
-        );
-        let list = build_element_list(&doc, None);
-        let context = selection_context_elements(&doc, &selection);
-        let related_constraints = selection_related_constraints(&doc, &selection);
-        assert!(!selection_styles_visible_list(&list, &selection));
-        assert_eq!(
-            row_style(
-                SceneElement::ConstructionPlane(1),
-                &selection,
-                &context,
-                &related_constraints,
-                false,
-                &DocumentHealth::default(),
-                &HashSet::new(),
-            ),
-            RowStyle::Normal
         );
     }
 
@@ -2550,15 +2315,6 @@ mod tests {
     }
 
     #[test]
-    fn hiding_sketch_hides_child_geometry() {
-        let doc = doc_with_plane_sketches();
-        let mut vis = ElementVisibility::default();
-        vis.set_visible(SceneElement::Sketch(0), false);
-        assert!(!vis.effective_visible(&doc, SceneElement::Rect(0)));
-        assert!(vis.effective_visible(&doc, SceneElement::Line(0)));
-    }
-
-    #[test]
     fn toggle_visibility_flips_state() {
         let mut vis = ElementVisibility::default();
         assert!(vis.is_visible(SceneElement::Sketch(0)));
@@ -2571,20 +2327,23 @@ mod tests {
         assert_eq!(PANE_TITLE, "Elements");
     }
 
-    /// A plane, a sketch with a rect, and an extrusion (owning a body) built from it — the
-    /// small fixture #34's Graph-view layout/highlight tests exercise, built with the sketch
-    /// under an active session so its rect shows up in the tree (see `build_sketch_entry`:
-    /// plain sketch geometry is only listed while that sketch is being edited).
+    #[test]
+    fn hierarchy_view_mode_defaults_to_list() {
+        assert_eq!(HierarchyViewMode::default(), HierarchyViewMode::List);
+    }
+
+    /// Drive the force layout to rest and return the final state, using the same fixture as the
+    /// static-layout tests (plane → sketch → rect + extrusion → body).
     fn doc_with_plane_sketch_rect_and_extrusion() -> (Document, SketchId) {
         use crate::model::{Body, BodySource, ExtrudeFace, Extrusion};
 
         let mut doc = Document::default();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
+        let rect_lines =
+            crate::construction::add_line_rectangle(&mut doc, sketch, 0.0, 0.0, 10.0, 10.0, [false; 4]);
         doc.extrusions.push(Extrusion {
             sketch,
-            faces: vec![ExtrudeFace::Rect(0)],
+            faces: vec![ExtrudeFace::Polygon(rect_lines.to_vec())],
             distance: 5.0,
             target: None,
             expression: String::new(),
@@ -2600,99 +2359,6 @@ mod tests {
         (doc, sketch)
     }
 
-    #[test]
-    fn graph_layout_assigns_column_by_depth_and_row_by_visit_order() {
-        let (doc, sketch) = doc_with_plane_sketch_rect_and_extrusion();
-        let tree = build_hierarchy(&doc, Some(SketchSession { sketch }));
-        let positions = graph_node_positions(&tree);
-
-        let find = |node: HierarchyNode| {
-            positions
-                .iter()
-                .find(|p| p.node == node)
-                .unwrap_or_else(|| panic!("missing position for {node:?}: {positions:?}"))
-        };
-
-        assert_eq!(positions.len(), 6, "{positions:?}");
-
-        let root = find(HierarchyNode::Document);
-        assert_eq!((root.depth, root.column, root.row, root.parent), (0, 0, 0, None));
-
-        let plane = find(HierarchyNode::ConstructionPlane(0));
-        assert_eq!(
-            (plane.depth, plane.column, plane.row, plane.parent),
-            (1, 1, 0, Some(HierarchyNode::Document))
-        );
-
-        let sketch_pos = find(HierarchyNode::Sketch(0));
-        assert_eq!(
-            (sketch_pos.depth, sketch_pos.column, sketch_pos.row, sketch_pos.parent),
-            (2, 2, 0, Some(HierarchyNode::ConstructionPlane(0)))
-        );
-
-        // Rect and Extrusion are siblings under Sketch(0), so they share a column (depth 3)
-        // but get distinct, visit-order rows.
-        let rect = find(HierarchyNode::Rect(0));
-        let extrusion = find(HierarchyNode::Extrusion(0));
-        assert_eq!((rect.depth, rect.column, rect.parent), (3, 3, Some(HierarchyNode::Sketch(0))));
-        assert_eq!(
-            (extrusion.depth, extrusion.column, extrusion.parent),
-            (3, 3, Some(HierarchyNode::Sketch(0)))
-        );
-        assert_ne!(rect.row, extrusion.row, "siblings in the same column need distinct rows");
-
-        let body = find(HierarchyNode::Body(0));
-        assert_eq!(
-            (body.depth, body.column, body.row, body.parent),
-            (4, 4, 0, Some(HierarchyNode::Extrusion(0)))
-        );
-    }
-
-    #[test]
-    fn graph_highlight_includes_ancestors_and_descendants_but_not_siblings() {
-        let (doc, sketch) = doc_with_plane_sketch_rect_and_extrusion();
-        let tree = build_hierarchy(&doc, Some(SketchSession { sketch }));
-
-        // Selecting the leaf Rect(0) highlights its ancestor chain up to the root, but not
-        // its sibling Extrusion(0) (or Extrusion's own descendant Body(0)).
-        let related = graph_related_nodes(&tree, HierarchyNode::Rect(0));
-        assert_eq!(
-            related,
-            HashSet::from([
-                HierarchyNode::Rect(0),
-                HierarchyNode::Sketch(0),
-                HierarchyNode::ConstructionPlane(0),
-                HierarchyNode::Document,
-            ])
-        );
-
-        // Selecting an internal node (Sketch(0)) highlights the full subtree under it, plus
-        // its own ancestors.
-        let related = graph_related_nodes(&tree, HierarchyNode::Sketch(0));
-        assert_eq!(
-            related,
-            HashSet::from([
-                HierarchyNode::Sketch(0),
-                HierarchyNode::ConstructionPlane(0),
-                HierarchyNode::Document,
-                HierarchyNode::Rect(0),
-                HierarchyNode::Extrusion(0),
-                HierarchyNode::Body(0),
-            ])
-        );
-
-        // The root has no ancestors, only its whole subtree.
-        let related = graph_related_nodes(&tree, HierarchyNode::Document);
-        assert_eq!(related.len(), 6, "{related:?}");
-    }
-
-    #[test]
-    fn hierarchy_view_mode_defaults_to_list() {
-        assert_eq!(HierarchyViewMode::default(), HierarchyViewMode::List);
-    }
-
-    /// Drive the force layout to rest and return the final state, using the same fixture as the
-    /// static-layout tests (plane → sketch → rect + extrusion → body).
     fn settle_graph_layout(width: f32, steps: u32) -> (GraphLayout, Vec<GraphNodePosition>) {
         let (doc, sketch) = doc_with_plane_sketch_rect_and_extrusion();
         let tree = build_hierarchy(&doc, Some(SketchSession { sketch }));

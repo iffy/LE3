@@ -424,8 +424,7 @@ fn remove_shape_order_entry(doc: &mut Document, kind: ShapeKind, ordinal: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Constraint, ConstraintKind, ConstraintLine, Document, Line, Rect};
-    use crate::selection::{click_scene_selection, SceneSelection};
+    use crate::model::{Constraint, ConstraintKind, ConstraintLine, Document, Line};
 
     fn sketch_with_two_lines() -> (Document, SketchId, usize, usize) {
         let mut doc = Document::default();
@@ -470,41 +469,6 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_sketch_cascades_geometry() {
-        let (mut doc, sketch, line_a, _) = sketch_with_two_lines();
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 5.0, 5.0));
-        doc.shape_order.push(ShapeKind::Rect);
-        assert!(tombstone_sketch(&mut doc, sketch));
-        assert!(doc.sketches[sketch].deleted);
-        assert!(doc.lines[line_a].deleted);
-        assert!(doc.rects[0].deleted);
-        assert!(!element_alive(&doc, SceneElement::Line(line_a)));
-    }
-
-    #[test]
-    fn delete_targets_from_selection_expands_rect_edge_and_point() {
-        use crate::model::{ConstraintPoint, LineEnd, RectEdge};
-        let mut sel = SceneSelection::default();
-        click_scene_selection(
-            &mut sel,
-            SceneElement::RectEdge(0, RectEdge::Bottom),
-            false,
-        );
-        click_scene_selection(
-            &mut sel,
-            SceneElement::Point(ConstraintPoint::LineEndpoint {
-                line: 1,
-                end: LineEnd::Start,
-            }),
-            true,
-        );
-        let targets = delete_targets_from_selection(&sel);
-        assert_eq!(targets.len(), 2);
-        assert!(targets.contains(&SceneElement::Rect(0)));
-        assert!(targets.contains(&SceneElement::Line(1)));
-    }
-
-    #[test]
     fn tombstone_elements_counts_unique_targets() {
         let (mut doc, _, line_a, line_b) = sketch_with_two_lines();
         let count = tombstone_elements(
@@ -517,16 +481,5 @@ mod tests {
         assert_eq!(count, 2);
         assert!(doc.lines[line_a].deleted);
         assert!(doc.lines[line_b].deleted);
-    }
-
-    #[test]
-    fn element_alive_false_for_tombstoned_rect() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0));
-        doc.shape_order.push(ShapeKind::Rect);
-        tombstone_rect(&mut doc, 0);
-        assert!(!element_alive(&doc, SceneElement::Rect(0)));
-        assert!(!element_alive(&doc, SceneElement::RectEdge(0, crate::model::RectEdge::Left)));
     }
 }

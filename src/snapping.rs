@@ -409,7 +409,7 @@ pub fn find_normal_at_midpoint_snap(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Document, FaceId, Line, Rect};
+    use crate::model::{Document, FaceId, Line};
 
     const EPS: f32 = 1e-4;
 
@@ -481,34 +481,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_in_range_returns_none() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        assert!(find_snap(&doc, sketch, (50.0, 50.0), 1.0, &[]).is_none());
-    }
-
-    #[test]
-    fn snaps_to_sketch_origin_as_a_vertex() {
-        let (mut doc, sketch) = sketch_doc();
-        // A rectangle away from the origin so its corners are out of range.
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 20.0, 20.0, 30.0, 30.0));
-        let snap = find_snap(&doc, sketch, (0.3, 0.2), 1.0, &[]).unwrap();
-        assert_eq!(snap.target, SnapTarget::Origin);
-        assert!(snap.uv.0.abs() < EPS && snap.uv.1.abs() < EPS);
-        // Leaving a point there pins it coincident with the origin.
-        let point = ConstraintPoint::RectCorner { rect: 0, corner: 0 };
-        assert!(matches!(
-            snap_constraint_kind(point, snap.target),
-            ConstraintKind::Coincident {
-                b: ConstraintEntity::Origin,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn real_vertex_beats_origin_when_closer() {
         let (mut doc, sketch) = sketch_doc();
         // A line endpoint very near the query, closer than the origin.
@@ -516,18 +488,6 @@ mod tests {
             .push(Line::from_local_endpoints(sketch, 0.4, 0.4, 10.0, 0.0));
         let snap = find_snap(&doc, sketch, (0.45, 0.45), 1.0, &[]).unwrap();
         assert!(matches!(snap.target, SnapTarget::Vertex(_)));
-    }
-
-    #[test]
-    fn snaps_to_rect_corner() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 6.0));
-        let snap = find_snap(&doc, sketch, (10.3, 6.2), 1.0, &[]).unwrap();
-        assert_eq!(
-            snap.target,
-            SnapTarget::Vertex(ConstraintPoint::RectCorner { rect: 0, corner: 2 })
-        );
     }
 
     #[test]
@@ -571,26 +531,6 @@ mod tests {
         let anchors = vec![ConstraintLine::Line(0)];
         // Far above the extension line: outside perpendicular tolerance.
         assert!(find_extension_snap(&doc, sketch, &anchors, (15.0, 5.0), 1.0, &[]).is_none());
-    }
-
-    #[test]
-    fn extension_anchors_from_a_rect_corner_extend_both_edges() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 6.0));
-        // Bottom-right corner (corner 1) owns the rectangle's four edges as anchors.
-        let corner = ConstraintPoint::RectCorner { rect: 0, corner: 1 };
-        let anchors = vertex_extension_anchors(corner);
-        // A point directly below the right edge (x=10) snaps onto that edge's extension.
-        let snap = find_extension_snap(&doc, sketch, &anchors, (10.2, -4.0), 1.0, &[]).unwrap();
-        assert_eq!(
-            snap.target,
-            SnapTarget::OnLineExtension(ConstraintLine::RectEdge {
-                rect: 0,
-                edge: RectEdge::Right
-            })
-        );
-        assert!((snap.uv.0 - 10.0).abs() < EPS);
     }
 
     #[test]

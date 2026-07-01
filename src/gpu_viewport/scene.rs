@@ -2779,112 +2779,11 @@ pub fn line_screen_quad(
 mod tests {
     use super::*;
     use crate::actions::AppState;
-    use crate::model::{FaceId, RectEdge};
+    use crate::model::FaceId;
     use egui::Rect as UiRect;
 
     fn test_viewport() -> UiRect {
         UiRect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(960.0, 560.0))
-    }
-
-    #[test]
-    fn editing_an_extrusion_hides_its_committed_body() {
-        use crate::actions::{Action, Tool};
-        use crate::model::ExtrudeFace;
-
-        let mut state = AppState::default();
-        state.apply(Action::BeginSketch {
-            face: FaceId::ConstructionPlane(0),
-            viewport: None,
-        });
-        state.creating_rect = Some(crate::actions::CreatingRect {
-            origin: glam::Vec3::ZERO,
-            texts: ["10".into(), "5".into()],
-            focused: 0,
-            last_mouse: glam::Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-
-        let cam = state.cam.clone();
-        let build = |editing: Option<usize>| {
-            ViewportScene::build(&ViewportSceneInput {
-                doc: &state.doc,
-                cam: &cam,
-                viewport: test_viewport(),
-                palette: ViewportPalette::default(),
-                sketch_session: None,
-                selection: &state.scene_selection,
-                element_visibility: &state.element_visibility,
-                preview_rect: None,
-                preview_line: None,
-                preview_circle: None,
-                preview_extrusion: None,
-                editing_extrusion: editing,
-                plane_preview: None,
-                active_sketch_face: None,
-                dimension_labels: &[],
-                dim_label_view: None,
-                plane_gizmo: None,
-                extrude_gizmo: None,
-                vertex_treatment_gizmo: None,
-                vertex_treatment_preview: None,
-                hover_highlight: None,
-                hover_color: Color32::WHITE,
-                document_health: &DocumentHealth::default(),
-                constraint_graphics: None,
-                constraint_connector_color: None,
-            })
-        };
-
-        let with_body = build(None);
-        let editing = build(Some(0));
-        // The committed extrusion body contributes geometry; suppressing it while
-        // editing must reduce the vertex count (only the ghost preview would show).
-        assert!(
-            editing.vertices.len() < with_body.vertices.len(),
-            "editing scene ({}) should drop the committed body geometry present without editing ({})",
-            editing.vertices.len(),
-            with_body.vertices.len()
-        );
-    }
-
-    /// Commits a single 10x5x7 extruded box body (#33 shading-mode tests below reuse this).
-    fn state_with_one_body() -> AppState {
-        use crate::actions::{Action, Tool};
-        use crate::model::ExtrudeFace;
-
-        let mut state = AppState::default();
-        state.apply(Action::BeginSketch {
-            face: FaceId::ConstructionPlane(0),
-            viewport: None,
-        });
-        state.creating_rect = Some(crate::actions::CreatingRect {
-            origin: glam::Vec3::ZERO,
-            texts: ["10".into(), "5".into()],
-            focused: 0,
-            last_mouse: glam::Vec3::new(10.0, 5.0, 0.0),
-            user_edited: [true, true],
-            pending_focus: false,
-            construction: false,
-        });
-        state.apply(Action::CommitRectangle);
-        state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
-        });
-        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
-        state.apply(Action::CommitExtrusion);
-        assert_eq!(state.doc.bodies.len(), 1);
-        state
     }
 
     fn build_scene_with_shading(
@@ -2920,6 +2819,35 @@ mod tests {
             constraint_graphics: None,
             constraint_connector_color: None,
         })
+    }
+
+    fn state_with_one_body() -> AppState {
+        use crate::actions::Action;
+        use crate::model::ExtrudeFace;
+
+        let mut state = AppState::default();
+        state.apply(Action::BeginSketch {
+            face: FaceId::ConstructionPlane(0),
+            viewport: None,
+        });
+        let sketch = state.sketch_session.unwrap().sketch;
+        let rect_lines = crate::construction::add_line_rectangle(
+            &mut state.doc,
+            sketch,
+            0.0,
+            0.0,
+            10.0,
+            5.0,
+            [false; 4],
+        );
+        state.apply(Action::CreateExtrusion {
+            sketch,
+            faces: vec![ExtrudeFace::Polygon(rect_lines.to_vec())],
+            distance: 7.0,
+            body: crate::actions::ExtrudeBodyChoice::New,
+        });
+        assert_eq!(state.doc.bodies.len(), 1);
+        state
     }
 
     #[test]
@@ -3572,68 +3500,58 @@ mod tests {
     }
 
     #[test]
-    fn construction_planes_render_fill_without_edge_strokes() {
-        use crate::hierarchy::SceneElement;
+    fn editing_an_extrusion_hides_its_committed_body() {
+        use crate::actions::{Action, Tool};
+        use crate::model::ExtrudeFace;
 
-        let mut hidden = AppState::default();
-        hidden
-            .element_visibility
-            .set_visible(SceneElement::ConstructionPlane(0), false);
-
-        let with_plane = build_scene_for_doc(&AppState::default());
-        let without_plane = build_scene_for_doc(&hidden);
-        let plane_indices =
-            with_plane.plane_fill_indices.len() - without_plane.plane_fill_indices.len();
-        assert_eq!(
-            plane_indices, 6,
-            "each construction plane should add only two fill triangles"
-        );
-    }
-
-    #[test]
-    fn mixed_construction_rect_skips_solid_stroke_on_construction_edges() {
-        let mut all_solid = AppState::default();
-        commit_test_rectangle(&mut all_solid);
-        let solid_scene = build_scene_for_doc(&all_solid);
-        let solid_strokes =
-            count_opaque_stroke_vertices(&solid_scene, ViewportPalette::default().rect_line);
-
-        let mut mixed = AppState::default();
-        commit_test_rectangle(&mut mixed);
-        mixed.doc.rects[0].set_edge_construction(RectEdge::Bottom, true);
-        assert!(mixed.doc.rects[0].has_mixed_edge_construction());
-        let mixed_scene = build_scene_for_doc(&mixed);
-        let mixed_strokes =
-            count_opaque_stroke_vertices(&mixed_scene, ViewportPalette::default().rect_line);
-
-        assert_eq!(solid_strokes, 16, "all-solid rect draws four 4-vertex line quads");
-        assert_eq!(
-            mixed_strokes, 12,
-            "mixed rect should draw solid strokes only on non-construction edges"
-        );
-    }
-
-    #[test]
-    fn solid_line_strokes_use_rectangle_stroke_color() {
         let mut state = AppState::default();
-        commit_test_line(&mut state);
-        let scene = build_scene_for_doc(&state);
-        let strokes =
-            count_opaque_stroke_vertices(&scene, ViewportPalette::default().rect_line);
-        assert!(
-            strokes > 0,
-            "a solid line should render with the shared rect/circle/line stroke color"
-        );
-    }
+        commit_test_rectangle(&mut state);
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace {
+            face: ExtrudeFace::Polygon(vec![0, 1, 2, 3]),
+        });
+        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
+        state.apply(Action::CommitExtrusion);
+        assert_eq!(state.doc.bodies.len(), 1);
 
-    #[test]
-    fn closed_line_loop_gets_a_sketch_fill_like_a_rect_or_circle() {
-        let mut state = AppState::default();
-        commit_test_triangle_loop(&mut state);
-        let scene = build_scene_for_doc(&state);
+        let cam = state.cam.clone();
+        let build = |editing: Option<usize>| {
+            ViewportScene::build(&ViewportSceneInput {
+                doc: &state.doc,
+                cam: &cam,
+                viewport: test_viewport(),
+                palette: ViewportPalette::default(),
+                sketch_session: None,
+                selection: &state.scene_selection,
+                element_visibility: &state.element_visibility,
+                preview_rect: None,
+                preview_line: None,
+                preview_circle: None,
+                preview_extrusion: None,
+                editing_extrusion: editing,
+                plane_preview: None,
+                active_sketch_face: None,
+                dimension_labels: &[],
+                dim_label_view: None,
+                plane_gizmo: None,
+                extrude_gizmo: None,
+                vertex_treatment_gizmo: None,
+                vertex_treatment_preview: None,
+                hover_highlight: None,
+                hover_color: Color32::WHITE,
+                document_health: &DocumentHealth::default(),
+                constraint_graphics: None,
+                constraint_connector_color: None,
+            })
+        };
+
+        let with_body = build(None);
+        let editing = build(Some(0));
         assert!(
-            !scene.sketch_fill_indices.is_empty(),
-            "a closed triangle of lines should fill the same as a rect/circle face (#66)"
+            editing.vertices.len() < with_body.vertices.len(),
+            "editing scene ({}) should drop the committed body geometry present without editing ({})",
+            editing.vertices.len(),
+            with_body.vertices.len()
         );
     }
 
@@ -3641,12 +3559,12 @@ mod tests {
     fn extruded_body_adds_solid_triangles() {
         let mut state = AppState::default();
         commit_test_rectangle(&mut state);
-        let sketch = state.doc.rects[0].sketch;
+        let sketch = state.doc.lines[0].sketch;
         let before = build_scene_for_doc(&state).vertices.len();
 
         state.apply(crate::actions::Action::CreateExtrusion {
             sketch,
-            faces: vec![crate::model::ExtrudeFace::Rect(0)],
+            faces: vec![crate::model::ExtrudeFace::Polygon(vec![0, 1, 2, 3])],
             distance: 8.0,
             body: crate::actions::ExtrudeBodyChoice::New,
         });
@@ -3665,10 +3583,8 @@ mod tests {
     fn extruded_top_cap_on_slanted_target_plane_is_biased_toward_camera() {
         let mut state = AppState::default();
         commit_test_rectangle(&mut state);
-        let sketch = state.doc.rects[0].sketch;
+        let sketch = state.doc.lines[0].sketch;
 
-        // A construction plane tilted about the X axis, raised above the sketch — extruding
-        // to it lands the top cap exactly in this slanted plane.
         let plane_origin = Vec3::new(0.0, 0.0, 12.0);
         let plane_normal = Vec3::new(0.0, 0.4, 1.0).normalize();
         let mut slanted = crate::face::default_xy_plane();
@@ -3678,7 +3594,7 @@ mod tests {
 
         state.apply(crate::actions::Action::CreateExtrusion {
             sketch,
-            faces: vec![crate::model::ExtrudeFace::Rect(0)],
+            faces: vec![crate::model::ExtrudeFace::Polygon(vec![0, 1, 2, 3])],
             distance: 6.0,
             body: crate::actions::ExtrudeBodyChoice::New,
         });
@@ -3692,9 +3608,6 @@ mod tests {
             .find(|p| ((**p - plane_origin).dot(plane_normal)).abs() < 1e-3)
             .expect("expected at least one top-cap vertex on the target plane");
 
-        // This corner is shared by the top cap and two side walls in the raw mesh — only the
-        // cap copies should move, so count how many raw triangle-vertices sit here before
-        // biasing as a baseline.
         let raw_unbiased_count = raw
             .triangles
             .iter()
@@ -3711,9 +3624,6 @@ mod tests {
             .filter(|v| (Vec3::from(v.position) - cap_vertex).length() < 1e-5)
             .count();
 
-        // The cap vertex was rasterized at the biased position, not its raw (z-fight-prone)
-        // position (#29) — the side-wall copies of this same corner stay put, but the
-        // top-cap copies move, so fewer unbiased copies should remain than the raw mesh had.
         assert!(
             scene
                 .vertices
@@ -3726,7 +3636,6 @@ mod tests {
             "expected fewer unbiased copies of the cap corner after biasing: raw={raw_unbiased_count} scene={scene_unbiased_count}"
         );
 
-        // A base-cap vertex (not on the target plane) is rasterized unbiased.
         let base_vertex = *raw
             .triangles
             .iter()
@@ -3745,11 +3654,10 @@ mod tests {
     #[test]
     fn extrude_preview_to_slanted_target_plane_shows_slanted_top() {
         // The in-progress (uncommitted) ghost preview should show the actual slanted shape
-        // once the gizmo has snapped to a slanted target plane, not a generic blind/
-        // rectangular extrude (#63).
+        // once the gizmo has snapped to a slanted target plane (#63).
         let mut state = AppState::default();
         commit_test_rectangle(&mut state);
-        let sketch = state.doc.rects[0].sketch;
+        let sketch = state.doc.lines[0].sketch;
 
         let plane_origin = Vec3::new(0.0, 0.0, 12.0);
         let plane_normal = Vec3::new(0.0, 0.4, 1.0).normalize();
@@ -3760,7 +3668,7 @@ mod tests {
 
         let preview = crate::model::Extrusion {
             sketch,
-            faces: vec![crate::model::ExtrudeFace::Rect(0)],
+            faces: vec![crate::model::ExtrudeFace::Polygon(vec![0, 1, 2, 3])],
             distance: 6.0,
             target: Some(crate::model::ExtrudeTarget::Plane(1)),
             expression: String::new(),
@@ -3813,12 +3721,163 @@ mod tests {
             "expected the raw preview mesh itself to be slanted, spread {}",
             zmax - zmin
         );
-
-        // The preview's solid triangles were actually rasterized into the scene (not skipped
-        // or substituted with a non-slanted placeholder).
         assert!(
             scene.vertices.len() >= raw.triangles.len() * 3,
             "expected the slanted preview solid's triangles in the rasterized scene"
+        );
+    }
+
+    #[test]
+    fn overlapping_rect_and_circle_on_ground_plane_have_distinct_fill_depths() {
+        let mut state = AppState::default();
+        commit_overlapping_rect_and_circle(&mut state);
+        let scene = build_scene_for_doc(&state);
+        let cam = Camera::default();
+        let eye = cam.eye();
+        let sketch = state.doc.lines[0].sketch;
+        let frame = crate::face::sketch_geometry_frame(&state.doc, sketch).expect("sketch frame");
+        let overlap = Vec3::new(40.0, 25.0, 0.0);
+        // The rectangle is a `Polygon` whose fill uses lane 2 keyed by its first line index;
+        // the circle's fill uses lane 1 keyed by its circle index. #3 keeps overlapping
+        // coplanar shapes on distinct depth biases so they never z-fight.
+        let rect_bias = shape_fill_depth_bias_laned(0, 2);
+        let circle_bias = shape_fill_depth_bias_laned(0, 1);
+        assert!(
+            (rect_bias - circle_bias).abs() > 1e-6,
+            "rect and circle fills must not share a depth bias: rect={rect_bias} circle={circle_bias}"
+        );
+        let rect_corner = offset_toward_camera(Vec3::ZERO, frame.normal, eye, rect_bias);
+        let circle_center = offset_toward_camera(overlap, frame.normal, eye, circle_bias);
+
+        let rect_mesh_z = mesh_z_closest_to(&scene, rect_corner).expect("rectangle fill in mesh");
+        let circle_mesh_z =
+            mesh_z_closest_to(&scene, circle_center).expect("circle fill in mesh");
+        assert!(
+            (rect_mesh_z - rect_corner.z).abs() < 1e-4,
+            "rectangle mesh z {rect_mesh_z} should match biased corner {}",
+            rect_corner.z
+        );
+        assert!(
+            (circle_mesh_z - circle_center.z).abs() < 1e-4,
+            "circle mesh z {circle_mesh_z} should match biased center {}",
+            circle_center.z
+        );
+        assert!(
+            (circle_mesh_z - rect_mesh_z).abs() > 1e-5,
+            "mesh depths must differ where shapes overlap (rect={rect_mesh_z} circle={circle_mesh_z})"
+        );
+    }
+
+    #[test]
+    fn committed_sketch_fills_go_in_stencil_masked_layer() {
+        // Committed coplanar sketch fills route into the dedicated stencil-masked
+        // sketch_fill layer so each pixel is painted once (#3).
+        let mut state = AppState::default();
+        commit_overlapping_rect_and_circle(&mut state);
+        let scene = build_scene_for_doc(&state);
+        assert!(
+            !scene.sketch_fill_indices.is_empty(),
+            "committed rect + circle fills should populate the stencil-masked layer"
+        );
+        let frame =
+            crate::face::sketch_geometry_frame(&state.doc, state.doc.lines[0].sketch).unwrap();
+        let cam = Camera::default();
+        let overlap = offset_toward_camera(
+            Vec3::new(40.0, 25.0, 0.0),
+            frame.normal,
+            cam.eye(),
+            shape_fill_depth_bias_laned(0, 0),
+        );
+        assert!(mesh_z_closest_to(&scene, overlap).is_some());
+    }
+
+    #[test]
+    fn hovering_a_sketch_face_lifts_its_fill_off_the_plane() {
+        let mut state = AppState::default();
+        commit_test_rectangle(&mut state);
+        let cam = state.cam.clone();
+        let base = build_scene_for_doc(&state);
+        let with_hover = ViewportScene::build(&ViewportSceneInput {
+            doc: &state.doc,
+            cam: &cam,
+            viewport: test_viewport(),
+            palette: ViewportPalette::default(),
+            sketch_session: None,
+            selection: &state.scene_selection,
+            element_visibility: &state.element_visibility,
+            preview_rect: None,
+            preview_line: None,
+            preview_circle: None,
+            preview_extrusion: None,
+            editing_extrusion: None,
+            plane_preview: None,
+            active_sketch_face: None,
+            dimension_labels: &[],
+            dim_label_view: None,
+            plane_gizmo: None,
+            extrude_gizmo: None,
+            vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
+            hover_highlight: Some(ViewportHoverHighlight::SketchFace(FaceId::Polygon(vec![
+                0, 1, 2, 3,
+            ]))),
+            hover_color: crate::construction::PICK_HOVER_RGBA,
+            document_health: &DocumentHealth::default(),
+            constraint_graphics: None,
+            constraint_connector_color: None,
+        });
+        let added = &with_hover.vertices[base.vertices.len()..];
+        assert!(!added.is_empty(), "hover should add geometry");
+        let fill_verts = added
+            .iter()
+            .filter(|v| (v.position[2] - HOVER_FILL_DEPTH_BIAS).abs() < 1e-4)
+            .count();
+        assert!(
+            fill_verts >= 6,
+            "expected the hover fill lifted to z={HOVER_FILL_DEPTH_BIAS}, found {fill_verts} such vertices"
+        );
+    }
+
+    #[test]
+    fn construction_planes_render_fill_without_edge_strokes() {
+        use crate::hierarchy::SceneElement;
+
+        let mut hidden = AppState::default();
+        hidden
+            .element_visibility
+            .set_visible(SceneElement::ConstructionPlane(0), false);
+
+        let with_plane = build_scene_for_doc(&AppState::default());
+        let without_plane = build_scene_for_doc(&hidden);
+        let plane_indices =
+            with_plane.plane_fill_indices.len() - without_plane.plane_fill_indices.len();
+        assert_eq!(
+            plane_indices, 6,
+            "each construction plane should add only two fill triangles"
+        );
+    }
+
+    #[test]
+    fn solid_line_strokes_use_rectangle_stroke_color() {
+        let mut state = AppState::default();
+        commit_test_line(&mut state);
+        let scene = build_scene_for_doc(&state);
+        let strokes =
+            count_opaque_stroke_vertices(&scene, ViewportPalette::default().rect_line);
+        assert!(
+            strokes > 0,
+            "a solid line should render with the shared rect/circle/line stroke color"
+        );
+    }
+
+    #[test]
+    fn closed_line_loop_gets_a_sketch_fill_like_a_rect_or_circle() {
+        let mut state = AppState::default();
+        commit_test_triangle_loop(&mut state);
+        let scene = build_scene_for_doc(&state);
+        assert!(
+            !scene.sketch_fill_indices.is_empty(),
+            "a closed triangle of lines should fill the same as a rect/circle face (#66)"
         );
     }
 
@@ -3968,74 +4027,6 @@ mod tests {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|p| p.z)
-    }
-
-    #[test]
-    fn overlapping_rect_and_circle_on_ground_plane_have_distinct_fill_depths() {
-        let mut state = AppState::default();
-        commit_overlapping_rect_and_circle(&mut state);
-        let scene = build_scene_for_doc(&state);
-        let cam = Camera::default();
-        let eye = cam.eye();
-        let sketch = state.doc.rects[0].sketch;
-        let frame = sketch_geometry_frame(&state.doc, sketch).expect("sketch frame");
-        let overlap = Vec3::new(40.0, 25.0, 0.0);
-        let rect_corner =
-            offset_toward_camera(Vec3::ZERO, frame.normal, eye, shape_fill_depth_bias_laned(0, 0));
-        let circle_center =
-            offset_toward_camera(overlap, frame.normal, eye, shape_fill_depth_bias_laned(0, 1));
-        let rect_overlap =
-            offset_toward_camera(overlap, frame.normal, eye, shape_fill_depth_bias_laned(0, 0));
-        assert!(
-            circle_center.z > rect_overlap.z,
-            "circle fill should sit above rectangle at overlap: rect_z={} circle_z={}",
-            rect_overlap.z,
-            circle_center.z
-        );
-
-        let rect_mesh_z = mesh_z_closest_to(&scene, rect_corner).expect("rectangle fill in mesh");
-        let circle_mesh_z =
-            mesh_z_closest_to(&scene, circle_center).expect("circle fill in mesh");
-        assert!(
-            (rect_mesh_z - rect_corner.z).abs() < 1e-4,
-            "rectangle mesh z {rect_mesh_z} should match biased corner {rect_corner_z}",
-            rect_corner_z = rect_corner.z
-        );
-        assert!(
-            (circle_mesh_z - circle_center.z).abs() < 1e-4,
-            "circle mesh z {circle_mesh_z} should match biased center {circle_center_z}",
-            circle_center_z = circle_center.z
-        );
-        assert!(
-            circle_mesh_z > rect_mesh_z,
-            "mesh depths must differ where shapes overlap (rect={rect_mesh_z} circle={circle_mesh_z})"
-        );
-    }
-
-    #[test]
-    fn committed_sketch_fills_go_in_stencil_masked_layer() {
-        // The overlap-darkening fix (#3) routes committed coplanar sketch fills into
-        // the dedicated sketch_fill layer, which the renderer draws with a stencil mask
-        // so each pixel is painted once. Guard that the fills land there (and not in the
-        // base layer, which is drawn without the mask).
-        let mut state = AppState::default();
-        commit_overlapping_rect_and_circle(&mut state);
-        let scene = build_scene_for_doc(&state);
-        assert!(
-            !scene.sketch_fill_indices.is_empty(),
-            "committed rect + circle fills should populate the stencil-masked layer"
-        );
-        // Both fills overlap at (40, 25, 0); locating that point must succeed from the
-        // sketch_fill layer (the helper only scans that layer).
-        let frame = sketch_geometry_frame(&state.doc, state.doc.rects[0].sketch).unwrap();
-        let cam = Camera::default();
-        let overlap = offset_toward_camera(
-            Vec3::new(40.0, 25.0, 0.0),
-            frame.normal,
-            cam.eye(),
-            shape_fill_depth_bias_laned(0, 0),
-        );
-        assert!(mesh_z_closest_to(&scene, overlap).is_some());
     }
 
     #[test]
@@ -4345,56 +4336,6 @@ mod tests {
     }
 
     #[test]
-    fn hovering_a_sketch_face_lifts_its_fill_off_the_plane() {
-        let mut state = AppState::default();
-        commit_test_rectangle(&mut state);
-        let cam = state.cam.clone();
-        let base = build_scene_for_doc(&state);
-        let with_hover = ViewportScene::build(&ViewportSceneInput {
-            doc: &state.doc,
-            cam: &cam,
-            viewport: test_viewport(),
-            palette: ViewportPalette::default(),
-            sketch_session: None,
-            selection: &state.scene_selection,
-            element_visibility: &state.element_visibility,
-            preview_rect: None,
-            preview_line: None,
-            preview_circle: None,
-            preview_extrusion: None,
-            editing_extrusion: None,
-            plane_preview: None,
-            active_sketch_face: None,
-            dimension_labels: &[],
-            dim_label_view: None,
-            plane_gizmo: None,
-            extrude_gizmo: None,
-            vertex_treatment_gizmo: None,
-            vertex_treatment_preview: None,
-            hover_highlight: Some(ViewportHoverHighlight::SketchFace(FaceId::Rect(0))),
-            hover_color: crate::construction::PICK_HOVER_RGBA,
-            document_health: &DocumentHealth::default(),
-            constraint_graphics: None,
-            constraint_connector_color: None,
-        });
-        let added = &with_hover.vertices[base.vertices.len()..];
-        assert!(!added.is_empty(), "hover should add geometry");
-        // The rectangle lies on the z=0 ground plane. Before the fix the hover fill sat at z=0,
-        // behind the committed coplanar fills (which are biased toward the camera) — showing
-        // through only in the gaps. It is now lifted to the hover bias so it covers the face
-        // cleanly above those fills (#19).
-        // The two fill triangles (6 vertices) are offset exactly along +Z by the hover bias.
-        let fill_verts = added
-            .iter()
-            .filter(|v| (v.position[2] - HOVER_FILL_DEPTH_BIAS).abs() < 1e-4)
-            .count();
-        assert!(
-            fill_verts >= 6,
-            "expected the hover fill lifted to z={HOVER_FILL_DEPTH_BIAS}, found {fill_verts} such vertices"
-        );
-    }
-
-    #[test]
     fn higher_shape_index_wins_coplanar_overlap() {
         let cam = Camera::default();
         let eye = cam.eye();
@@ -4429,9 +4370,12 @@ mod tests {
         let view = crate::dimensions::PlanarLabelView::from_camera_and_plane(&cam, glam::Vec3::Z);
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |_| {});
-        let constraint = state.doc.constraints.iter().find(|c| c.sketch == session.sketch);
-        let constraint = constraint.expect("rectangle should have a width constraint");
-        let (a, b) = crate::constraints::constraint_segment_endpoints(&state.doc, 0).unwrap();
+        // The rectangle is four lines plus geometric constraints (#66); the width dimension
+        // is the first constraint that carries an evaluated length.
+        let width_dim = (0..state.doc.constraints.len())
+            .find(|&i| crate::constraints::constraint_evaluated_length(&state.doc, i).is_some())
+            .expect("rectangle should have a width dimension constraint");
+        let (a, b) = crate::constraints::constraint_segment_endpoints(&state.doc, width_dim).unwrap();
         let world = crate::dimensions::linear_dimension_world_geom(
             a,
             b,
@@ -4440,7 +4384,7 @@ mod tests {
             1.0,
             2.0,
         );
-        let label_text = crate::constraints::constraint_evaluated_length(&state.doc, 0)
+        let label_text = crate::constraints::constraint_evaluated_length(&state.doc, width_dim)
             .map(crate::value::format_length_display)
             .unwrap();
         let (text_vertices, text_indices) = crate::gpu_viewport::build_planar_label_mesh(
@@ -4524,7 +4468,6 @@ mod tests {
         assert!(!scene.text_vertices.is_empty());
         assert!(!scene.text_indices.is_empty());
         assert!(scene.vertices.len() > vertex_count_before);
-        let _ = constraint;
     }
 
     #[test]

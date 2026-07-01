@@ -744,7 +744,7 @@ pub fn show_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Circle, Document, FaceId, Line, Rect};
+    use crate::model::{Document, FaceId, Line};
     use crate::selection::click_scene_selection;
 
     fn input<'a>(doc: &'a Document, selection: &'a SceneSelection) -> ContextInput<'a> {
@@ -788,55 +788,6 @@ mod tests {
                 }),
             }
         );
-    }
-
-    #[test]
-    fn shows_construction_union_for_multiple_selected() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 5.0, 0.0));
-        let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::RectEdge(0, RectEdge::Bottom), false);
-        click_scene_selection(&mut sel, SceneElement::Line(0), true);
-        assert_eq!(
-            context_pane_content(&input(&doc, &sel)),
-            ContextPaneContent {
-                name: None,
-                curve_mode: None,
-                tangent_constraint: None,
-                construction: Some(ConstructionControl {
-                    value: TriState::Off,
-                    target_count: 2,
-                }),
-                constraints: None,
-                snapping: None,
-                extrude_body: None,
-                units: None,
-            }
-        );
-    }
-
-    #[test]
-    fn mixed_when_selected_edges_disagree() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        doc.rects[0].set_edge_construction(RectEdge::Bottom, true);
-        let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::RectEdge(0, RectEdge::Bottom), false);
-        click_scene_selection(&mut sel, SceneElement::RectEdge(0, RectEdge::Top), true);
-        assert_eq!(
-            construction_tri_state(&doc, &construction_targets_from_selection(&sel)),
-            TriState::Mixed
-        );
-    }
-
-    #[test]
-    fn whole_rectangle_expands_to_all_edges() {
-        let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Rect(0), false);
-        assert_eq!(construction_targets_from_selection(&sel).len(), 4);
     }
 
     #[test]
@@ -1070,67 +1021,5 @@ mod tests {
             content.constraints.as_ref().map(|rows| rows.len()),
             Some(crate::geometric_constraints::GeometricConstraintType::ALL.len())
         );
-    }
-
-    #[test]
-    fn selection_highlight_dashed_for_construction_primitives() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 5.0, 0.0));
-        doc.lines[0].construction = true;
-        doc.circles
-            .push(Circle::from_local_center_radius(sketch, 0.0, 0.0, 5.0, 0.0));
-        doc.circles[0].construction = true;
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        doc.rects[0].set_edge_construction(RectEdge::Bottom, true);
-
-        assert_eq!(
-            selection_highlight_dashed(&doc, SceneElement::Line(0)),
-            Some(true)
-        );
-        assert_eq!(
-            selection_highlight_dashed(&doc, SceneElement::Circle(0)),
-            Some(true)
-        );
-        assert_eq!(
-            selection_highlight_dashed(&doc, SceneElement::RectEdge(0, RectEdge::Bottom)),
-            Some(true)
-        );
-        assert_eq!(
-            selection_highlight_dashed(&doc, SceneElement::RectEdge(0, RectEdge::Top)),
-            Some(false)
-        );
-        assert_eq!(selection_highlight_dashed(&doc, SceneElement::Rect(0)), None);
-    }
-
-    #[test]
-    fn set_construction_for_targets_updates_all() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0));
-        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 2.0, 0.0));
-        let targets = vec![
-            SceneElement::RectEdge(0, RectEdge::Left),
-            SceneElement::Line(0),
-        ];
-        set_construction_for_targets(&mut doc, &targets, true).unwrap();
-        assert!(doc.rects[0].edge_construction(RectEdge::Left));
-        assert!(doc.lines[0].construction);
-    }
-
-    #[test]
-    fn toggle_construction_for_targets_flips_each() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 1.0));
-        doc.rects[0].set_edge_construction(RectEdge::Bottom, true);
-        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 2.0, 0.0));
-        let targets = vec![
-            SceneElement::RectEdge(0, RectEdge::Bottom),
-            SceneElement::Line(0),
-        ];
-        toggle_construction_for_targets(&mut doc, &targets).unwrap();
-        assert!(!doc.rects[0].edge_construction(RectEdge::Bottom));
-        assert!(doc.lines[0].construction);
     }
 }

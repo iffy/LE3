@@ -1014,47 +1014,16 @@ pub fn show_pane(ui: &mut egui::Ui, app: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::{Action, ActionResult, AppState};
+    use crate::actions::AppState;
     use crate::constraints::add_distance_constraint;
     use crate::document_lifecycle::tombstone_element;
     use crate::hierarchy::SceneElement;
     use crate::model::{DistanceTarget, Document, FaceId, Line, ShapeKind};
-    use crate::Rect;
 
     fn doc_with_param_a() -> Document {
         let mut doc = Document::default();
         add_parameter(&mut doc, "A".to_string(), "5mm".to_string()).unwrap();
         doc
-    }
-
-    #[test]
-    fn elements_using_parameter_includes_constraint_and_geometry() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        add_parameter(&mut doc, "w".to_string(), "20mm".to_string()).unwrap();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        doc.shape_order.push(ShapeKind::Rect);
-        doc.lines
-            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
-        doc.shape_order.push(ShapeKind::Line);
-        // Rect width uses `w`; the line length does not.
-        add_distance_constraint(&mut doc, sketch, DistanceTarget::RectWidth(0), "w".to_string())
-            .unwrap();
-        add_distance_constraint(
-            &mut doc,
-            sketch,
-            DistanceTarget::LineLength(0),
-            "10mm".to_string(),
-        )
-        .unwrap();
-
-        let using = elements_using_parameter(&doc, "w");
-        let width_constraint =
-            find_distance_constraint(&doc, DistanceTarget::RectWidth(0)).unwrap();
-        assert!(using.contains(&SceneElement::Constraint(width_constraint)));
-        assert!(using.contains(&SceneElement::Rect(0)));
-        assert!(!using.contains(&SceneElement::Line(0)));
     }
 
     #[test]
@@ -1083,43 +1052,6 @@ mod tests {
         add_parameter(&mut doc, "B".to_string(), "A + 5in".to_string()).unwrap();
         set_parameter_name(&mut doc, 0, "Len".to_string()).unwrap();
         assert_eq!(doc.parameters[1].expression, "Len + 5in");
-    }
-
-    #[test]
-    fn parameter_value_change_recomputes_rectangle_width() {
-        let mut doc = doc_with_param_a();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 5.0, 10.0));
-        doc.shape_order.push(ShapeKind::Rect);
-        add_distance_constraint(
-            &mut doc,
-            sketch,
-            DistanceTarget::RectWidth(0),
-            "A".to_string(),
-        )
-        .unwrap();
-
-        set_parameter_expression(&mut doc, 0, "10mm".to_string()).unwrap();
-        assert!((doc.rects[0].w - 10.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn rectangle_with_parameter_expression_evaluates_on_recompute() {
-        let mut doc = doc_with_param_a();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 1.0, 10.0));
-        doc.shape_order.push(ShapeKind::Rect);
-        add_distance_constraint(
-            &mut doc,
-            sketch,
-            DistanceTarget::RectWidth(0),
-            "A + 5in".to_string(),
-        )
-        .unwrap();
-        recompute_document_geometry(&mut doc).unwrap();
-        assert!((doc.rects[0].w - (5.0 + 5.0 * 25.4)).abs() < 1e-2);
     }
 
     #[test]
@@ -1210,33 +1142,6 @@ mod tests {
         assert!(parameter_edit_enter_pressed(true, true, false));
         assert!(!parameter_edit_enter_pressed(true, false, false));
         assert!(!parameter_edit_enter_pressed(false, false, true));
-    }
-
-    #[test]
-    fn commit_parameter_expression_via_action_recomputes_dependent_rectangle() {
-        let mut state = AppState::default();
-        add_parameter(&mut state.doc, "A".to_string(), "5mm".to_string()).unwrap();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state.doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 5.0, 10.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
-        add_distance_constraint(
-            &mut state.doc,
-            sketch,
-            DistanceTarget::RectWidth(0),
-            "A".to_string(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            state.apply(Action::CommitParameterExpression {
-                index: 0,
-                expression: "12mm".to_string(),
-            }),
-            ActionResult::Ok
-        );
-        assert_eq!(state.doc.parameters[0].expression, "12mm");
-        assert!((state.doc.rects[0].w - 12.0).abs() < 1e-3);
     }
 
     #[test]

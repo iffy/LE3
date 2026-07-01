@@ -649,7 +649,7 @@ impl SketchBridge {
 
     /// Resolve a point's solver variables, lazily seeding a `FaceVertex` the first time it's
     /// referenced (#26/#27): unlike sketch-native points, a face's own vertex isn't discovered
-    /// by `seed_entities` walking `doc.lines`/`doc.rects`/`doc.circles`, so it's seeded here on
+    /// by `seed_entities` walking `doc.lines`/`doc.circles`, so it's seeded here on
     /// first use instead — as a **fixed** point (mirrors how `add_coincident`'s `Origin` arm
     /// above adds a fixed helper point), since it's not draggable/settable.
     fn point_vars(&mut self, doc: &Document, point: ConstraintPoint) -> Result<(VarId, VarId), String> {
@@ -882,20 +882,20 @@ fn set_point_uv_from_solver(
     v: f64,
 ) -> Result<(), String> {
     // `sketch` is only meaningful for `FaceVertex` (fixed, so `set_point_uv` always errors on
-    // it anyway) — every point this is actually called with (`LineEndpoint`/`RectCorner`/
-    // `CircleCenter`) ignores it.
+    // it anyway) — every point this is actually called with (`LineEndpoint`/`CircleCenter`)
+    // ignores it.
     crate::geometric_constraints::set_point_uv(doc, sketch, point, u as f32, v as f32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constraints::{add_distance_constraint, find_distance_constraint};
+    use crate::constraints::add_distance_constraint;
     use crate::geometric_constraints::{
-        add_geometric_constraint_from_selection, line_direction_uv, GeometricConstraintType,
+        add_geometric_constraint_from_selection, GeometricConstraintType,
     };
     use crate::hierarchy::SceneElement;
-    use crate::model::{Constraint, ConstraintKind, Document, FaceId, Line, Rect};
+    use crate::model::{Constraint, ConstraintKind, Document, FaceId, Line};
     use crate::selection::{click_scene_selection, SceneSelection};
 
     const EPS: f32 = 1e-2;
@@ -908,70 +908,6 @@ mod tests {
 
     fn solve_bridge(doc: &mut Document, _sketch: SketchId) {
         solve_document_sketches(doc, &[]).expect("solve");
-    }
-
-    /// A rectangle has 4 degrees of freedom (x, y, w, h), not 8 — its corners are not
-    /// four independent points. The solver must keep it rigid/axis-aligned.
-    #[test]
-    fn free_rectangle_reports_four_dof() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 6.0));
-        assert_eq!(sketch_dof_remaining(&doc, sketch).unwrap(), 4);
-    }
-
-    /// When a constraint pulls one rectangle corner, the rectangle must stay rigid so the
-    /// corner actually tracks what it is tied to (here, a coincident line endpoint).
-    #[test]
-    fn solver_keeps_rect_rigid_when_corner_pulled_by_coincidence() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 6.0));
-        doc.lines
-            .push(Line::from_local_endpoints(sketch, 10.0, 6.0, 16.0, 6.0));
-        doc.shape_order.push(crate::model::ShapeKind::Rect);
-        doc.shape_order.push(crate::model::ShapeKind::Line);
-
-        let corner2 = ConstraintPoint::RectCorner { rect: 0, corner: 2 };
-        let line_start = ConstraintPoint::LineEndpoint {
-            line: 0,
-            end: LineEnd::Start,
-        };
-        let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Point(corner2.clone()), false);
-        click_scene_selection(&mut sel, SceneElement::Point(line_start.clone()), true);
-        add_geometric_constraint_from_selection(
-            &mut doc,
-            sketch,
-            GeometricConstraintType::Coincident,
-            &sel,
-        )
-        .unwrap();
-        let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Line(0), false);
-        add_geometric_constraint_from_selection(
-            &mut doc,
-            sketch,
-            GeometricConstraintType::Horizontal,
-            &sel,
-        )
-        .unwrap();
-
-        // Pull the far line endpoint down; the near end (and the rect corner) must follow.
-        let line_end = ConstraintPoint::LineEndpoint {
-            line: 0,
-            end: LineEnd::End,
-        };
-        let pins = [(line_end, (16.0_f32, 3.0_f32))];
-        solve_document_sketches(&mut doc, &pins).unwrap();
-
-        let (lsu, lsv) = point_uv(&doc, sketch, line_start).unwrap();
-        let (c2u, c2v) = point_uv(&doc, sketch, corner2).unwrap();
-        assert!(
-            (c2u - lsu).abs() < 0.1 && (c2v - lsv).abs() < 0.1,
-            "rect corner detached from coincident line start: corner=({c2u},{c2v}) line_start=({lsu},{lsv})"
-        );
-        assert!((c2v - 3.0).abs() < 0.3, "rect corner should follow to v=3, got {c2v}");
     }
 
     /// Dragging the movable line of a parallel pair must not drag the reference line.
@@ -1093,48 +1029,6 @@ mod tests {
     }
 
     #[test]
-    fn bridge_rect_width_updates_with_height_constraint() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        add_distance_constraint(
-            &mut doc,
-            sketch,
-            DistanceTarget::RectWidth(0),
-            "10mm".to_string(),
-        )
-        .unwrap();
-        add_distance_constraint(
-            &mut doc,
-            sketch,
-            DistanceTarget::RectHeight(0),
-            "5mm".to_string(),
-        )
-        .unwrap();
-        let width_id = find_distance_constraint(&doc, DistanceTarget::RectWidth(0)).unwrap();
-        crate::constraints::set_constraint_expression(&mut doc, width_id, "20mm".to_string()).unwrap();
-        assert!(
-            (doc.rects[0].w - 20.0).abs() < EPS,
-            "w={} corners: {:?}",
-            doc.rects[0].w,
-            (
-                point_uv(
-                    &doc,
-                    sketch,
-                    ConstraintPoint::RectCorner { rect: 0, corner: 0 },
-                )
-                .unwrap(),
-                point_uv(
-                    &doc,
-                    sketch,
-                    ConstraintPoint::RectCorner { rect: 0, corner: 1 },
-                )
-                .unwrap(),
-            )
-        );
-    }
-
-    #[test]
     fn bridge_round_trip_line() {
         let (mut doc, sketch) = sketch_doc();
         doc.lines
@@ -1149,34 +1043,6 @@ mod tests {
         doc.lines[0].x1 = 7.0;
         solve_bridge(&mut doc, sketch);
         assert!((doc.lines[0].length() - 10.0).abs() < EPS);
-    }
-
-    #[test]
-    fn bridge_rect_edge_parallel() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        doc.lines
-            .push(Line::from_local_endpoints(sketch, 0.0, 10.0, 3.0, 13.0));
-        let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::RectEdge(0, RectEdge::Bottom), false);
-        click_scene_selection(&mut sel, SceneElement::Line(0), true);
-        add_geometric_constraint_from_selection(
-            &mut doc,
-            sketch,
-            GeometricConstraintType::Parallel,
-            &sel,
-        )
-        .unwrap();
-        solve_bridge(&mut doc, sketch);
-        let edge = ConstraintLine::RectEdge {
-            rect: 0,
-            edge: RectEdge::Bottom,
-        };
-        let (edu, edv) = line_direction_uv(&doc, sketch, edge).unwrap();
-        let (ldu, ldv) = line_direction_uv(&doc, sketch, ConstraintLine::Line(0)).unwrap();
-        let cross = edu * ldv - edv * ldu;
-        assert!(cross.abs() < EPS, "cross={cross}");
     }
 
     #[test]
@@ -1311,81 +1177,5 @@ mod tests {
         .unwrap();
         assert!((pu - 5.0).abs() < EPS);
         assert!(pv.abs() < EPS);
-    }
-
-    #[test]
-    fn bridge_rect_parallel_perpendicular_point_line_distance() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.lines
-            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 100.0, 0.0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 20.0, 10.0, 70.0, 40.0));
-        doc.lines
-            .push(Line::from_local_endpoints(sketch, 30.0, 55.0, 30.0, 85.0));
-        doc.shape_order.push(crate::model::ShapeKind::Line);
-        doc.shape_order.push(crate::model::ShapeKind::Rect);
-        doc.shape_order.push(crate::model::ShapeKind::Line);
-
-        let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::RectEdge(0, RectEdge::Top), false);
-        click_scene_selection(&mut sel, SceneElement::Line(0), true);
-        add_geometric_constraint_from_selection(
-            &mut doc,
-            sketch,
-            GeometricConstraintType::Parallel,
-            &sel,
-        )
-        .unwrap();
-
-        let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Line(0), false);
-        click_scene_selection(&mut sel, SceneElement::Line(1), true);
-        add_geometric_constraint_from_selection(
-            &mut doc,
-            sketch,
-            GeometricConstraintType::Perpendicular,
-            &sel,
-        )
-        .unwrap();
-
-        let rect_top = ConstraintLine::RectEdge {
-            rect: 0,
-            edge: RectEdge::Top,
-        };
-        add_distance_constraint(
-            &mut doc,
-            sketch,
-            DistanceTarget::PointLineDistance {
-                point: ConstraintPoint::LineEndpoint {
-                    line: 1,
-                    end: LineEnd::Start,
-                },
-                line: rect_top,
-                side: 1,
-            },
-            "50mm".to_string(),
-        )
-        .unwrap();
-
-        solve_bridge(&mut doc, sketch);
-
-        let (adu, adv) = line_direction_uv(&doc, sketch, ConstraintLine::Line(0)).unwrap();
-        let (bdu, bdv) = line_direction_uv(&doc, sketch, ConstraintLine::Line(1)).unwrap();
-        assert!((adu * bdu + adv * bdv).abs() < EPS);
-
-        let pins = [(
-            ConstraintPoint::LineEndpoint {
-                line: 1,
-                end: LineEnd::End,
-            },
-            (45.0_f32, 100.0_f32),
-        )];
-        solve_document_sketches(&mut doc, &pins).unwrap();
-        let (adu, adv) = line_direction_uv(&doc, sketch, ConstraintLine::Line(0)).unwrap();
-        let (bdu, bdv) = line_direction_uv(&doc, sketch, ConstraintLine::Line(1)).unwrap();
-        assert!((adu * bdu + adv * bdv).abs() < 0.05, "perpendicular broken after drag");
-        let line = &doc.lines[1];
-        assert!((line.x1 - 45.0).abs() < 0.1);
-        assert!((line.y1 - 100.0).abs() < 0.1);
     }
 }

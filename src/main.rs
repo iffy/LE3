@@ -7381,6 +7381,17 @@ mod tests {
         assert_eq!(col::RECT_LINE, Color32::from_rgb(120, 170, 240));
     }
 
+    fn test_viewport_rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(960.0, 560.0))
+    }
+
+    #[test]
+    fn next_rect_focus_axis_toggles_width_and_height() {
+        use super::{next_rect_focus_axis, RectAxis};
+        assert_eq!(next_rect_focus_axis(0), RectAxis::Height);
+        assert_eq!(next_rect_focus_axis(1), RectAxis::Width);
+    }
+
     #[test]
     fn extrude_preview_uses_pending_target_before_commit() {
         // While dragging the gizmo, the snapped target lives in `pending_extrude_target`
@@ -7388,7 +7399,7 @@ mod tests {
         // must still pick it up live so it shows the real (e.g. slanted) shape while
         // dragging, not just after release (#63).
         use crate::actions::{Action, AppState, Tool};
-        use crate::model::{ExtrudeFace, ExtrudeTarget, Rect, ShapeKind};
+        use crate::model::{ExtrudeFace, ExtrudeTarget};
 
         let mut state = AppState::default();
         state.apply(Action::BeginSketch {
@@ -7396,11 +7407,10 @@ mod tests {
             viewport: None,
         });
         let sketch = state.sketch_session.unwrap().sketch;
-        state.doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        state.doc.shape_order.push(ShapeKind::Rect);
+        crate::construction::add_line_rectangle(&mut state.doc, sketch, 0.0, 0.0, 10.0, 5.0, [false; 4]);
         state.apply(Action::SetTool(Tool::Extrude));
         state.apply(Action::ToggleExtrudeFace {
-            face: ExtrudeFace::Rect(0),
+            face: ExtrudeFace::Polygon(vec![0, 1, 2, 3]),
         });
         let ce = state.creating_extrusion.as_ref().unwrap();
         assert_eq!(ce.target, None, "target isn't committed onto ce yet");
@@ -7442,17 +7452,10 @@ mod tests {
         );
     }
 
-    /// #77: while dragging the 3D edge chamfer/fillet gizmo, the live amount should drive a
-    /// ghost-preview solid via the same `preview_extrusion`/`editing_extrusion` mechanism the
-    /// extrude tool uses — the real body is suppressed (`editing_extrusion`) while the ghost
-    /// (a clone of the extrusion with the live treatment spliced in) is shown instead. Mirrors
-    /// `extrude_preview_uses_pending_target_before_commit`.
     #[test]
     fn edge_treatment_preview_shows_the_live_amount_and_suppresses_the_real_body() {
         use crate::actions::{Action, AppState, CreatingEdgeTreatment, Tool};
-        use crate::model::{ExtrudeFace, ExtrusionEdgeRef};
-
-        use crate::model::VertexTreatmentKind;
+        use crate::model::{ExtrudeFace, ExtrusionEdgeRef, VertexTreatmentKind};
 
         let mut state = AppState::default();
         state.apply(Action::BeginSketch {
@@ -7460,13 +7463,11 @@ mod tests {
             viewport: None,
         });
         let sketch = state.sketch_session.unwrap().sketch;
-        state
-            .doc
-            .rects
-            .push(crate::model::Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        state.doc.shape_order.push(crate::model::ShapeKind::Rect);
+        crate::construction::add_line_rectangle(&mut state.doc, sketch, 0.0, 0.0, 10.0, 10.0, [false; 4]);
         state.apply(Action::SetTool(Tool::Extrude));
-        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
+        state.apply(Action::ToggleExtrudeFace {
+            face: ExtrudeFace::Polygon(vec![0, 1, 2, 3]),
+        });
         state.apply(Action::SetExtrudeDistance { distance: 5.0 });
         state.apply(Action::CommitExtrusion);
         assert_eq!(state.doc.extrusions[0].edge_treatments.len(), 0);
@@ -7511,19 +7512,12 @@ mod tests {
             None,
             None,
         );
-        // The ghost preview carries the live in-progress treatment...
         let preview = scene_input.preview_extrusion.as_ref().expect("expected a ghost preview");
         assert_eq!(preview.edge_treatments.len(), 1);
         assert_eq!(preview.edge_treatments[0].amount, 2.0);
         assert_eq!(preview.edge_treatments[0].edge, edge);
-        // ...and the real (committed, untreated) body is suppressed while it's shown.
         assert_eq!(scene_input.editing_extrusion, Some(0));
-        // The document itself is untouched until commit.
         assert!(state.doc.extrusions[0].edge_treatments.is_empty());
-    }
-
-    fn test_viewport_rect() -> egui::Rect {
-        egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(960.0, 560.0))
     }
 
     /// A two-line right-angle corner (10mm + 10mm legs meeting at (10,0)) in a fresh sketch on
@@ -7908,13 +7902,6 @@ mod tests {
         assert!(should_commit_sketch_on_enter(false, false, true));
         assert!(!should_commit_sketch_on_enter(false, true, true));
         assert!(!should_commit_sketch_on_enter(false, false, false));
-    }
-
-    #[test]
-    fn next_rect_focus_axis_toggles_width_and_height() {
-        use super::{next_rect_focus_axis, RectAxis};
-        assert_eq!(next_rect_focus_axis(0), RectAxis::Height);
-        assert_eq!(next_rect_focus_axis(1), RectAxis::Width);
     }
 
     #[test]

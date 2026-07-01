@@ -145,7 +145,7 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
   new line's carrier) — no new `ConstraintKind` needed.
 - **Polygon faces from closed line loops (#66):** any set of plain `Line`s that connect
   end-to-end into a closed loop, via `Coincident` constraints on their endpoints, is itself a
-  usable face — filled the same as a rect/circle profile (shared blue styling, construction
+  usable face — filled the same as a circle profile (shared blue styling, construction
   loops dashed/dimmed like other construction geometry), pickable for sketching-on-face, and
   extrudable. Loops are detected on the fly (not a stored entity) as every simple cycle in the
   sketch's line-connectivity graph; a line shared by two loops (e.g. a rectangle split by a
@@ -244,13 +244,13 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
 ### 3.2 Solid creation from sketches
 - **Extrude** — blind, symmetric, to-object, with optional draft angle.
   - An **Extrusion** is a first-class feature element (own hierarchy row, nameable, undoable):
-    it references one or more coplanar sketch faces (closed rect/circle/polygon profiles) and a
-    signed distance along the plane normal, and generates a solid mesh (prism per rect or
-    polygon, cylinder per circle). Each extrusion produces a **Body** (the solid result) that
-    depends on it: the body nests under the extrusion in the Elements pane and is removed if the
-    extrusion is deleted.
+    it references one or more coplanar sketch faces (closed circle/polygon profiles — a
+    rectangle is a four-line polygon loop) and a signed distance along the plane normal, and
+    generates a solid mesh (prism per polygon, cylinder per circle). Each extrusion produces a
+    **Body** (the solid result) that depends on it: the body nests under the extrusion in the
+    Elements pane and is removed if the extrusion is deleted.
     Created in script via
-    `bearcad.extrude{ rect|circle|polygon|rects|circles, distance, name?, body? }`.
+    `bearcad.extrude{ circle|polygon|circles, distance, name?, body? }`.
   - Implemented: the data model (Extrusion + Body) with `.bearcad` persistence; mesh generation;
     both hierarchy elements; depth-tested flat-shaded rendering; and the interactive **Extrude
     tool** (`E`): click coplanar faces to toggle inclusion (hover-highlighted), drag the normal
@@ -290,7 +290,7 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
     other, via two point-in-polygon tests against the picked point. This is `ExtrudeFace::
     Boolean { op: BooleanOp::Intersection | Difference, a, b }` (`a`/`b` boxed `ExtrudeFace`s,
     recursive so the type stays general, though the interactive picker only ever constructs
-    depth-1 combinations of two raw `Rect`/`Circle`/`Polygon` shapes) — toggled into
+    depth-1 combinations of two raw `Circle`/`Polygon` shapes) — toggled into
     `Extrusion::faces` exactly like any other face (multi-face selection already lets a union of
     two whole shapes be built by toggling both, so no separate `Union` variant is needed). The
     region's boundary is computed on demand by `crate::polygon_boolean::polygon_boolean`, a
@@ -298,8 +298,8 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
     the standard trick that turns the same intersection-walk into a subtraction); its resolved
     loop feeds mesh generation, fill rendering, and hover-highlighting the same way a `Polygon`
     face's loop already does. Scriptable via `bearcad.extrude{ boolean = { op = "intersection" |
-    "difference", a = <face spec>, b = <face spec> }, distance }`, where a face spec is `{rect=
-    i}`/`{circle=i}`/`{polygon={...}}`/a nested `{boolean={...}}`.
+    "difference", a = <face spec>, b = <face spec> }, distance }`, where a face spec is
+    `{circle=i}`/`{polygon={...}}` (a rectangle is a four-line polygon)/a nested `{boolean={...}}`.
     - **Scope (deliberate, not yet general N-way arrangements)**: only ever two shapes at a
       time — a sketch with three or more mutually-overlapping shapes falls back to today's
       whole-shape picking instead. `polygon_boolean` itself only produces a result when the
@@ -340,7 +340,8 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
   directly reshapes the extrusion's own triangle mesh. If the kernel can't place a treatment (an
   edge it can't match, or an OCCT error) that extrusion falls back to the mesh-bevel path, so
   broken geometry never ships. Both paths are scoped to bodies whose source is one or more
-  `Extrusion`s with a `Rect` or `Polygon` profile, and to the two edge families that have a clean
+  `Extrusion`s with a `Polygon` profile (a rectangle being a four-line polygon), and to the two
+  edge families that have a clean
   analytic definition there (see `crate::extrude::side_quad_world`/`cap_polygon_world`):
   - a **vertical side edge**, where two adjacent flat side walls of the profile meet, and
   - a **side/cap edge**, where a side wall meets the top or bottom cap.
@@ -530,9 +531,9 @@ modeled on SolveSpace (https://solvespace.com).
   magnitudes (supplementary, one on each pair of opposite wedges), and whichever wedge
   encloses the cursor is the one previewed. Clicking commits that choice and moves to typing
   the value, the same as other dimensions (#40).
-- **Selection:** Sketch points (line endpoints, rectangle corners, circle centres), lines,
-  and rectangle edges are selectable in the viewport. Point picks take precedence near
-  vertices within the point pick tolerance.
+- **Selection:** Sketch points (line endpoints — including a rectangle's corners — and circle
+  centres), lines (a rectangle's four edges are plain lines), and circles are selectable in the
+  viewport. Point picks take precedence near vertices within the point pick tolerance.
 - **Context pane:** While the constraint tool is active, the context pane lists geometric
   constraint types as buttons (text labels for now; icons later).
   - **Always all types:** every constraint type is **always listed**, in fixed order.
@@ -547,8 +548,8 @@ modeled on SolveSpace (https://solvespace.com).
 - **Geometric types (v1):**
   - **Parallel** — `line`, `line`
   - **Perpendicular** — `line`, `line`
-  - **Equal** — `line`, `line` (the two edges are constrained to equal length; rect edges
-    count as lines). See #47.
+  - **Equal** — `line`, `line` (the two edges are constrained to equal length; a rectangle's
+    edges are plain lines). See #47.
   - **Coincident** — `point`, `point`; `point`, `line`; or `point`, `circle` (point on the
     circle's perimeter). A `point`/`line` operand may be the sketch's own face's vertex/edge
     (#26/#27, see §3.1) — picked the same way as any other sketch point/line.
@@ -576,7 +577,8 @@ back the assembly joints/mates (§2.3).
 ### 6.3 Solver
 - A native Rust numeric constraint solver (`sketch_solver`) resolves sketch constraint
   systems by minimizing weighted residuals with dense Levenberg–Marquardt (SolveSpace-style).
-- Rectangles decompose to four corner points; circles use centre point + radius variable.
+- Rectangles are four constrained lines (eight endpoint variables, closed by coincident
+  constraints); circles use centre point + radius variable.
 - Interactive drag adds high-weight pin residuals; reference geometry uses softer holds that
   are skipped during drag so the solver can rebalance.
 - The UI must report **under-** and **over-constrained** states and indicate conflicting
@@ -667,19 +669,18 @@ Everything achievable in the GUI must be achievable by programming, and vice ver
   mouse/keyboard) and enter a ground-plane sketch if none is open: `bearcad.rect{ width, height,
   x?, y?, name? }` and `bearcad.line{ length, angle?, x?, y?, name? }` (or explicit endpoints
   `bearcad.line{ x, y, x1, y1 }`).
-- `bearcad.begin_sketch{ … }` starts a sketch on any face. Besides `kind = "rect"|"circle"|"plane"`
+- `bearcad.begin_sketch{ … }` starts a sketch on any face. Besides `kind = "circle"|"plane"`
   with `index`, it accepts **3D body faces**: `kind = "extrude_cap", extrusion, profile =
-  "rect"|"circle", profile_index, top?` and `kind = "extrude_side", extrusion, profile,
-  profile_index, edge?`. (This makes sketching on a solid's face scriptable, e.g. for testing.)
+  "circle"|"polygon" (with `profile_lines = {..}` for polygons), profile_index, top?` and
+  `kind = "extrude_side", extrusion, profile, profile_index, edge?`. (This makes sketching on a
+  solid's face scriptable, e.g. for testing.)
 - **Point-level selection (#68):** `bearcad.select{ kind = "line", index, ["end"] = "start"|"end" }`
-  or `bearcad.select{ kind = "rect", index, corner = 0..3 }` selects an individual vertex (a
-  `ConstraintPoint`) rather than the whole element, so e.g. `bearcad.select{...}` +
-  `bearcad.select({...}, true)` + `bearcad.add_geometric_constraint("coincident")` can join two
-  line endpoints (closing a polygon loop) purely from a script — the same point-numbering the
-  interactive Constraint tool uses (a rect's corners are numbered 0–3 counterclockwise starting
-  at its `(x, y)` origin corner; a line's two points are `start`/`end`, i.e. `(x0,y0)`/`(x1,y1)`).
-  A table with neither `end` nor `corner` still resolves to the whole element as before; pass an
-  explicit `point = true` to target a point that has no such field (e.g. a circle's center).
+  selects an individual vertex (a `ConstraintPoint`) rather than the whole element, so e.g.
+  `bearcad.select{...}` + `bearcad.select({...}, true)` + `bearcad.add_geometric_constraint("coincident")`
+  can join two line endpoints (closing a polygon loop — including a rectangle's four corners)
+  purely from a script — a line's two points are `start`/`end`, i.e. `(x0,y0)`/`(x1,y1)`.
+  A table with no `end` still resolves to the whole element as before; pass an explicit
+  `point = true` to target a point that has no such field (e.g. a circle's center).
 - **Face vertex/edge selection (#26/#27):** `bearcad.select{ kind = "face", face = { … }, index }`
   selects a corner of the *sketched-on* face's own boundary loop (a `ConstraintPoint::FaceVertex`);
   add `edge = true` to select the edge from that corner to the next instead

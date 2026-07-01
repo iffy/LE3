@@ -82,8 +82,8 @@ mod tests {
     fn single_returns_one_selected_element() {
         let mut sel = SceneSelection::default();
         assert_eq!(sel.single(), None);
-        click_scene_selection(&mut sel, SceneElement::Rect(0), false);
-        assert_eq!(sel.single(), Some(SceneElement::Rect(0)));
+        click_scene_selection(&mut sel, SceneElement::Circle(0), false);
+        assert_eq!(sel.single(), Some(SceneElement::Circle(0)));
         click_scene_selection(&mut sel, SceneElement::Line(1), true);
         assert_eq!(sel.single(), None);
     }
@@ -91,8 +91,8 @@ mod tests {
     #[test]
     fn click_replaces_selection_without_modifier() {
         let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Rect(0), false);
-        assert_eq!(selection_single(&sel), Some(SceneElement::Rect(0)));
+        click_scene_selection(&mut sel, SceneElement::Circle(0), false);
+        assert_eq!(selection_single(&sel), Some(SceneElement::Circle(0)));
         click_scene_selection(&mut sel, SceneElement::Line(1), false);
         assert_eq!(selection_single(&sel), Some(SceneElement::Line(1)));
     }
@@ -100,40 +100,27 @@ mod tests {
     #[test]
     fn click_selected_deselects() {
         let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Rect(0), false);
-        click_scene_selection(&mut sel, SceneElement::Rect(0), false);
+        click_scene_selection(&mut sel, SceneElement::Circle(0), false);
+        click_scene_selection(&mut sel, SceneElement::Circle(0), false);
         assert!(sel.is_empty());
     }
 
     #[test]
     fn additive_click_builds_multi_selection() {
         let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Rect(0), false);
+        click_scene_selection(&mut sel, SceneElement::Circle(0), false);
         click_scene_selection(&mut sel, SceneElement::Line(1), true);
         assert_eq!(selection_count(&sel), 2);
-        assert!(sel.is_selected(SceneElement::Rect(0)));
+        assert!(sel.is_selected(SceneElement::Circle(0)));
         assert!(sel.is_selected(SceneElement::Line(1)));
-    }
-
-    #[test]
-    fn additive_click_rect_edges() {
-        let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::RectEdge(0, crate::model::RectEdge::Bottom), false);
-        click_scene_selection(
-            &mut sel,
-            SceneElement::RectEdge(0, crate::model::RectEdge::Top),
-            true,
-        );
-        assert_eq!(selection_count(&sel), 2);
-        assert!(sel.has_rect_edge_selected(0));
     }
 
     #[test]
     fn additive_click_selected_deselects_one() {
         let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Rect(0), false);
+        click_scene_selection(&mut sel, SceneElement::Circle(0), false);
         click_scene_selection(&mut sel, SceneElement::Line(1), true);
-        click_scene_selection(&mut sel, SceneElement::Rect(0), true);
+        click_scene_selection(&mut sel, SceneElement::Circle(0), true);
         assert_eq!(selection_single(&sel), Some(SceneElement::Line(1)));
     }
 

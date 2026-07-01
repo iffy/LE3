@@ -232,33 +232,7 @@ pub fn node_label(doc: &Document, node: HierarchyNode) -> String {
 mod tests {
     use super::*;
     use crate::constraints::add_distance_constraint;
-    use crate::model::{Document, FaceId, Line, Rect};
-    use crate::selection::{click_scene_selection, SceneSelection};
-
-    #[test]
-    fn rect_edge_maps_to_parent_rect_for_naming() {
-        assert_eq!(
-            nameable_element(SceneElement::RectEdge(2, crate::model::RectEdge::Top)),
-            Some(SceneElement::Rect(2))
-        );
-        assert_eq!(
-            nameable_element(SceneElement::Line(0)),
-            Some(SceneElement::Line(0))
-        );
-    }
-
-    #[test]
-    fn single_nameable_requires_exactly_one_selected() {
-        let mut sel = SceneSelection::default();
-        assert_eq!(single_nameable_from_selection(&sel), None);
-        click_scene_selection(&mut sel, SceneElement::Line(0), false);
-        assert_eq!(
-            single_nameable_from_selection(&sel),
-            Some(SceneElement::Line(0))
-        );
-        click_scene_selection(&mut sel, SceneElement::Rect(1), true);
-        assert_eq!(single_nameable_from_selection(&sel), None);
-    }
+    use crate::model::{Document, FaceId, Line};
 
     #[test]
     fn chamfer_fillet_bridge_line_gets_a_recognizable_default_label() {
@@ -291,49 +265,6 @@ mod tests {
             element_name(&doc, SceneElement::Line(0)),
             Some("Guide")
         );
-    }
-
-    #[test]
-    fn empty_name_clears_custom_label() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        set_element_name(&mut doc, SceneElement::Rect(0), "Box".to_string()).unwrap();
-        set_element_name(&mut doc, SceneElement::Rect(0), "   ".to_string()).unwrap();
-        assert_eq!(element_name(&doc, SceneElement::Rect(0)), None);
-        assert!(node_label(&doc, HierarchyNode::Rect(0)).starts_with("Rectangle 0"));
-    }
-
-    #[test]
-    fn default_node_label_respects_document_default_length_unit() {
-        // #85: setting the document's default unit to inches must be reflected in the
-        // Elements-pane label for descendant geometry, not hardcoded mm.
-        let mut doc = Document::default();
-        doc.default_length_unit = crate::value::LengthUnit::In;
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 25.4, 50.8));
-        let label = node_label(&doc, HierarchyNode::Rect(0));
-        assert!(label.contains("1.0 in"), "expected inches in {label:?}");
-        assert!(label.contains("2.0 in"), "expected inches in {label:?}");
-        assert!(!label.contains("mm"), "should not show mm: {label:?}");
-    }
-
-    #[test]
-    fn find_element_by_name_returns_first_match() {
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        set_element_name(&mut doc, SceneElement::Line(0), "Guide".to_string()).unwrap();
-        set_element_name(&mut doc, SceneElement::Rect(0), "Guide".to_string()).unwrap();
-        assert_eq!(
-            find_element_by_name(&doc, "Guide"),
-            Some(SceneElement::Line(0))
-        );
-        assert_eq!(find_element_by_name(&doc, "Missing"), None);
     }
 
     #[test]

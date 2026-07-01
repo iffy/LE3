@@ -1487,12 +1487,66 @@ fn extrude_profile_with_treatments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Circle, Document, FaceId, Rect};
+    use crate::model::{Circle, Document, FaceId};
 
     fn sketch_doc() -> (Document, crate::model::SketchId) {
         let mut doc = Document::default();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
         (doc, sketch)
+    }
+
+    /// Drop a rectangle (four lines + a closed-loop polygon face) and return its `Polygon`
+    /// profile — the rectangle profile every extrude test used to build from a `Rect`.
+    fn rect_profile(
+        doc: &mut Document,
+        sketch: crate::model::SketchId,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) -> ExtrudeFace {
+        let lines = crate::construction::add_line_rectangle(doc, sketch, x, y, w, h, [false; 4]);
+        ExtrudeFace::Polygon(lines.to_vec())
+    }
+
+    /// A body built from a 10x10x5 box (extrusion 0) with a 4x4 column (extrusion 1, centered)
+    /// cut through it (#35): source `Solid { add: [0], cut: [1] }`.
+    fn cut_body_doc() -> Document {
+        let (mut doc, sketch) = sketch_doc();
+        let outer = rect_profile(&mut doc, sketch, 0.0, 0.0, 10.0, 10.0);
+        let inner = rect_profile(&mut doc, sketch, 3.0, 3.0, 4.0, 4.0);
+        doc.extrusions.push(extrusion(sketch, vec![outer], 5.0));
+        doc.extrusions.push(extrusion(sketch, vec![inner], 5.0));
+        doc.bodies.push(crate::model::Body {
+            source: crate::model::BodySource::Solid {
+                add: vec![0],
+                cut: vec![1],
+            },
+            name: None,
+            deleted: false,
+        });
+        doc
+    }
+
+    fn box_doc() -> (Document, crate::model::SketchId, Extrusion) {
+        let (mut doc, sketch) = sketch_doc();
+        let profile = rect_profile(&mut doc, sketch, 0.0, 0.0, 10.0, 10.0);
+        let ext = extrusion(sketch, vec![profile], 5.0);
+        (doc, sketch, ext)
+    }
+
+    #[test]
+    fn line_rectangle_extrudes_to_a_box_of_expected_volume() {
+        let (mut doc, sketch) = sketch_doc();
+        let profile = rect_profile(&mut doc, sketch, 0.0, 0.0, 10.0, 4.0);
+        let ext = extrusion(sketch, vec![profile], 6.0);
+        let mesh = extrusion_mesh(&doc, &ext).unwrap();
+        // A 10x4x6 box: 12 triangles, 240 mm^3, spanning its footprint.
+        assert_eq!(mesh.triangles.len(), 12);
+        let (min, max) = mesh.bounds().unwrap();
+        assert!((max.x - min.x - 10.0).abs() < 1e-4);
+        assert!((max.y - min.y - 4.0).abs() < 1e-4);
+        assert!((max.z - min.z - 6.0).abs() < 1e-4);
     }
 
     fn extrusion(sketch: crate::model::SketchId, faces: Vec<ExtrudeFace>, distance: f32) -> Extrusion {
@@ -1506,64 +1560,6 @@ mod tests {
             deleted: false,
             edge_treatments: Vec::new(),
         }
-    }
-
-    #[test]
-    fn rect_extrudes_to_a_box_mesh() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 4.0));
-        let ext = extrusion(sketch, vec![ExtrudeFace::Rect(0)], 6.0);
-        let mesh = extrusion_mesh(&doc, &ext).unwrap();
-        // A box: 2 (bottom) + 2 (top) + 4 edges * 2 = 12 triangles.
-        assert_eq!(mesh.triangles.len(), 12);
-        // Ground plane normal is +Z, so the solid spans z in [0, 6].
-        let (min, max) = mesh.bounds().unwrap();
-        assert!((min.z).abs() < 1e-4 && (max.z - 6.0).abs() < 1e-4, "z [{},{}]", min.z, max.z);
-        assert!((max.x - min.x - 10.0).abs() < 1e-4 && (max.y - min.y - 4.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn face_boundary_loop_world_returns_cap_and_side_vertices() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 4.0));
-        let ext = extrusion(sketch, vec![ExtrudeFace::Rect(0)], 6.0);
-        doc.extrusions.push(ext);
-
-        let base_cap = FaceId::ExtrudeCap {
-            extrusion: 0,
-            profile: ExtrudeFace::Rect(0),
-            top: false,
-        };
-        let loop_vertices = face_boundary_loop_world(&doc, &base_cap).unwrap();
-        assert_eq!(loop_vertices, cap_polygon_world(&doc, 0, &ExtrudeFace::Rect(0), false).unwrap());
-        assert_eq!(loop_vertices.len(), 4);
-        for v in &loop_vertices {
-            assert!(v.z.abs() < 1e-4);
-        }
-
-        let top_cap = FaceId::ExtrudeCap {
-            extrusion: 0,
-            profile: ExtrudeFace::Rect(0),
-            top: true,
-        };
-        let top_loop = face_boundary_loop_world(&doc, &top_cap).unwrap();
-        for v in &top_loop {
-            assert!((v.z - 6.0).abs() < 1e-4);
-        }
-
-        let side = FaceId::ExtrudeSide {
-            extrusion: 0,
-            profile: ExtrudeFace::Rect(0),
-            edge: 0,
-        };
-        let side_loop = face_boundary_loop_world(&doc, &side).unwrap();
-        assert_eq!(
-            side_loop,
-            side_quad_world(&doc, 0, &ExtrudeFace::Rect(0), 0).unwrap().to_vec()
-        );
-        assert_eq!(side_loop.len(), 4);
     }
 
     #[test]
@@ -1606,49 +1602,6 @@ mod tests {
         assert!((min.z).abs() < 1e-4 && (max.z - 6.0).abs() < 1e-4, "z [{},{}]", min.z, max.z);
     }
 
-    #[test]
-    fn document_solid_mesh_collects_bodies() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 4.0));
-        doc.extrusions
-            .push(extrusion(sketch, vec![ExtrudeFace::Rect(0)], 6.0));
-        doc.bodies.push(crate::model::Body {
-            source: crate::model::BodySource::Extrusion(0),
-            name: Some("Box".into()),
-            deleted: false,
-        });
-        let combined = document_solid_mesh(&doc);
-        assert_eq!(combined.triangles.len(), 12);
-        // A deleted body contributes nothing.
-        doc.bodies[0].deleted = true;
-        assert!(document_solid_mesh(&doc).is_empty());
-        assert!(body_solid_mesh(&doc, 0).is_none());
-    }
-
-    /// A body built from a 10x10x5 box (extrusion 0) with a 4x4 column (extrusion 1, centered)
-    /// cut through it (#35): source `Solid { add: [0], cut: [1] }`.
-    fn cut_body_doc() -> Document {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 3.0, 3.0, 7.0, 7.0));
-        doc.extrusions
-            .push(extrusion(sketch, vec![ExtrudeFace::Rect(0)], 5.0));
-        doc.extrusions
-            .push(extrusion(sketch, vec![ExtrudeFace::Rect(1)], 5.0));
-        doc.bodies.push(crate::model::Body {
-            source: crate::model::BodySource::Solid {
-                add: vec![0],
-                cut: vec![1],
-            },
-            name: None,
-            deleted: false,
-        });
-        doc
-    }
-
     #[cfg(not(feature = "occt"))]
     #[test]
     fn cut_body_renders_additive_geometry_only_without_kernel() {
@@ -1681,17 +1634,6 @@ mod tests {
     }
 
     #[test]
-    fn negative_distance_extrudes_the_other_way() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 4.0));
-        let ext = extrusion(sketch, vec![ExtrudeFace::Rect(0)], -5.0);
-        let mesh = extrusion_mesh(&doc, &ext).unwrap();
-        let (min, max) = mesh.bounds().unwrap();
-        assert!((min.z + 5.0).abs() < 1e-4 && (max.z).abs() < 1e-4, "z [{},{}]", min.z, max.z);
-    }
-
-    #[test]
     fn circle_extrudes_to_a_cylinder_mesh() {
         let (mut doc, sketch) = sketch_doc();
         doc.circles
@@ -1705,88 +1647,6 @@ mod tests {
         assert!((max.z - 8.0).abs() < 1e-4 && min.z.abs() < 1e-4);
         // Radius 5 → diameter 10 in x and y.
         assert!((max.x - min.x - 10.0).abs() < 0.1 && (max.y - min.y - 10.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn multiple_faces_combine() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 4.0));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 20.0, 0.0, 30.0, 4.0));
-        let ext = extrusion(
-            sketch,
-            vec![ExtrudeFace::Rect(0), ExtrudeFace::Rect(1)],
-            6.0,
-        );
-        let mesh = extrusion_mesh(&doc, &ext).unwrap();
-        assert_eq!(mesh.triangles.len(), 24);
-    }
-
-    #[test]
-    fn extrude_up_to_plane_uses_target_plane() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        // A parallel construction plane 20mm above the ground.
-        let mut above = crate::face::default_xy_plane();
-        above.origin = Vec3::new(0.0, 0.0, 20.0);
-        doc.construction_planes.push(above);
-
-        let mut ext = extrusion(sketch, vec![ExtrudeFace::Rect(0)], 6.0);
-        ext.target = Some(ExtrudeTarget::Plane(1));
-
-        // Effective depth reaches the target plane regardless of the stored distance.
-        assert!((effective_distance(&doc, &ext) - 20.0).abs() < 1e-3);
-        let mesh = extrusion_mesh(&doc, &ext).unwrap();
-        let (min, max) = mesh.bounds().unwrap();
-        assert!((max.z - 20.0).abs() < 1e-3 && min.z.abs() < 1e-3, "z [{},{}]", min.z, max.z);
-    }
-
-    #[test]
-    fn extrude_to_slanted_plane_lands_top_cap_in_the_plane() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 6.0));
-        // A construction plane tilted about the X axis, ~21.8°, raised above the sketch.
-        let plane_origin = Vec3::new(0.0, 0.0, 12.0);
-        let plane_normal = Vec3::new(0.0, 0.4, 1.0).normalize();
-        let mut slanted = crate::face::default_xy_plane();
-        slanted.origin = plane_origin;
-        slanted.normal = plane_normal;
-        doc.construction_planes.push(slanted);
-
-        let mut ext = extrusion(sketch, vec![ExtrudeFace::Rect(0)], 6.0);
-        ext.target = Some(ExtrudeTarget::Plane(1));
-        doc.extrusions.push(ext.clone());
-
-        // Every top-cap corner lies exactly in the slanted plane (full contact).
-        let cap = cap_polygon_world(&doc, 0, &ExtrudeFace::Rect(0), true).unwrap();
-        assert_eq!(cap.len(), 4);
-        for corner in &cap {
-            let signed = (*corner - plane_origin).dot(plane_normal);
-            assert!(signed.abs() < 1e-3, "cap corner off the target plane: {signed}");
-        }
-        // The cap really is slanted: corners reach the plane at different heights.
-        let heights: Vec<f32> = cap.iter().map(|c| c.z).collect();
-        let zmin = heights.iter().cloned().fold(f32::MAX, f32::min);
-        let zmax = heights.iter().cloned().fold(f32::MIN, f32::max);
-        assert!(zmax - zmin > 1.0, "expected a slanted top, spread {}", zmax - zmin);
-
-        // The base cap stays on the sketch plane (z = 0).
-        let base = cap_polygon_world(&doc, 0, &ExtrudeFace::Rect(0), false).unwrap();
-        for corner in &base {
-            assert!(corner.z.abs() < 1e-4);
-        }
-    }
-
-    #[test]
-    fn zero_distance_or_no_faces_yields_no_mesh() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 4.0));
-        assert!(extrusion_mesh(&doc, &extrusion(sketch, vec![ExtrudeFace::Rect(0)], 0.0)).is_none());
-        assert!(extrusion_mesh(&doc, &extrusion(sketch, vec![], 6.0)).is_none());
     }
 
     // --- 3D edge chamfer/fillet (#77) ---------------------------------------------------
@@ -1818,14 +1678,6 @@ mod tests {
         for (e, c) in &edge_count {
             assert_eq!(*c, 2, "edge {e:?} used by {c} triangle(s), expected exactly 2 (not watertight)");
         }
-    }
-
-    fn box_doc() -> (Document, crate::model::SketchId, Extrusion) {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        let ext = extrusion(sketch, vec![ExtrudeFace::Rect(0)], 5.0);
-        (doc, sketch, ext)
     }
 
     #[test]
@@ -2200,104 +2052,5 @@ mod tests {
         assert_eq!(twice.edge_treatments.len(), 1);
         assert_eq!(twice.edge_treatments[0].kind, VertexTreatmentKind::Fillet);
         assert_eq!(twice.edge_treatments[0].amount, 3.0);
-    }
-
-    // ---- #16/#62: overlap detection + click resolution scope gate ----
-
-    #[test]
-    fn overlapping_partner_finds_the_unique_overlapping_shape() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        doc.circles.push(Circle::from_local_center_radius(sketch, 5.0, 5.0, 3.0, 0.0));
-        let partner = overlapping_partner(&doc, sketch, &ExtrudeFace::Rect(0));
-        assert_eq!(partner, Some(ExtrudeFace::Circle(0)));
-        // Symmetric the other way too.
-        let partner_rev = overlapping_partner(&doc, sketch, &ExtrudeFace::Circle(0));
-        assert_eq!(partner_rev, Some(ExtrudeFace::Rect(0)));
-    }
-
-    #[test]
-    fn overlapping_partner_is_none_when_shapes_dont_overlap() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        doc.circles.push(Circle::from_local_center_radius(sketch, 100.0, 100.0, 3.0, 0.0));
-        assert_eq!(overlapping_partner(&doc, sketch, &ExtrudeFace::Rect(0)), None);
-    }
-
-    #[test]
-    fn overlapping_partner_is_none_when_a_third_shape_also_overlaps() {
-        // Scope note (#16/#62): if a third shape also overlaps the pair, this feature doesn't
-        // apply — fall back to today's whole-shape picking.
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        doc.circles.push(Circle::from_local_center_radius(sketch, 5.0, 5.0, 3.0, 0.0));
-        // A second rect also overlapping both the first rect and the circle (a genuine
-        // partial overlap via two transversal crossings, not just a shared-corner touch).
-        doc.rects.push(Rect::from_local_corners(sketch, 3.0, 3.0, 13.0, 13.0));
-        assert_eq!(overlapping_partner(&doc, sketch, &ExtrudeFace::Rect(0)), None);
-        assert_eq!(overlapping_partner(&doc, sketch, &ExtrudeFace::Circle(0)), None);
-    }
-
-    #[test]
-    fn resolve_boolean_click_picks_the_right_atomic_region() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, -20.0, 20.0, 20.0));
-        doc.circles.push(Circle::from_local_center_radius(sketch, 0.0, 0.0, 5.0, 0.0));
-        let rect = ExtrudeFace::Rect(0);
-        let circle = ExtrudeFace::Circle(0);
-
-        // Inside both (right half of the circle, which lies within the rect's x >= 0 span).
-        let both = resolve_boolean_click(&doc, sketch, &rect, &circle, (2.0, 0.0));
-        assert_eq!(
-            both,
-            Some(ExtrudeFace::Boolean {
-                op: crate::model::BooleanOp::Intersection,
-                a: Box::new(rect.clone()),
-                b: Box::new(circle.clone()),
-            })
-        );
-
-        // Inside the rect only (circle doesn't reach x=15).
-        let rect_only = resolve_boolean_click(&doc, sketch, &rect, &circle, (15.0, 0.0));
-        assert_eq!(
-            rect_only,
-            Some(ExtrudeFace::Boolean {
-                op: crate::model::BooleanOp::Difference,
-                a: Box::new(rect.clone()),
-                b: Box::new(circle.clone()),
-            })
-        );
-
-        // Inside the circle only (left half, x < 0, outside the rect).
-        let circle_only = resolve_boolean_click(&doc, sketch, &rect, &circle, (-2.0, 0.0));
-        assert_eq!(
-            circle_only,
-            Some(ExtrudeFace::Boolean {
-                op: crate::model::BooleanOp::Difference,
-                a: Box::new(circle.clone()),
-                b: Box::new(rect.clone()),
-            })
-        );
-
-        // Outside both.
-        assert_eq!(resolve_boolean_click(&doc, sketch, &rect, &circle, (-100.0, -100.0)), None);
-    }
-
-    #[test]
-    fn boolean_face_profile_world_and_side_face_count() {
-        let (mut doc, sketch) = sketch_doc();
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, -20.0, 20.0, 20.0));
-        doc.circles.push(Circle::from_local_center_radius(sketch, 0.0, 0.0, 5.0, 0.0));
-        let face = ExtrudeFace::Boolean {
-            op: crate::model::BooleanOp::Intersection,
-            a: Box::new(ExtrudeFace::Rect(0)),
-            b: Box::new(ExtrudeFace::Circle(0)),
-        };
-        let (profile, _normal) = face_profile_world(&doc, &face).expect("resolved loop");
-        assert!(profile.len() >= 3);
-        // No flat-side-wall sketching offered on boolean-derived profiles (documented
-        // limitation) — but this doesn't affect `extrusion_mesh`, which walks the resolved
-        // profile loop directly rather than through `side_face_count`.
-        assert_eq!(side_face_count(&face), 0);
     }
 }

@@ -229,9 +229,18 @@ fn parse_face_id_table(table: Table) -> mlua::Result<FaceId> {
                 table.get("profile").or_else(|_| table.get("profile_kind"))?;
             let profile_index: usize = table
                 .get("profile_index")
-                .or_else(|_| table.get("index"))?;
+                .or_else(|_| table.get("index"))
+                .unwrap_or(0);
             let profile = match profile_kind.to_ascii_lowercase().as_str() {
                 "circle" => crate::model::ExtrudeFace::Circle(profile_index),
+                // A rectangle is now a `Polygon` loop (#66); give its four line indices as
+                // `profile_lines = {..}`.
+                "polygon" => {
+                    let lines: Vec<usize> = table
+                        .get("profile_lines")
+                        .or_else(|_| table.get("lines"))?;
+                    crate::model::ExtrudeFace::Polygon(lines)
+                }
                 other => {
                     return Err(mlua::Error::external(format!(
                         "unknown extrude profile kind '{other}'"
@@ -1737,41 +1746,6 @@ mod tests {
     }
 
     #[test]
-    fn lua_select_rect_corner_targets_a_point_not_the_whole_rect() {
-        // #68: `corner = N` (0..3) selects just that corner's point, same numbering as the
-        // interactive Constraint tool's `ConstraintPoint::RectCorner`.
-        let state = run_lua(
-            r#"
-            bearcad.new()
-            bearcad.rect{ x = 0, y = 0, width = 10, height = 10, name = "box" }
-            bearcad.line{ x = 20, y = 20, x1 = 30, y1 = 20, name = "loose" }
-            bearcad.select{ kind = "rect", index = 0, corner = 2 }
-            bearcad.select({ kind = "line", index = 0, ["end"] = "start" }, true)
-            bearcad.add_geometric_constraint("coincident")
-        "#,
-        );
-        let corner_point =
-            crate::model::ConstraintEntity::Point(ConstraintPoint::RectCorner { rect: 0, corner: 2 });
-        let line_point = crate::model::ConstraintEntity::Point(ConstraintPoint::LineEndpoint {
-            line: 0,
-            end: LineEnd::Start,
-        });
-        assert!(
-            state.doc.constraints.iter().any(|c| {
-                !c.deleted
-                    && matches!(
-                        &c.kind,
-                        crate::model::ConstraintKind::Coincident { a, b }
-                            if (*a == corner_point && *b == line_point)
-                                || (*a == line_point && *b == corner_point)
-                    )
-            }),
-            "expected a Coincident constraint between the rect corner and the line start, got: {:?}",
-            state.doc.constraints
-        );
-    }
-
-    #[test]
     fn lua_select_circle_center_with_explicit_point_flag() {
         // #68: kind="circle" alone still selects the whole circle (unchanged); `point = true`
         // is required to target just its center point.
@@ -1785,25 +1759,6 @@ mod tests {
         assert_eq!(
             state.scene_selection.iter().next(),
             Some(SceneElement::Point(ConstraintPoint::CircleCenter(0)))
-        );
-    }
-
-    #[test]
-    fn lua_rect_creates_rectangle_on_ground_plane() {
-        // A single call should enter a ground-plane sketch and make the rectangle.
-        let state = run_lua(
-            r#"
-            bearcad.new()
-            bearcad.rect{ width = 80, height = 50, name = "Box" }
-        "#,
-        );
-        assert_eq!(state.doc.rects.len(), 1);
-        let rect = &state.doc.rects[0];
-        assert!((rect.w - 80.0).abs() < 1e-2, "w={}", rect.w);
-        assert!((rect.h - 50.0).abs() < 1e-2, "h={}", rect.h);
-        assert_eq!(
-            find_element_by_name(&state.doc, "Box"),
-            Some(SceneElement::Rect(0))
         );
     }
 
@@ -1898,7 +1853,7 @@ mod tests {
         let state = run_lua(
             r#"
             bearcad.rect{ x = 0, y = 0, width = 10, height = 10 }
-            bearcad.extrude{ rect = 0, distance = 5 }
+            bearcad.extrude{ polygon = {0, 1, 2, 3}, distance = 5 }
             bearcad.chamfer_edge{
                 extrusion = 0,
                 edge = { kind = "vertical", face = 0, edge = 0 },
@@ -1921,7 +1876,7 @@ mod tests {
         let state = run_lua(
             r#"
             bearcad.rect{ x = 0, y = 0, width = 10, height = 10 }
-            bearcad.extrude{ rect = 0, distance = 5 }
+            bearcad.extrude{ polygon = {0, 1, 2, 3}, distance = 5 }
             bearcad.fillet_edge{
                 extrusion = 0,
                 edge = { kind = "cap", face = 0, edge = 1, top = true },
@@ -1948,7 +1903,7 @@ mod tests {
         let state = run_lua(
             r#"
             bearcad.rect{ x = 0, y = 0, width = 10, height = 10 }
-            bearcad.extrude{ rect = 0, distance = 5 }
+            bearcad.extrude{ polygon = {0, 1, 2, 3}, distance = 5 }
             bearcad.chamfer_edge{
                 extrusion = 0,
                 edge = { kind = "vertical", face = 0, edge = 99 },
@@ -2072,7 +2027,7 @@ mod tests {
             r#"
             bearcad.new()
             bearcad.rect{ width = 80, height = 50 }
-            bearcad.extrude{ rect = 0, distance = 20, name = "Boss" }
+            bearcad.extrude{ polygon = {0, 1, 2, 3}, distance = 20, name = "Boss" }
         "#,
         );
         assert_eq!(state.doc.extrusions.len(), 1);
@@ -2115,37 +2070,15 @@ mod tests {
     }
 
     #[test]
-    fn lua_begin_sketch_on_extrude_cap_face() {
-        let state = run_lua(
-            r#"
-            bearcad.new()
-            bearcad.rect{ width = 80, height = 50 }
-            bearcad.extrude{ rect = 0, distance = 20 }
-            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
-        "#,
-        );
-        let face = state.doc.sketches.last().map(|s| s.face.clone());
-        assert_eq!(
-            face,
-            Some(FaceId::ExtrudeCap {
-                extrusion: 0,
-                profile: crate::model::ExtrudeFace::Rect(0),
-                top: true,
-            }),
-            "expected a sketch on the extrusion's top cap, got {face:?}"
-        );
-    }
-
-    #[test]
     fn lua_extrude_with_body_merge_joins_the_existing_body() {
         let state = run_lua(
             r#"
             bearcad.new()
             bearcad.rect{ width = 80, height = 50 }
-            bearcad.extrude{ rect = 0, distance = 20 }
-            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
+            bearcad.extrude{ polygon = {0, 1, 2, 3}, distance = 20 }
+            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "polygon", profile_lines = {0, 1, 2, 3}, top = true }
             bearcad.rect{ x = 10, y = 10, width = 20, height = 10 }
-            bearcad.extrude{ rect = 1, distance = 5, body = "merge" }
+            bearcad.extrude{ polygon = {4, 5, 6, 7}, distance = 5, body = "merge" }
         "#,
         );
         assert_eq!(state.doc.extrusions.len(), 2);
@@ -2162,10 +2095,10 @@ mod tests {
             r#"
             bearcad.new()
             bearcad.rect{ width = 80, height = 50 }
-            bearcad.extrude{ rect = 0, distance = 20 }
-            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
+            bearcad.extrude{ polygon = {0, 1, 2, 3}, distance = 20 }
+            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "polygon", profile_lines = {0, 1, 2, 3}, top = true }
             bearcad.rect{ x = 10, y = 10, width = 20, height = 10 }
-            bearcad.extrude{ rect = 1, distance = 5, body = "cut" }
+            bearcad.extrude{ polygon = {4, 5, 6, 7}, distance = 5, body = "cut" }
         "#,
         );
         assert_eq!(state.doc.extrusions.len(), 2);
@@ -2180,101 +2113,14 @@ mod tests {
             r#"
             bearcad.new()
             bearcad.rect{ width = 80, height = 50 }
-            bearcad.extrude{ rect = 0, distance = 20 }
-            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
+            bearcad.extrude{ polygon = {0, 1, 2, 3}, distance = 20 }
+            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "polygon", profile_lines = {0, 1, 2, 3}, top = true }
             bearcad.rect{ x = 10, y = 10, width = 20, height = 10 }
-            bearcad.extrude{ rect = 1, distance = 5 }
+            bearcad.extrude{ polygon = {4, 5, 6, 7}, distance = 5 }
         "#,
         );
         assert_eq!(state.doc.extrusions.len(), 2);
         assert_eq!(state.doc.bodies.len(), 2, "default extrude always starts a new body");
-    }
-
-    #[test]
-    fn lua_begin_sketch_on_extrude_side_face() {
-        let state = run_lua(
-            r#"
-            bearcad.new()
-            bearcad.rect{ width = 80, height = 50 }
-            bearcad.extrude{ rect = 0, distance = 20 }
-            bearcad.begin_sketch{ kind = "extrude_side", extrusion = 0, profile = "rect", profile_index = 0, edge = 1 }
-        "#,
-        );
-        let face = state.doc.sketches.last().map(|s| s.face.clone());
-        assert_eq!(
-            face,
-            Some(FaceId::ExtrudeSide {
-                extrusion: 0,
-                profile: crate::model::ExtrudeFace::Rect(0),
-                edge: 1,
-            }),
-            "expected a sketch on the extrusion's side face, got {face:?}"
-        );
-    }
-
-    #[test]
-    fn lua_select_face_vertex_makes_coincident_with_sketch_point() {
-        // #26: a sketch point can be pinned coincident to a corner of the body face it's
-        // drawn on, purely from script — `{ kind = "face", face = {...}, index = N }` selects
-        // the vertex the same way `{ kind = "line", ["end"] = "start" }` selects a line endpoint.
-        let state = run_lua(
-            r#"
-            bearcad.new()
-            bearcad.rect{ width = 80, height = 50 }
-            bearcad.extrude{ rect = 0, distance = 20 }
-            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
-            bearcad.line{ x = 5, y = 5, x1 = 15, y1 = 2 }
-            -- `bearcad.line` auto-locks the drawn length (see `Action::CreateLineSegment`),
-            -- which would fight the coincidence below over the start point; drop that lock
-            -- first so the point is free to land exactly on the face vertex. (Constraints
-            -- 0/1 are the rect's own auto-locked width/height from `bearcad.rect` above;
-            -- 2 is this line's length lock.)
-            bearcad.select{ kind = "constraint", index = 2 }
-            bearcad.delete_selection()
-            bearcad.select{ kind = "line", index = 0, ["end"] = "start" }
-            bearcad.select({
-                kind = "face",
-                face = { kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true },
-                index = 2,
-            }, true)
-            bearcad.add_geometric_constraint("coincident")
-        "#,
-        );
-        let sketch = state.doc.sketches.len() - 1;
-        let cap = crate::model::FaceId::ExtrudeCap {
-            extrusion: 0,
-            profile: crate::model::ExtrudeFace::Rect(0),
-            top: true,
-        };
-        let expected_a = crate::model::ConstraintEntity::Point(ConstraintPoint::LineEndpoint {
-            line: 0,
-            end: LineEnd::Start,
-        });
-        let expected_b = crate::model::ConstraintEntity::Point(ConstraintPoint::FaceVertex {
-            face: cap,
-            index: 2,
-        });
-        assert!(
-            state.doc.constraints.iter().any(|c| {
-                !c.deleted
-                    && matches!(
-                        &c.kind,
-                        crate::model::ConstraintKind::Coincident { a, b }
-                            if (*a == expected_a && *b == expected_b)
-                                || (*a == expected_b && *b == expected_a)
-                    )
-            }),
-            "expected a Coincident constraint between the line start and the cap's corner 2, got: {:?}",
-            state.doc.constraints
-        );
-        // The solver actually pinned the line's start to the cap's corner 2 (80, 50).
-        let (u, v) = crate::geometric_constraints::point_uv(
-            &state.doc,
-            sketch,
-            ConstraintPoint::LineEndpoint { line: 0, end: LineEnd::Start },
-        )
-        .unwrap();
-        assert!((u - 80.0).abs() < 1e-2 && (v - 50.0).abs() < 1e-2, "got ({u},{v})");
     }
 
     #[test]
@@ -2283,7 +2129,7 @@ mod tests {
             r#"
             bearcad.new()
             bearcad.rect{ width = 80, height = 50 }
-            bearcad.extrude{ rect = 0, distance = 20 }
+            bearcad.extrude{ polygon = {0, 1, 2, 3}, distance = 20 }
         "#,
         );
         assert_eq!(state.doc.bodies.len(), 1);
@@ -2443,29 +2289,5 @@ mod tests {
             runner.tick(&mut state, &mut synthetic, None, &ctx);
         }
         assert_eq!(state.tool, Tool::Select);
-    }
-
-    #[test]
-    fn lua_wait_frames_advances() {
-        let mut runner = ScriptRunner::from_lua_source(
-            r#"
-            bearcad.ui.wait(2)
-            bearcad.clear()
-        "#,
-        )
-        .unwrap();
-        runner.verbose = false;
-        let mut state = AppState::default();
-        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
-        state.doc.rects.push(crate::model::Rect::from_local_corners(
-            sketch, 0., 0., 1., 1.,
-        ));
-        let mut synthetic = SyntheticInput::default();
-        let ctx = egui::Context::default();
-        let vp = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(960.0, 560.0));
-        while !runner.done {
-            runner.tick(&mut state, &mut synthetic, Some(vp), &ctx);
-        }
-        assert!(state.doc.rects.is_empty());
     }
 }

@@ -406,168 +406,10 @@ pub fn open(path: &str) -> Result<Document> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Circle, FaceId, RectEdge};
+    use crate::model::{Circle, FaceId};
 
     fn plane_sketch(doc: &mut Document) -> usize {
         doc.add_sketch(FaceId::ConstructionPlane(0))
-    }
-
-    #[test]
-    fn round_trips_rectangle_dimension_label_offsets() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("bearcad_rect_dim_offset_test.bearcad");
-        let path = path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&path);
-
-        let mut doc = Document {
-            parameters: Vec::new(),
-            sketches: Vec::new(),
-            rects: Vec::new(),
-            lines: vec![],
-            circles: Vec::new(),
-            constraints: Vec::new(),
-            construction_planes: vec![default_xy_plane()],
-            extrusions: Vec::new(),
-            bodies: Vec::new(),
-            imported_meshes: Vec::new(),
-            shape_order: Vec::new(),
-            default_length_unit: LengthUnit::default(),
-            default_angle_unit: AngleUnit::default(),
-        };
-        let sketch = plane_sketch(&mut doc);
-        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 50.8, 5.0);
-        rect.width_locked = true;
-        rect.height_locked = true;
-        rect.width_dim_offset = Some(42.0);
-        rect.height_dim_offset = Some(36.0);
-        doc.rects.push(rect);
-        doc.shape_order.push(ShapeKind::Rect);
-
-        save(&path, &doc).unwrap();
-        let loaded = open(&path).unwrap();
-        assert_eq!(loaded.rects[0].width_dim_offset, Some(42.0));
-        assert_eq!(loaded.rects[0].height_dim_offset, Some(36.0));
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn round_trips_rectangle_dimension_locks() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("bearcad_rect_locks_test.bearcad");
-        let path = path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&path);
-
-        let mut doc = Document {
-            parameters: Vec::new(),
-            sketches: Vec::new(),
-            rects: Vec::new(),
-            lines: vec![],
-            circles: Vec::new(),
-            constraints: Vec::new(),
-            construction_planes: vec![default_xy_plane()],
-            extrusions: Vec::new(),
-            bodies: Vec::new(),
-            imported_meshes: Vec::new(),
-            shape_order: Vec::new(),
-            default_length_unit: LengthUnit::default(),
-            default_angle_unit: AngleUnit::default(),
-        };
-        let sketch = plane_sketch(&mut doc);
-        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 50.8, 5.0);
-        rect.width_locked = true;
-        rect.height_locked = false;
-        doc.rects.push(rect);
-        doc.shape_order.push(ShapeKind::Rect);
-
-        save(&path, &doc).unwrap();
-        let loaded = open(&path).unwrap();
-        assert!(loaded.rects[0].width_locked);
-        assert!(!loaded.rects[0].height_locked);
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn round_trips_rectangles() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("bearcad_roundtrip_test.bearcad");
-        let path = path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&path);
-
-        let mut doc = Document {
-            parameters: Vec::new(),
-            sketches: Vec::new(),
-            rects: Vec::new(),
-            lines: vec![],
-            circles: Vec::new(),
-            constraints: Vec::new(),
-            construction_planes: vec![default_xy_plane()],
-            extrusions: Vec::new(),
-            bodies: Vec::new(),
-            imported_meshes: Vec::new(),
-            shape_order: Vec::new(),
-            default_length_unit: LengthUnit::default(),
-            default_angle_unit: AngleUnit::default(),
-        };
-        let sketch = plane_sketch(&mut doc);
-        doc.rects.push(Rect::from_local_corners(sketch, 1.0, 2.0, 4.0, 6.0));
-        doc.shape_order.push(ShapeKind::Rect);
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 10.0, 20.0, 40.0, 60.0));
-        doc.shape_order.push(ShapeKind::Rect);
-
-        save(&path, &doc).unwrap();
-        let loaded = open(&path).unwrap();
-
-        assert_eq!(loaded.rects, doc.rects);
-        assert_eq!(loaded.shape_order, doc.shape_order);
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn round_trips_rectangle_edge_construction_flags() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("bearcad_rect_edge_construction_test.bearcad");
-        let path = path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&path);
-
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(crate::model::FaceId::ConstructionPlane(0));
-        let mut rect = Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0);
-        rect.set_edge_construction(RectEdge::Bottom, true);
-        rect.set_edge_construction(RectEdge::Top, true);
-        doc.rects.push(rect);
-        doc.shape_order.push(ShapeKind::Rect);
-
-        save(&path, &doc).unwrap();
-        let loaded = open(&path).unwrap();
-        assert!(loaded.rects[0].edge_construction(RectEdge::Bottom));
-        assert!(!loaded.rects[0].edge_construction(RectEdge::Right));
-        assert!(loaded.rects[0].edge_construction(RectEdge::Top));
-        assert!(!loaded.rects[0].edge_construction(RectEdge::Left));
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    fn element_world_anchors(doc: &Document) -> Vec<glam::Vec3> {
-        let mut anchors = Vec::new();
-        for plane in &doc.construction_planes {
-            anchors.push(plane.origin);
-        }
-        for rect in &doc.rects {
-            anchors.push(crate::face::rect_world_corners(doc, rect).unwrap()[0]);
-        }
-        for circle in &doc.circles {
-            anchors.push(crate::face::circle_world_center(doc, circle).unwrap());
-        }
-        for line in &doc.lines {
-            let (a, b) = crate::face::line_world_endpoints(doc, line).unwrap();
-            anchors.push(a);
-            anchors.push(b);
-        }
-        anchors
     }
 
     fn assert_world_anchors_match(before: &[glam::Vec3], after: &[glam::Vec3]) {
@@ -584,6 +426,48 @@ mod tests {
                 b
             );
         }
+    }
+
+    fn element_world_anchors(doc: &Document) -> Vec<glam::Vec3> {
+        let mut anchors = Vec::new();
+        for plane in &doc.construction_planes {
+            anchors.push(plane.origin);
+        }
+        for circle in &doc.circles {
+            anchors.push(crate::face::circle_world_center(doc, circle).unwrap());
+        }
+        for line in &doc.lines {
+            let (a, b) = crate::face::line_world_endpoints(doc, line).unwrap();
+            anchors.push(a);
+            anchors.push(b);
+        }
+        anchors
+    }
+
+    #[test]
+    fn round_trips_shapes_and_shape_order() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("bearcad_roundtrip_test.bearcad");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = plane_sketch(&mut doc);
+        crate::construction::add_line_rectangle(&mut doc, sketch, 1.0, 2.0, 4.0, 6.0, [false; 4]);
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 5.0, 0.0));
+        doc.shape_order.push(ShapeKind::Line);
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 1.0, 1.0, 1.0, 6.0));
+        doc.shape_order.push(ShapeKind::Line);
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert_eq!(loaded.lines, doc.lines);
+        assert_eq!(loaded.constraints, doc.constraints);
+        assert_eq!(loaded.shape_order, doc.shape_order);
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -605,42 +489,19 @@ mod tests {
             ),
             crate::model::ConstructionPlaneParent::Root,
         );
-        let mut doc = Document {
-            parameters: Vec::new(),
-            sketches: Vec::new(),
-            rects: Vec::new(),
-            lines: vec![],
-            circles: Vec::new(),
-            constraints: Vec::new(),
-            construction_planes: vec![default_xy_plane(), offset_plane],
-            extrusions: Vec::new(),
-            bodies: Vec::new(),
-            imported_meshes: Vec::new(),
-            shape_order: Vec::new(),
-            default_length_unit: LengthUnit::default(),
-            default_angle_unit: AngleUnit::default(),
-        };
+        let mut doc = Document::default();
+        doc.construction_planes.push(offset_plane);
 
         let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.circles.push(Circle::from_local_center_radius(
-            s0, 12.0, -8.0, 15.0, 0.4,
-        ));
+        doc.circles
+            .push(Circle::from_local_center_radius(s0, 12.0, -8.0, 15.0, 0.4));
         doc.shape_order.push(ShapeKind::Circle);
 
         let s1 = doc.add_sketch(FaceId::ConstructionPlane(1));
-        doc.rects
-            .push(Rect::from_local_corners(s1, 3.0, 4.0, 13.0, 14.0));
-        doc.lines.push(Line::from_local_endpoints(
-            s1, -2.0, 1.0, 8.0, 6.0,
-        ));
-        doc.shape_order.push(ShapeKind::Rect);
+        crate::construction::add_line_rectangle(&mut doc, s1, 3.0, 4.0, 10.0, 10.0, [false; 4]);
+        doc.lines
+            .push(Line::from_local_endpoints(s1, -2.0, 1.0, 8.0, 6.0));
         doc.shape_order.push(ShapeKind::Line);
-        doc.shape_order.push(ShapeKind::ConstructionPlane);
-
-        let s2 = doc.add_sketch(FaceId::Rect(0));
-        doc.rects
-            .push(Rect::from_local_corners(s2, 1.0, 2.0, 4.0, 5.0));
-        doc.shape_order.push(ShapeKind::Rect);
 
         let before = element_world_anchors(&doc);
         save(&path, &doc).unwrap();
@@ -648,35 +509,11 @@ mod tests {
         let after = element_world_anchors(&loaded);
         assert_world_anchors_match(&before, &after);
 
-        let offset_rect = crate::face::rect_world_corners(&loaded, &loaded.rects[0]).unwrap();
+        // A rectangle edge on the offset plane should keep its world height.
+        let (a, _) = crate::face::line_world_endpoints(&loaded, &loaded.lines[0]).unwrap();
         assert!(
-            (offset_rect[0].z - 25.0).abs() < 1e-3,
-            "rectangle on offset plane should keep its world height"
-        );
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn default_construction_plane_origin_round_trips() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("bearcad_plane0_origin_test.bearcad");
-        let path = path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&path);
-
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.construction_planes[0].origin.z = 30.0;
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        doc.shape_order.push(ShapeKind::Rect);
-
-        let before_origin = doc.construction_planes[0].origin;
-        save(&path, &doc).unwrap();
-        let loaded = open(&path).unwrap();
-        assert!(
-            (loaded.construction_planes[0].origin - before_origin).length() < 1e-3,
-            "edited default plane origin should round-trip"
+            (a.z - 25.0).abs() < 1e-3,
+            "geometry on the offset plane should keep its world height"
         );
 
         std::fs::remove_file(&path).unwrap();
@@ -701,41 +538,48 @@ mod tests {
             ),
             crate::model::ConstructionPlaneParent::Root,
         );
-        let mut doc = Document {
-            parameters: Vec::new(),
-            sketches: Vec::new(),
-            rects: Vec::new(),
-            lines: vec![],
-            circles: Vec::new(),
-            constraints: Vec::new(),
-            construction_planes: vec![default_xy_plane(), offset_plane.clone()],
-            extrusions: Vec::new(),
-            bodies: Vec::new(),
-            imported_meshes: Vec::new(),
-            shape_order: Vec::new(),
-            default_length_unit: LengthUnit::default(),
-            default_angle_unit: AngleUnit::default(),
-        };
+        let mut doc = Document::default();
+        doc.construction_planes.push(offset_plane.clone());
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(1));
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        doc.shape_order.push(ShapeKind::Rect);
+        crate::construction::add_line_rectangle(&mut doc, sketch, 0.0, 0.0, 10.0, 10.0, [false; 4]);
         doc.shape_order.push(ShapeKind::ConstructionPlane);
 
         save(&path, &doc).unwrap();
         let loaded = open(&path).unwrap();
-        assert_eq!(loaded.rects.len(), 1);
         assert_eq!(loaded.construction_planes.len(), 2);
         assert_eq!(loaded.construction_planes[1], offset_plane);
         assert_eq!(
             loaded.sketches[0].face,
             FaceId::ConstructionPlane(1),
-            "rectangle sketch should stay on the offset plane"
+            "sketch should stay on the offset plane"
         );
-        let corners = crate::face::rect_world_corners(&loaded, &loaded.rects[0]).unwrap();
+        let (a, _) = crate::face::line_world_endpoints(&loaded, &loaded.lines[0]).unwrap();
         assert!(
-            (corners[0].z - 25.0).abs() < 1e-3,
-            "loaded rectangle should keep its offset-plane world position"
+            (a.z - 25.0).abs() < 1e-3,
+            "loaded geometry should keep its offset-plane world position"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn default_construction_plane_origin_round_trips() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("bearcad_plane0_origin_test.bearcad");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.construction_planes[0].origin.z = 30.0;
+        crate::construction::add_line_rectangle(&mut doc, sketch, 0.0, 0.0, 10.0, 10.0, [false; 4]);
+
+        let before_origin = doc.construction_planes[0].origin;
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert!(
+            (loaded.construction_planes[0].origin - before_origin).length() < 1e-3,
+            "edited default plane origin should round-trip"
         );
 
         std::fs::remove_file(&path).unwrap();
@@ -748,101 +592,19 @@ mod tests {
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
-        let doc = Document {
-            parameters: Vec::new(),
-            sketches: vec![Sketch {
-                face: FaceId::ConstructionPlane(1),
-                name: None,
-                deleted: false,
-                length_unit: None,
-                angle_unit: None,
-            }],
-            rects: vec![Rect::from_local_corners(0, 0.0, 0.0, 10.0, 10.0)],
-            lines: vec![],
-            circles: Vec::new(),
-            constraints: Vec::new(),
-            construction_planes: vec![default_xy_plane()],
-            extrusions: Vec::new(),
-            bodies: Vec::new(),
-            imported_meshes: Vec::new(),
-            shape_order: vec![ShapeKind::Sketch, ShapeKind::Rect],
-            default_length_unit: LengthUnit::default(),
-            default_angle_unit: AngleUnit::default(),
-        };
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(1));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 10.0));
+        doc.shape_order.push(ShapeKind::Line);
+
         save(&path, &doc).unwrap();
         let loaded = open(&path).unwrap();
         assert!(
             loaded.construction_planes.len() >= 2,
             "legacy sketch references to plane 1 should not crash on load"
         );
-        assert!(
-            crate::face::rect_world_corners(&loaded, &loaded.rects[0]).is_some()
-        );
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn round_trips_mixed_shapes_in_order() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("bearcad_mixed_shapes_test.bearcad");
-        let path = path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&path);
-
-        let mut doc = Document {
-            parameters: Vec::new(),
-            sketches: Vec::new(),
-            rects: Vec::new(),
-            lines: Vec::new(),
-            circles: Vec::new(),
-            constraints: Vec::new(),
-            construction_planes: vec![default_xy_plane()],
-            extrusions: Vec::new(),
-            bodies: Vec::new(),
-            imported_meshes: Vec::new(),
-            shape_order: Vec::new(),
-            default_length_unit: LengthUnit::default(),
-            default_angle_unit: AngleUnit::default(),
-        };
-        let sketch = plane_sketch(&mut doc);
-        doc.rects
-            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        doc.shape_order.push(ShapeKind::Rect);
-        doc.lines
-            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 5.0, 0.0));
-        doc.shape_order.push(ShapeKind::Line);
-        doc.lines
-            .push(Line::from_local_endpoints(sketch, 1.0, 1.0, 1.0, 6.0));
-        doc.shape_order.push(ShapeKind::Line);
-
-        save(&path, &doc).unwrap();
-        let loaded = open(&path).unwrap();
-        assert_eq!(loaded.rects, doc.rects);
-        assert_eq!(loaded.lines, doc.lines);
-        assert_eq!(loaded.shape_order, doc.shape_order);
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn round_trips_circles() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("bearcad_circle_roundtrip_test.bearcad");
-        let path = path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&path);
-
-        let mut doc = Document::default();
-        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        let mut circle = Circle::from_local_center_radius(sketch, 5.0, 5.0, 10.0, 0.5);
-        circle.diameter_dim_offset = Some(18.0);
-        circle.diameter_dim_angle = 1.2;
-        circle.construction = true;
-        doc.circles.push(circle);
-        doc.shape_order.push(ShapeKind::Circle);
-
-        save(&path, &doc).unwrap();
-        let loaded = open(&path).unwrap();
-        assert_eq!(loaded.circles, doc.circles);
+        assert!(crate::face::line_world_endpoints(&loaded, &loaded.lines[0]).is_some());
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -857,15 +619,14 @@ mod tests {
         let mut doc = Document::default();
         let s0 = doc.add_sketch(FaceId::ConstructionPlane(0));
         let s1 = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(s0, 0.0, 0.0, 1.0, 1.0));
-        doc.shape_order.push(ShapeKind::Rect);
+        crate::construction::add_line_rectangle(&mut doc, s0, 0.0, 0.0, 1.0, 1.0, [false; 4]);
 
         save(&path, &doc).unwrap();
         let loaded = open(&path).unwrap();
         assert_eq!(loaded.sketches.len(), 2);
         assert_eq!(loaded.sketches[0].face, FaceId::ConstructionPlane(0));
         assert_eq!(loaded.sketches[1].face, FaceId::ConstructionPlane(0));
-        assert_eq!(loaded.rects[0].sketch, s0);
+        assert_eq!(loaded.lines[0].sketch, s0);
         let _ = s1;
 
         std::fs::remove_file(&path).unwrap();
@@ -881,11 +642,11 @@ mod tests {
 
         let mut doc = Document::default();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
-        doc.shape_order.push(ShapeKind::Rect);
+        let rect_lines =
+            crate::construction::add_line_rectangle(&mut doc, sketch, 0.0, 0.0, 10.0, 5.0, [false; 4]);
         doc.extrusions.push(Extrusion {
             sketch,
-            faces: vec![ExtrudeFace::Rect(0)],
+            faces: vec![ExtrudeFace::Polygon(rect_lines.to_vec())],
             distance: 12.0,
             target: None,
             expression: String::new(),
@@ -904,7 +665,10 @@ mod tests {
         save(&path, &doc).unwrap();
         let loaded = open(&path).unwrap();
         assert_eq!(loaded.extrusions.len(), 1);
-        assert_eq!(loaded.extrusions[0].faces, vec![ExtrudeFace::Rect(0)]);
+        assert_eq!(
+            loaded.extrusions[0].faces,
+            vec![ExtrudeFace::Polygon(rect_lines.to_vec())]
+        );
         assert_eq!(loaded.extrusions[0].distance, 12.0);
         assert_eq!(loaded.extrusions[0].name.as_deref(), Some("Boss"));
         assert_eq!(loaded.bodies.len(), 1);
@@ -917,9 +681,7 @@ mod tests {
 
     #[test]
     fn round_trips_body_with_cut_extrusion() {
-        // A `Solid { add, cut }` body (#35): the cut list must survive save/load, and old
-        // files (which never carried one) still load as the additive `Extrusion`/`Extrusions`
-        // forms thanks to `#[serde(default)]`.
+        // A `Solid { add, cut }` body (#35): the cut list must survive save/load.
         use crate::model::{Body, BodySource, ExtrudeFace, Extrusion};
         let dir = std::env::temp_dir();
         let path = dir.join("bearcad_cut_body_roundtrip.bearcad");
@@ -928,9 +690,14 @@ mod tests {
 
         let mut doc = Document::default();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
-        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
-        doc.rects.push(Rect::from_local_corners(sketch, 3.0, 3.0, 7.0, 7.0));
-        for face in [ExtrudeFace::Rect(0), ExtrudeFace::Rect(1)] {
+        let outer =
+            crate::construction::add_line_rectangle(&mut doc, sketch, 0.0, 0.0, 10.0, 10.0, [false; 4]);
+        let inner =
+            crate::construction::add_line_rectangle(&mut doc, sketch, 3.0, 3.0, 4.0, 4.0, [false; 4]);
+        for face in [
+            ExtrudeFace::Polygon(outer.to_vec()),
+            ExtrudeFace::Polygon(inner.to_vec()),
+        ] {
             doc.extrusions.push(Extrusion {
                 sketch,
                 faces: vec![face],
@@ -964,6 +731,29 @@ mod tests {
         );
         assert_eq!(loaded.bodies[0].source.extrusion_indices(), [0]);
         assert_eq!(loaded.bodies[0].source.cut_extrusion_indices(), [1]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn round_trips_circles() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("bearcad_circle_roundtrip_test.bearcad");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        let mut circle = Circle::from_local_center_radius(sketch, 5.0, 5.0, 10.0, 0.5);
+        circle.diameter_dim_offset = Some(18.0);
+        circle.diameter_dim_angle = 1.2;
+        circle.construction = true;
+        doc.circles.push(circle);
+        doc.shape_order.push(ShapeKind::Circle);
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert_eq!(loaded.circles, doc.circles);
 
         std::fs::remove_file(&path).unwrap();
     }
