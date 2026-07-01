@@ -20,7 +20,7 @@ These are settled. Do not re-litigate them during implementation.
 | GUI toolkit | **egui** | Immediate-mode; easy tiling/docking, command palette, theming. |
 | 3D rendering | **wgpu** | Cross-platform GPU backend; the 3D viewport is a wgpu surface composited with egui. |
 | Save file | **SQLite**, extension `.bearcad` | Schema in §7. |
-| License | **MIT OR Apache-2.0** (dual) | BearCAD's own code is permissively licensed. OCCT is LGPL and MUST be **dynamically linked** so the permissive license is preserved; bundle the LGPL text and OCCT's. Audit STEP/3MF/AMF library licenses for the same constraint. |
+| License | **MIT OR Apache-2.0** (dual) | BearCAD's own code is permissively licensed. OCCT is LGPL 2.1 and is **statically linked** under the LGPL's relink provision — BearCAD ships the pinned OCCT source (submodule), a build script, and an `OCCT_DIR` relink override (see §10). Bundle the LGPL + OCCT-exception text and all dependency notices via `THIRD_PARTY_LICENSES.md` (Help ▸ Licenses). Audit STEP/3MF/AMF library licenses for the same constraint. |
 
 ### 1.1 Platforms
 
@@ -101,6 +101,18 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
   behind the body. Entering a sketch reorients the camera head-on to the face; for a near-vertical
   face (such as a side wall) the view is oriented with world up (+Z) toward the top of the screen
   so the ground stays at the bottom and orbit behaves normally, rather than rolling sideways.
+- **Constraining to the sketched-on face itself (#26/#27):** while a sketch is open on one of
+  a body's own faces (an extrusion cap or side wall — not a construction plane), that face's
+  own analytic boundary loop (the same one used for its cap/side-wall geometry) is available as
+  constraint targets: `ConstraintPoint::FaceVertex` for a corner and `ConstraintLine::FaceEdge`
+  for an edge, both resolved by projecting the face's world-space boundary into the sketch's
+  frame. They plug into the existing constraint machinery like any other point/line — a sketch
+  point can be **Coincident** to a face vertex, and the **Midpoint**/**PointLineDistance**
+  constraints work against a face edge unchanged (e.g. "30mm from the top edge"). Both are
+  fixed by the body's geometry (not draggable/settable), the same treatment `Coincident`'s
+  `Origin` entity already gets. Picking is scoped to the *active sketch's own face* only (not
+  arbitrary other faces), with vertices taking precedence over edges like other sketch points.
+  Out of scope: imported STL/STEP bodies have no analytic face/edge structure to reference.
 - Sketch entities: line, arc, circle, ellipse, spline, point, and construction-geometry
   variants. Convenience primitives (e.g. **rectangle**, drawn as four constrained lines)
   may be offered as tools that emit the underlying entities.
@@ -122,6 +134,15 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
   those edges (within a perpendicular tolerance), with a dashed guide line from the edge to the
   point. Leaving the point there adds a point-on-line coincidence (collinear with the edge), so
   e.g. touching a rectangle corner lets the next point be placed in line with one of its sides.
+- **Inference snapping onto a normal-at-midpoint guide (#41):** touching a line/edge's
+  **midpoint** arms it as a normal-inference anchor; pulling away then snaps the point onto the
+  **infinite line perpendicular to that edge, through its midpoint** (same touch-then-track
+  interaction as the extension guide above, with its own dashed guide line). There's no single
+  constraint primitive for "perpendicular through a midpoint", so leaving the point there instead
+  invents a construction `Line` from the anchor's midpoint out toward the placed point (dashed,
+  `construction: true`) and pins it with three existing constraints: `Midpoint` (its start at the
+  anchor's midpoint), `Perpendicular` (to the anchor), and `Coincident` (the placed point onto the
+  new line's carrier) — no new `ConstraintKind` needed.
 - **Polygon faces from closed line loops (#66):** any set of plain `Line`s that connect
   end-to-end into a closed loop, via `Coincident` constraints on their endpoints, is itself a
   usable face — filled the same as a rect/circle profile (shared blue styling, construction
@@ -135,12 +156,39 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
   control points (`[0]` near `(x0,y0)`, `[1]` near `(x1,y1)`) — its two endpoints stay ordinary
   constrainable vertices, so coincidence/distance constraints, dragging, undo, and persistence
   all work unchanged. Curves are made three ways:
-  - **Click-drag with the Line tool:** a click-click still draws a straight segment (unchanged);
-    holding the button down and dragging away from the straight chord before releasing shapes a
-    curve through the drag path instead. A negligible drag (a plain click/tap) stays straight.
+  - **Curve-mode toggle with the Line tool (#73):** the Line tool always places points with
+    plain click-click (no click-drag gesture). Two independent toggles, shown as checkboxes in
+    the Context pane (above Construction) while the Line tool is active and bound to keyboard
+    shortcuts `B`/`T`, control what happens at each shared vertex of a drawn polyline:
+    - **Curve mode (`B`, default off):** when on, the *next* point placed gets bezier handles on
+      both sides of it (or just the outgoing side, if it's a fresh chain's starting point, since
+      there's no previous segment to derive a tangent from yet). Concretely: committing the
+      *n*-th point of a chain (n ≥ 3) retroactively smooths the shared vertex between the
+      (n-2)→(n-1) and (n-1)→n segments — so a segment only curves once a further point makes its
+      tangent meaningful. The toggle persists across chained segments (like Construction) and is
+      read/written by `Action::ApplyCurveMode`/`ToggleCurveMode`.
+    - **Tangent constraint (`T`, default on):** while curve mode is on, controls *how* each
+      shared vertex is curved. On: both sides' handles are mirrored/tangent-continuous via the
+      same smoothing used by "Convert to bezier curve" below. Off: the previous segment's handle
+      is left alone and the new segment gets an independent "corner" handle a third of the way
+      along its own chord — a barely-curved starting shape meant to be reshaped by hand via the
+      draggable handles below.
+    - **Live preview:** as the mouse moves before the next point is placed, the in-progress
+      segment previews its live curve toward the cursor, and — when curve mode smooths a shared
+      vertex — the previous segment's end visibly bends to stay smooth/corner-consistent with it,
+      updating every frame.
+    - Both toggles also work retroactively: with the Select tool, in sketch mode, with one or
+      more vertices selected, `B` toggles the selected vertex(es) between curved and straight
+      (straightens both incident lines if either is already curved, else smooths them — see
+      `Action::SetVertexTangent`/`ConvertVertexToBezier`/`StraightenLine`) and `T` toggles
+      between tangent-continuous (re-smoothed) and independent handles at the vertex. Vertices
+      that don't join exactly two plain lines are skipped (no-op).
   - **Draggable handles:** once committed, a curved line's two tangent handles are shown (in the
     active sketch) as small discs with dashed guides back to their endpoint; dragging one
-    reshapes the curve live.
+    reshapes the curve live. Clicking (rather than dragging) a handle selects it; pressing
+    Delete/Backspace, or right-clicking it and choosing "Delete handle", straightens the line
+    (#75) — a curve is either both handles or neither, so there's no independent per-handle
+    state to remove, only the whole curve.
   - **Right-click a vertex:** right-clicking a vertex where exactly two plain lines meet offers
     "Convert to bezier curve", which smooths the joint into a tangent-continuous pair of curves
     (Catmull-Rom-style, using the two lines' far endpoints to set the tangent direction through
@@ -169,13 +217,29 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
   rejected as degenerate. Only the `Coincident` constraint directly between the two treated
   endpoints is removed on commit — other constraints that happened to reference the old vertex
   position are **not** automatically fixed up (a known, documented limitation; the resulting
-  sketch may need manual re-constraining). This is explicitly **2D sketch vertices only** — there
-  is no 3D solid-edge chamfer/fillet in this version, because BearCAD has no BREP/NURBS kernel
-  yet (see §10); a mesh-bevel approximation on extrusion side/cap edges would need new per-edge
-  picking infrastructure and mesh-stitching at corners, and is left as future work alongside true
-  kernel-backed 3D fillets. Scriptable via `bearcad.chamfer_vertex{ point = {...}, distance = }`
+  sketch may need manual re-constraining). This is specifically the **2D sketch-vertex** case;
+  the same Chamfer/Fillet tool also does a **3D solid-edge** mesh-bevel approximation on an
+  extrusion's analytic side/cap edges when no sketch is open — see §3.4, which is *not* a true
+  kernel-backed BREP fillet (BearCAD has no BREP/NURBS kernel — see §10). Scriptable via
+  `bearcad.chamfer_vertex{ point = {...}, distance = }`
   and `bearcad.fillet_vertex{ point = {...}, radius = }`, where `point` is the usual
   `ConstraintPoint` table (e.g. `{ kind = "line", index = 0, ["end"] = "end" }`).
+  - **Live geometry preview (#76):** while the gizmo is being placed or dragged (before commit),
+    the actual treated-corner shape is drawn as a preview overlay — the two truncated points and
+    the bridge between them (straight for a chamfer, sampled from the fillet's bezier arc) — not
+    just the gizmo arrow. It's recomputed every frame from the live drag amount, so pulling the
+    handle further visibly grows the cut/round before you commit.
+  - **Elements pane nesting (#76):** the bridging `Line` a chamfer/fillet creates is nested under
+    the trimmed line it came from, instead of appearing as an ordinary flat sibling. Since a
+    corner is shared by two trimmed lines, the tie is broken deterministically by nesting under
+    whichever of the two has the lower index in `doc.lines` (recorded once at commit time via
+    `Line.chamfer_fillet_parent: Option<usize>`); if that parent line is later deleted, the
+    bridging line falls back to a top-level row rather than disappearing. Its default label is
+    also "Chamfer N"/"Fillet N" instead of the generic "Line N".
+  - **Document root row (#87):** the Elements pane's sole top-level row is a synthetic
+    **Document** node (not individually selectable or hideable); every root construction
+    plane, orphaned extrusion, and orphaned body (e.g. STL/STEP imports) nests under it
+    instead of appearing as a separate root.
 
 ### 3.2 Solid creation from sketches
 - **Extrude** — blind, symmetric, to-object, with optional draft angle.
@@ -215,18 +279,87 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
     contribution — the body survives as long as it still has at least one. Scriptable via
     `bearcad.extrude{ ..., body = "merge" }` (joins the face's body if there is one; omitted or
     any other value always creates a new body, matching the declarative/OpenSCAD-style default).
+  - **Boolean-region face picking (#16/#62)**: when exactly two coplanar sketch shapes overlap
+    with nonzero area (and no third shape also overlaps that pair — see scope below), clicking
+    inside their combined footprint with the Extrude tool resolves to the specific atomic region
+    under the cursor instead of a whole shape: their shared intersection, or one shape minus the
+    other, via two point-in-polygon tests against the picked point. This is `ExtrudeFace::
+    Boolean { op: BooleanOp::Intersection | Difference, a, b }` (`a`/`b` boxed `ExtrudeFace`s,
+    recursive so the type stays general, though the interactive picker only ever constructs
+    depth-1 combinations of two raw `Rect`/`Circle`/`Polygon` shapes) — toggled into
+    `Extrusion::faces` exactly like any other face (multi-face selection already lets a union of
+    two whole shapes be built by toggling both, so no separate `Union` variant is needed). The
+    region's boundary is computed on demand by `crate::polygon_boolean::polygon_boolean`, a
+    two-simple-polygon Weiler-Atherton clip (`Difference` reverses the clip polygon's winding —
+    the standard trick that turns the same intersection-walk into a subtraction); its resolved
+    loop feeds mesh generation, fill rendering, and hover-highlighting the same way a `Polygon`
+    face's loop already does. Scriptable via `bearcad.extrude{ boolean = { op = "intersection" |
+    "difference", a = <face spec>, b = <face spec> }, distance }`, where a face spec is `{rect=
+    i}`/`{circle=i}`/`{polygon={...}}`/a nested `{boolean={...}}`.
+    - **Scope (deliberate, not yet general N-way arrangements)**: only ever two shapes at a
+      time — a sketch with three or more mutually-overlapping shapes falls back to today's
+      whole-shape picking instead. `polygon_boolean` itself only produces a result when the
+      boolean combination reduces to a **single simple polygon loop**; it returns `None`
+      (falling back the same way) for a multi-part (disjoint-piece) result, a result with a
+      hole (e.g. subtracting a shape strictly interior to another, which would leave an
+      annulus), or a near-zero-area/degenerate result — these are deliberately rejected rather
+      than approximated. No flat side-wall sketching is offered on a boolean-derived extrusion
+      (`side_face_count` is 0 for it, mirroring `Circle`'s curved walls) since its edge count
+      depends on the resolved (Document-dependent) geometry; the extrusion mesh itself is
+      unaffected, since it walks the resolved profile loop directly.
 - **Revolve** — about an axis, full or partial angle.
 
 ### 3.3 Combining solids
 - **Boolean**: union, cut (subtract), intersect.
 
 ### 3.4 Modifying solids
-- **Fillet** and **Chamfer**: v1 ships these as the 2D sketch-vertex tools described in §3.1
-  (#37/#38) — truncate-and-bridge on a sketch vertex where two lines meet, with the fillet arc
-  approximated by a single bezier segment on the bridging `Line`. True 3D solid-edge fillet/
-  chamfer on selected edges (constant radius/distance for v1; variable is a stretch goal) remains
-  future work pending a BREP/NURBS geometry kernel (see §10) — BearCAD has none today, and a
-  mesh-bevel approximation without one was judged out of scope for this change.
+- **Fillet** and **Chamfer**, 2D sketch vertices: the tools described in §3.1 (#37/#38) —
+  truncate-and-bridge on a sketch vertex where two lines meet, with the fillet arc approximated
+  by a single bezier segment on the bridging `Line`.
+- **Fillet** and **Chamfer**, 3D solid edges (#77): a **mesh-bevel approximation**, not a true
+  BREP fillet — BearCAD has no BREP/NURBS kernel (see §10), so this doesn't attempt a
+  tangent-continuous curved surface, correct face trimming, or vertex-miter blending where 3+
+  edges meet; it directly reshapes the extrusion's own triangle mesh instead. Scoped to bodies
+  whose source is one or more `Extrusion`s with a `Rect` or `Polygon` profile, and to the two
+  edge families that have a clean analytic definition there (see `crate::extrude::side_quad_
+  world`/`cap_polygon_world`):
+  - a **vertical side edge**, where two adjacent flat side walls of the profile meet, and
+  - a **side/cap edge**, where a side wall meets the top or bottom cap.
+
+  **Chamfer** replaces the edge with a single flat bevel quad connecting the two originally
+  adjacent faces, offset back from the edge by the chamfer distance on each side (the same
+  truncate-by-`amount` math as the 2D vertex case, `crate::model::vertex_treatment_geometry`,
+  generalized to arbitrary 3D corners via `crate::extrude::corner_bevel_3d` — any two rays from
+  a shared point span a flat 2D subspace, so this is an exact, not approximated, embedding).
+  **Fillet** replaces it with an N-segment faceted rounded bevel instead of a true curved
+  surface, sampling the same cubic-bezier arc approximation the 2D fillet uses, faceted at
+  `EDGE_TREATMENT_FILLET_SEGMENTS` (= `BEZIER_SEGMENTS`, the existing curve-faceting precedent).
+  - **Explicitly out of scope**: `Circle`-profile edges (curved, no discrete side walls to
+    bevel — `side_face_count` is 0); STL/STEP-imported bodies (pure triangle soup, no analytic
+    profile to derive an edge from — #31's generic mesh-feature-edge extraction still works for
+    *picking/hovering* those edges for plane-referencing, just not for beveling them); and a
+    **vertex miter** where 3+ treated edges would meet at a shared corner — rejected at commit
+    time (`crate::extrude::edge_treatment_conflicts`) rather than attempting to blend three
+    bevels together, a documented limitation rather than a crash or wrong-looking result.
+  - **Data model**: parametric, like everything else in this app (re-evaluated from the document
+    every frame, not a one-time mesh edit). Each `Extrusion` carries `edge_treatments: Vec<
+    EdgeTreatment>`, where `EdgeTreatment { edge: ExtrusionEdgeRef, kind: VertexTreatmentKind,
+    amount: f32 }` and `ExtrusionEdgeRef` names the analytic edge family + index (`Vertical {
+    face, edge }` or `Cap { face, edge, top }`, `face` indexing `Extrusion::faces`). `kind`
+    reuses `VertexTreatmentKind` (Chamfer/Fillet) from the 2D case directly. `crate::extrude::
+    extrusion_mesh` applies every treatment on a face while building its mesh.
+  - **Interactive tool**: the same Chamfer/Fillet tool (`K`/`F`) as the 2D case — when a sketch
+    is open it behaves exactly as §3.1 describes; when no sketch is open, clicking a body's
+    analytic edge (picked directly from the edge list, not the generic mesh-feature-edge
+    extraction, since the structured `ExtrusionEdgeRef` is needed) starts a parallel in-progress
+    state and shows the same push/pull gizmo (anchored at the edge midpoint, pointing along the
+    inward bisector of the two adjacent faces) with a live semi-transparent ghost-preview solid
+    (reusing the extrude tool's `preview_extrusion`/`editing_extrusion` mechanism: a clone of the
+    extrusion with the live treatment spliced in, the committed body hidden meanwhile) — drag or
+    type an amount, Enter/click commits, Esc cancels.
+  - Scriptable via `bearcad.chamfer_edge{ extrusion =, edge = {...}, distance = }` and
+    `bearcad.fillet_edge{ extrusion =, edge = {...}, radius = }`, where `edge` is `{ kind =
+    "vertical", face =, edge = }` or `{ kind = "cap", face =, edge =, top = }`.
 - **Shell** — hollow a solid to a wall thickness, removing selected faces.
 
 ### 3.5 Advanced features
@@ -346,6 +479,18 @@ is the source of truth for the model; geometry is derived from it (see §4.4).
   needed.
 - Internal canonical storage units: **TBD** (recommend millimeters for length, radians for
   angle), but the stored expression text is always preserved.
+- **Default-unit picker (#52):** the Context pane lets the user choose default length/angle
+  units. With nothing selected, it edits the document-wide defaults
+  (`bearcad.set_units{ length = "mm", angle = "deg" }`). With exactly one **sketch** selected,
+  it edits that sketch's own override instead, offering a "Follow document" entry per axis
+  (length and angle can be overridden independently) that clears back to inheriting the
+  document default (`bearcad.set_units{ sketch = N, length = "in" }`; omitting an axis on a
+  sketch call means "follow document" for that axis, since Lua can't distinguish an omitted
+  table field from an explicit `nil`). Any other selection hides the picker. **Scope note
+  (#85):** dimension labels and the Elements pane now format geometry in the effective unit
+  (document default, or the owning sketch's override) instead of always showing mm/degrees.
+  This does **not** change the bare-number parsing fallback, which is still hardcoded to
+  mm/degrees (per above) — internal storage stays mm/radians regardless of display unit.
 
 ---
 
@@ -384,7 +529,8 @@ modeled on SolveSpace (https://solvespace.com).
   - **Equal** — `line`, `line` (the two edges are constrained to equal length; rect edges
     count as lines). See #47.
   - **Coincident** — `point`, `point`; `point`, `line`; or `point`, `circle` (point on the
-    circle's perimeter)
+    circle's perimeter). A `point`/`line` operand may be the sketch's own face's vertex/edge
+    (#26/#27, see §3.1) — picked the same way as any other sketch point/line.
   - **Midpoint** — `point`, `line`
   - **Vertical** — `line`
   - **Horizontal** — `line`
@@ -513,6 +659,13 @@ Everything achievable in the GUI must be achievable by programming, and vice ver
   at its `(x, y)` origin corner; a line's two points are `start`/`end`, i.e. `(x0,y0)`/`(x1,y1)`).
   A table with neither `end` nor `corner` still resolves to the whole element as before; pass an
   explicit `point = true` to target a point that has no such field (e.g. a circle's center).
+- **Face vertex/edge selection (#26/#27):** `bearcad.select{ kind = "face", face = { … }, index }`
+  selects a corner of the *sketched-on* face's own boundary loop (a `ConstraintPoint::FaceVertex`);
+  add `edge = true` to select the edge from that corner to the next instead
+  (`ConstraintLine::FaceEdge`). `face` is a nested table in the same shape `begin_sketch` takes
+  for a 3D body face (`kind = "extrude_cap"|"extrude_side", extrusion, profile, profile_index,
+  top?/edge?`). Combine with the point-level selection above to build the constraint purely from
+  a script, e.g. pinning a sketch point coincident to the face's corner 2.
 
 ---
 
@@ -587,13 +740,26 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
 
 ## 10. Geometry kernel integration (OCCT)
 
-- Integrate OCCT via Rust FFI. Either use/extend an existing binding crate or generate a
-  thin C++ shim exposing only the operations BearCAD needs (sketch profiles, prism/revol,
-  boolean, fillet/chamfer, shell, sweep/loft, STEP/mesh I/O, tessellation). Binding
-  strategy: **TBD**, but isolate all `unsafe`/FFI behind a safe Rust `kernel` module.
-- OCCT must be **dynamically linked** (license, §1) and bundled in each platform package.
+- Integrate OCCT via Rust FFI through a **hand-written thin C++ shim** exposing only the
+  operations BearCAD needs (sketch profiles, prism/revol, boolean, fillet/chamfer, shell,
+  sweep/loft, STEP/mesh I/O, tessellation). All `unsafe`/FFI is isolated behind a safe Rust
+  `kernel` module (`src/kernel/`, shim in `cpp/`). The shim presents a flat `extern "C"` C
+  ABI (no C++ types cross the boundary), so no `bindgen` is required.
+- OCCT is **statically linked**, gated behind the off-by-default **`occt` Cargo feature** so
+  the default build/CI need no C++ toolchain or built OCCT. Static linking is permitted under
+  OCCT's LGPL 2.1 because BearCAD ships the means to relink against a different OCCT: the
+  pinned OCCT source (the `third_party/OCCT` git submodule), a build script
+  (`scripts/build-occt.sh`), and an `OCCT_DIR` env override that repoints the link at any
+  OCCT install prefix. See `README.md` ("Building with the OCCT kernel") and
+  `THIRD_PARTY_LICENSES.md`. (This supersedes the earlier dynamic-linking plan in §1; the
+  LGPL obligation is met by relink-ability rather than by dynamic linking.)
+- A **Help ▸ Licenses** menu item links to `THIRD_PARTY_LICENSES.md`, which reproduces/points
+  to the LGPL 2.1 + OCCT exception text and every other dependency's license, satisfying the
+  attribution/notice obligations.
 - Record the OCCT version in the file (§7.1) to support deterministic recompute (§4.4).
-- Kernel errors must be converted into typed Rust errors attached to the failing DAG node.
+- Kernel errors must be converted into typed Rust errors attached to the failing DAG node —
+  the shim catches OCCT C++ exceptions at the boundary and returns error sentinels rather than
+  unwinding across FFI.
 
 ---
 
@@ -620,15 +786,16 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
 - **STL import (#70):** **File → Import STL…** (open dialog) reads an STL file — ASCII or
   binary, auto-detected by exact byte-length match against the binary format's
   header+triangle-count framing — and adds it as a new **Body** with no source feature (no
-  sketch/extrusion to nest under, so it appears at the top level of the Elements pane, named
-  after the file). Scriptable via `bearcad.import_stl(path)`. The mesh is stored and rendered
-  as-is (no auto-centering/scaling); it participates in STL/STEP export, visibility, renaming,
-  and deletion exactly like any other body, but — since it has no sketch/distance parameters —
-  can't be edited or merged into by a further extrude the way an extrusion-backed body can (#32).
+  sketch/extrusion to nest under, so it nests directly under the Elements pane's Document
+  root (#87), named after the file). Scriptable via `bearcad.import_stl(path)`. The mesh is
+  stored and rendered as-is (no auto-centering/scaling); it participates in STL/STEP export,
+  visibility, renaming, and deletion exactly like any other body, but — since it has no
+  sketch/distance parameters — can't be edited or merged into by a further extrude the way
+  an extrusion-backed body can (#32).
 - **STEP import (#71):** **File → Import STEP…** reads a STEP (ISO-10303-21) document's
   `FACETED_BREP` geometry — the same `POLY_LOOP`-bounded planar `FACE_SURFACE` subset BearCAD's
   own STEP export produces — and adds it as a new **Body**, the same way STL import does
-  (top-level in the Elements pane, named after the file). Scriptable via
+  (nests directly under the Elements pane's Document root, named after the file). Scriptable via
   `bearcad.import_step(path)`. STEP files using full BREP geometry (`ADVANCED_FACE` with
   curved/NURBS surfaces, as most CAD tools export) are rejected with a clear error rather than
   approximated: BearCAD has no NURBS/curve kernel yet (§10 is still **TBD**), so only the
@@ -644,6 +811,14 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
   document when replayed. Editing an already-committed extrusion isn't yet representable by a
   declarative call, so re-commits from the Edit flow aren't re-logged (a known gap, not a second,
   wrong instruction).
+- **Elements pane view modes (#34):** three icon-toggle buttons next to the pane heading switch
+  between **List** (the default flat, topologically-sorted view), **Tree** (the real nested
+  hierarchy, each level indented farther than its parent — planes/sketches/extrusions/bodies
+  nest exactly as the Document root tree does, #87), and **Graph** (a 2D node-link diagram:
+  column = tree depth, row = position within that column, width-constrained to the pane so it
+  never scrolls horizontally, only vertically). Clicking a node in Graph view selects it like any
+  other row; selecting a node highlights its ancestor and descendant nodes/edges with a distinct
+  accent color/stroke. This is a per-session UI preference, not saved with the document.
 
 ### 11.2 Command palette
 - VS Code-style palette listing **context-pertinent** commands. Commands come from the
@@ -675,6 +850,9 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
   *Select* is the default and only orbits/pans/zooms — geometry is created only when a
   drawing tool is active, so navigation never creates geometry by accident. Tools are part
   of the shared action layer (§8) so they appear in the palette and are rebindable.
+- **Sketch-mode border (#74):** while a sketch is open, the 3D viewport is outlined in a
+  bright orange border — a mode indicator distinct from every other viewport accent color, so
+  sketch mode is never mistaken for ordinary 3D navigation at a glance.
 - **Selectable hover feedback:** in any tool mode where the user can click to select
   geometry (e.g. picking a reference face or axis for a construction plane), every
   pickable target under the cursor is highlighted before click. The highlight uses a
@@ -689,6 +867,12 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
   creation), standalone sketch lines and individual edges of shapes (rectangle sides,
   construction-plane borders, etc.) are all valid picks. Shape edges take precedence over
   the shape's face when the cursor is near the edge.
+- **3D body edges (#31):** any edge of any 3D body — not just 2D sketch geometry — is a valid
+  axis reference for a construction plane, including STL/STEP-imported bodies. An edge here is
+  a *feature* edge of the body's triangle mesh (a mesh boundary, or a crease between two
+  non-coplanar triangles) — the same extraction `ShadingMode::Wireframe` uses to draw a body's
+  edges — so it works uniformly for any body regardless of how it was created, without needing
+  an analytic profile.
 - **Global axes:** the origin X/Y/Z triad is pickable as an axis reference when creating
   construction planes. Axis gizmo handles show a hover affordance (bright ring and thicker
   stroke) so the user can see which handle will be grabbed on click.
@@ -707,12 +891,18 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
     - *Solid + wireframe*: opaque fill plus an edge overlay that stays visible through the
       body, using the same depth-test-disabled technique as gizmos drawing through bodies
       (above) so the far-side edges aren't occluded by the near faces.
+    - *Realistic (#83)*: ambient + diffuse + specular (Blinn-Phong-ish) lighting instead of
+      `Solid`'s flat/Lambert-ish term, giving bodies a matte/satin "painted object" look with a
+      camera-dependent specular highlight. Still flat-shaded per triangle (no shared vertex
+      normals exist on the mesh), so it reads as faceted rather than smoothly lit. No
+      materials/textures yet — every body renders with the same fixed gloss; per-body/per-face
+      materials are future work.
 
   Both rows are backed by `Camera` state (a viewport display preference, alongside
   projection mode — not saved model geometry) and are fully scriptable:
   `bearcad.ui.toggle_projection()` / `bearcad.ui.view("orthographic" | "natural")` for
   projection, and `bearcad.ui.shading("wireframe" | "transparent" | "solid" |
-  "solid_wireframe")` for shading.
+  "solid_wireframe" | "realistic")` for shading.
 
 ---
 

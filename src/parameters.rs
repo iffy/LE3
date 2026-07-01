@@ -6,10 +6,10 @@ use crate::constraints::{
 };
 use crate::icons::{icon_button, IconId};
 use crate::document_health::HealthStatus;
-use crate::model::{DistanceTarget, Document, Parameter, ParameterSource};
+use crate::model::{effective_length_unit, DistanceTarget, Document, Parameter, ParameterSource};
 use crate::value::{
     eval_parameter_in_doc, expression_references_document_parameter,
-    format_angle_display, format_length_display, format_unknown_variable_error,
+    format_angle_display_in, format_length_display_in, format_unknown_variable_error,
     has_angle_unit_suffix, is_valid_parameter_name, parameter_name_conflicts_with_unit,
     parameter_names_referenced_in_expression, substitute_parameter_name,
     unknown_variables_in_parameter_expression, valid_parameter_expression_with_params,
@@ -65,8 +65,10 @@ pub fn format_parameter_autocomplete_value(doc: &Document, index: usize) -> Stri
         return String::new();
     }
     match eval_parameter_in_doc(&param.expression, doc) {
-        Some(EvaluatedParameter::LengthMm(v)) => format_length_display(v),
-        Some(EvaluatedParameter::AngleRad(v)) => format_angle_display(v),
+        Some(EvaluatedParameter::LengthMm(v)) => {
+            format_length_display_in(v, doc.default_length_unit)
+        }
+        Some(EvaluatedParameter::AngleRad(v)) => format_angle_display_in(v, doc.default_angle_unit),
         None => param.expression.clone(),
     }
 }
@@ -79,10 +81,10 @@ pub fn format_parameter_value_display(doc: &Document, expression: &str) -> Strin
     }
     match eval_parameter_in_doc(expr, doc) {
         Some(EvaluatedParameter::LengthMm(v)) => {
-            format!("{} ({expr})", format_length_display(v))
+            format!("{} ({expr})", format_length_display_in(v, doc.default_length_unit))
         }
         Some(EvaluatedParameter::AngleRad(v)) => {
-            format!("{} ({expr})", format_angle_display(v))
+            format!("{} ({expr})", format_angle_display_in(v, doc.default_angle_unit))
         }
         None => expr.to_string(),
     }
@@ -106,6 +108,10 @@ fn pane_element_for_constraint_line(line: crate::model::ConstraintLine) -> crate
     match line {
         ConstraintLine::Line(index) => SceneElement::Line(index),
         ConstraintLine::RectEdge { rect, .. } => SceneElement::Rect(rect),
+        // A face's own edge tracks the extrusion that produced its face, same as elsewhere.
+        ConstraintLine::FaceEdge { face, .. } => {
+            SceneElement::Extrusion(face.extrusion_index().unwrap_or(usize::MAX))
+        }
     }
 }
 
@@ -118,6 +124,9 @@ fn pane_element_for_constraint_point(
         ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(line),
         ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(rect),
         ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(circle),
+        ConstraintPoint::FaceVertex { face, .. } => {
+            SceneElement::Extrusion(face.extrusion_index().unwrap_or(usize::MAX))
+        }
     }
 }
 
@@ -138,7 +147,7 @@ pub fn elements_using_parameter(
             continue;
         }
         elements.insert(SceneElement::Constraint(index));
-        match constraint.kind {
+        match constraint.kind.clone() {
             ConstraintKind::Distance { target } => match target {
                 DistanceTarget::LineLength(i) => {
                     elements.insert(SceneElement::Line(i));
@@ -319,7 +328,15 @@ pub fn sync_computed_parameters(doc: &mut Document) {
         if let Some(ParameterSource::LineLength(index)) = param.source {
             if let Some(line) = doc.lines.get(index) {
                 if !line.deleted {
-                    param.expression = format_length_display(line.length());
+                    let length = line.length();
+                    // Field-disjoint access to avoid re-borrowing the whole `doc` while
+                    // `doc.parameters` is under an active mutable iterator borrow above.
+                    let unit = doc
+                        .sketches
+                        .get(line.sketch)
+                        .and_then(|s| s.length_unit)
+                        .unwrap_or(doc.default_length_unit);
+                    param.expression = format_length_display_in(length, unit);
                 }
             }
         }
@@ -354,10 +371,11 @@ pub fn add_computed_parameter_from_line_length(
         .unwrap_or_else(|| default_computed_parameter_name_for_line(doc, line_index));
     validate_new_parameter_name(doc, &name, None)?;
     let length = doc.lines[line_index].length();
+    let unit = effective_length_unit(doc, doc.lines[line_index].sketch);
     let index = doc.parameters.len();
     doc.parameters.push(Parameter {
         name,
-        expression: format_length_display(length),
+        expression: format_length_display_in(length, unit),
         deleted: false,
         source: Some(ParameterSource::LineLength(line_index)),
     });

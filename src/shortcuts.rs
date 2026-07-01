@@ -90,6 +90,10 @@ pub fn tool_shortcut(tool: Tool) -> Option<ShortcutHint> {
 }
 
 pub const TOGGLE_CONSTRUCTION: ShortcutHint = ShortcutHint::plain("X");
+/// Curve-mode toggle for the line tool (#73): the next point drawn gets bezier handles.
+pub const TOGGLE_CURVE_MODE: ShortcutHint = ShortcutHint::plain("B");
+/// Tangent-constraint toggle for the line tool (#73): keep curve handles mirrored/smooth.
+pub const TOGGLE_TANGENT_CONSTRAINT: ShortcutHint = ShortcutHint::plain("T");
 pub const FOCUS_ELEMENT_NAME: ShortcutHint = ShortcutHint::plain("N");
 pub const CANCEL_OPERATION: ShortcutHint = ShortcutHint::plain("Esc");
 pub const UNDO: ShortcutHint = ShortcutHint::primary("Z");

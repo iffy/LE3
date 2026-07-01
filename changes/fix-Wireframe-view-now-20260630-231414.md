@@ -1,0 +1,1 @@
+Wireframe view now shows only real feature edges (face boundaries where the surface actually creases) instead of every internal triangulation seam, so a flat face no longer visibly shows the triangles it's built from.

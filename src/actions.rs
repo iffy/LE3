@@ -39,9 +39,10 @@ use crate::constraints::{
     find_distance_constraint, set_constraint_dim_offset, set_constraint_expression, ConstraintId,
 };
 use crate::model::{
-    bezier_from_drag_path, vertex_treatment_geometry, Circle, ConstraintEntity, ConstraintLine,
-    ConstraintKind, ConstructionPlane, ConstraintPoint, DimensionTarget, DistanceTarget, Document,
-    ExtrudeFace, Extrusion, FaceId, Line, LineEnd, Rect, RectEdge, ShapeKind, VertexTreatmentKind,
+    independent_corner_handle, smooth_joint_bezier, vertex_treatment_geometry, Circle,
+    ConstraintEntity, ConstraintLine, ConstraintKind, ConstructionPlane, ConstraintPoint,
+    DimensionTarget, DistanceTarget, Document, EdgeTreatment, ExtrudeFace, Extrusion,
+    ExtrusionEdgeRef, FaceId, Line, LineEnd, Rect, RectEdge, ShapeKind, VertexTreatmentKind,
 };
 use crate::vertex_drag;
 use crate::face::SketchFrame;
@@ -180,10 +181,20 @@ pub struct CreatingLine {
     pub pending_focus: bool,
     /// Committed line is construction geometry when true.
     pub construction: bool,
-    /// Local-space pointer samples recorded while the button has stayed held down since the
-    /// initial press. A click-click straight line never accumulates enough of these; a
-    /// click-drag-release gesture does, and its bulge shapes the committed line into a curve.
-    pub drag_path: Vec<(f32, f32)>,
+    /// When true, the vertex this segment starts from (if it has a previous chained
+    /// segment) gets bezier handles on both sides — see [`Action::CommitLine`] and #73.
+    pub curve_mode: bool,
+    /// When curve-mode is on, whether the shared vertex's handles stay mirrored/tangent-
+    /// continuous (via [`crate::model::smooth_joint_bezier`]) or are independent "corner"
+    /// handles. Ignored when `curve_mode` is false.
+    pub tangent_constraint: bool,
+    /// Index into `doc.lines` of the previous segment this one chains from (its end is this
+    /// segment's start), if any. `None` for the first segment of a fresh chain.
+    pub chained_from: Option<usize>,
+    /// Snapshot of `chained_from`'s line's `bezier` value taken the moment this segment
+    /// started, before any live-preview smoothing touched it. Restored on cancel and used as
+    /// the stable "existing far handle" baseline while curving the joint live (#73).
+    pub chained_from_bezier: Option<[(f32, f32); 2]>,
 }
 
 /// State for the in-progress (pre-Enter) circle creation.
@@ -304,6 +315,36 @@ pub struct CreatingVertexTreatment {
 }
 
 impl CreatingVertexTreatment {
+    /// Evaluated amount: typed magnitude (if edited), otherwise the live gizmo-driven value.
+    /// Always non-negative.
+    pub fn evaluated_amount(&self, doc: &Document) -> f32 {
+        if self.user_edited {
+            parse_positive_length_or_in_doc(&self.text, doc, self.amount_live.max(0.0))
+        } else {
+            self.amount_live.max(0.0)
+        }
+    }
+}
+
+/// In-progress (pre-commit) 3D solid-edge chamfer/fillet (#77): the extrusion + analytic edge
+/// picked, which kind, and the live gizmo-driven amount. The 3D analogue of
+/// [`CreatingVertexTreatment`] — kept as a parallel, separate state rather than folded into it,
+/// since resolving the target/geometry is entirely different (an extrusion's own analytic
+/// side/cap edge, via `ExtrusionEdgeRef`, not a sketch vertex).
+#[derive(Clone, Debug)]
+pub struct CreatingEdgeTreatment {
+    pub extrusion: usize,
+    pub edge: ExtrusionEdgeRef,
+    pub kind: VertexTreatmentKind,
+    /// Live amount (mm), gizmo-driven; always clamped non-negative.
+    pub amount_live: f32,
+    /// Amount input text; the sign is always positive (chamfer/fillet can't go negative).
+    pub text: String,
+    pub user_edited: bool,
+    pub pending_focus: bool,
+}
+
+impl CreatingEdgeTreatment {
     /// Evaluated amount: typed magnitude (if edited), otherwise the live gizmo-driven value.
     /// Always non-negative.
     pub fn evaluated_amount(&self, doc: &Document) -> f32 {
@@ -507,6 +548,21 @@ pub enum Action {
     },
     /// Toggle construction/substantial on the active draw op or each constructable selected target.
     ToggleConstruction,
+    /// Set curve-mode (`B`) on the active line draw op, or the persisted default for the line
+    /// tool (#73).
+    ApplyCurveMode { curve_mode: bool },
+    /// Toggle curve-mode (`B`): on the active line draw op / persisted line-tool default, or —
+    /// in Select tool with sketch vertices selected — retroactively on each selected vertex
+    /// (curves it if straight, straightens it if curved; see [`Action::ConvertVertexToBezier`]
+    /// / [`Action::StraightenLine`]).
+    ToggleCurveMode,
+    /// Set the tangent-constraint toggle (`T`) on the active line draw op, or the persisted
+    /// default for the line tool (#73).
+    ApplyTangentConstraint { tangent_constraint: bool },
+    /// Toggle the tangent-constraint (`T`): on the active line draw op / persisted line-tool
+    /// default, or — in Select tool with sketch vertices selected — retroactively re-smooth
+    /// vs. break tangency at each selected vertex (see [`Action::SetVertexTangent`]).
+    ToggleTangentConstraint,
     CommitElementName {
         element: SceneElement,
         name: String,
@@ -558,6 +614,15 @@ pub enum Action {
     ConvertVertexToBezier { point: ConstraintPoint },
     /// Right-click "straighten curve": clears a curved line's tangent handles.
     StraightenLine { line: usize },
+    /// Retroactive `T` shortcut on a selected sketch vertex (#73): when `continuous`, re-smooths
+    /// both incident lines' handles at `point` via [`crate::model::smooth_joint_bezier`]
+    /// (same computation as [`Action::ConvertVertexToBezier`]); when not, gives each line an
+    /// independent "corner" handle at the vertex instead. Errors unless exactly two plain lines
+    /// meet there.
+    SetVertexTangent {
+        point: ConstraintPoint,
+        continuous: bool,
+    },
     /// Chamfer or fillet a sketch vertex where exactly two plain lines meet (#37/#38):
     /// truncates both lines back from the vertex and bridges them with a new `Line` (straight
     /// for a chamfer, single-cubic-bezier arc for a fillet — see
@@ -566,6 +631,22 @@ pub enum Action {
     /// from the interactive gizmo tool.
     CommitVertexTreatment {
         point: ConstraintPoint,
+        kind: VertexTreatmentKind,
+        amount: f32,
+    },
+    /// Chamfer or fillet an analytic edge of an extrusion's 3D solid (#77): a mesh-bevel
+    /// approximation (flat bevel quad for a chamfer, an N-segment faceted bevel for a fillet —
+    /// see `crate::extrude::corner_bevel_3d`/`extrude_profile_with_treatments`), scoped to the
+    /// vertical side and side/cap edges of a `Rect`/`Polygon`-profiled extrusion (SPEC §3.4).
+    /// Stores (or updates, if `edge` is already treated) an `EdgeTreatment` on the extrusion —
+    /// parametric, re-evaluated every frame like everything else in this app, not a baked mesh
+    /// edit. Rejects an edge that would share a corner with another already-treated edge on the
+    /// same face (a vertex miter — this mesh-bevel approximation doesn't attempt to blend
+    /// three-or-more bevels together). Atomic and declarative: usable directly from Lua
+    /// (`bearcad.chamfer_edge`/`fillet_edge`) as well as from the interactive gizmo tool.
+    CommitEdgeTreatment {
+        extrusion: usize,
+        edge: ExtrusionEdgeRef,
         kind: VertexTreatmentKind,
         amount: f32,
     },
@@ -838,19 +919,19 @@ pub enum DimEditTarget {
 impl DimEditTarget {
     pub fn dimension_target(&self, doc: &Document) -> Option<DimensionTarget> {
         match self {
-            DimEditTarget::New(target) => Some(*target),
-            DimEditTarget::Constraint(id) => doc.constraints.get(*id).and_then(|c| match c.kind {
+            DimEditTarget::New(target) => Some(target.clone()),
+            DimEditTarget::Constraint(id) => doc.constraints.get(*id).and_then(|c| match &c.kind {
                 crate::model::ConstraintKind::Distance { target } => {
-                    Some(DimensionTarget::Distance(target))
+                    Some(DimensionTarget::Distance(target.clone()))
                 }
                 crate::model::ConstraintKind::Angle {
                     line_a,
                     line_b,
                     rotation_sign,
                 } => Some(DimensionTarget::Angle {
-                    line_a,
-                    line_b,
-                    rotation_sign,
+                    line_a: line_a.clone(),
+                    line_b: line_b.clone(),
+                    rotation_sign: *rotation_sign,
                 }),
                 _ => None,
             }),
@@ -898,7 +979,7 @@ pub struct EditingCommittedDim {
 /// snapping `rotation_sign` to whichever of the angle's two distinct magnitudes
 /// (the natural one or its supplement) encloses the cursor; a click commits it and
 /// moves on to typing the value (#40).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PlacingAngleDimension {
     pub line_a: ConstraintLine,
     pub line_b: ConstraintLine,
@@ -996,8 +1077,18 @@ pub struct AppState {
     pub creating_extrusion: Option<CreatingExtrusion>,
     /// In-progress chamfer/fillet: picked vertex + live gizmo-driven amount.
     pub creating_vertex_treatment: Option<CreatingVertexTreatment>,
+    /// In-progress 3D solid-edge chamfer/fillet (#77): picked extrusion edge + live
+    /// gizmo-driven amount. Parallel to `creating_vertex_treatment` — see
+    /// [`CreatingEdgeTreatment`].
+    pub creating_edge_treatment: Option<CreatingEdgeTreatment>,
     /// Shared construction draw mode for rectangle, line, and circle tools.
     pub draw_construction: bool,
+    /// Persisted "next point gets bezier handles" toggle for the line tool (`B`, #73); mirrors
+    /// how `draw_construction` persists across chained segments.
+    pub draw_curve_mode: bool,
+    /// Persisted tangent-continuity toggle for the line tool (`T`, #73); only meaningful while
+    /// `draw_curve_mode` is on.
+    pub draw_tangent_constraint: bool,
     pub creating_plane: Option<CreatingConstructionPlane>,
     pub panes: PaneVisibility,
     pub parameters_pane: ParametersPaneState,
@@ -1032,6 +1123,10 @@ pub struct AppState {
     /// hovered while sketching. While these are active, pulling away from that vertex snaps
     /// the point onto the infinite extension of those edges (#21). Cleared on sketch exit.
     pub extension_anchors: Vec<crate::model::ConstraintLine>,
+    /// Inference snap guide for #41: the line whose midpoint the cursor most recently touched
+    /// while sketching. While set, pulling away from that midpoint snaps the point onto the
+    /// infinite line normal to it, through its midpoint. Cleared on sketch exit.
+    pub normal_inference_anchor: Option<crate::model::ConstraintLine>,
     /// Snapshots of `construction_planes` taken before each in-place plane edit, so that
     /// `UndoLast` can revert the edit. Kept in lockstep with `ShapeKind::ConstructionPlaneEdit`
     /// markers in `shape_order` (one payload per marker, same LIFO order).
@@ -1051,7 +1146,10 @@ impl Default for AppState {
             creating_circle: None,
             creating_extrusion: None,
             creating_vertex_treatment: None,
+            creating_edge_treatment: None,
             draw_construction: false,
+            draw_curve_mode: false,
+            draw_tangent_constraint: true,
             creating_plane: None,
             panes: PaneVisibility::default(),
             parameters_pane: ParametersPaneState::default(),
@@ -1075,6 +1173,7 @@ impl Default for AppState {
             rect_opposite_snap: None,
             circle_center_snap: None,
             extension_anchors: Vec::new(),
+            normal_inference_anchor: None,
             construction_plane_edit_undo: Vec::new(),
         }
     }
@@ -1256,11 +1355,14 @@ impl AppState {
 pub const DEFAULT_EXTRUDE_DISTANCE: f32 = 10.0;
 
 /// The sketch a face (rect/circle/polygon profile) belongs to.
-fn extrude_face_sketch(doc: &Document, face: &ExtrudeFace) -> Option<SketchId> {
+pub(crate) fn extrude_face_sketch(doc: &Document, face: &ExtrudeFace) -> Option<SketchId> {
     match face {
         ExtrudeFace::Rect(i) => doc.rects.get(*i).map(|r| r.sketch),
         ExtrudeFace::Circle(i) => doc.circles.get(*i).map(|c| c.sketch),
         ExtrudeFace::Polygon(lines) => lines.first().and_then(|&i| doc.lines.get(i)).map(|l| l.sketch),
+        // `a`/`b` always share the same sketch (that's the whole premise of combining them),
+        // so either side resolves it.
+        ExtrudeFace::Boolean { a, .. } => extrude_face_sketch(doc, a),
     }
 }
 
@@ -1298,6 +1400,92 @@ fn rect_corner_index_at(rect: &Rect, u: f32, v: f32) -> u8 {
 
 fn pane_status(pane: Pane, visible: bool) -> String {
     format!("{} {}", pane.label(), if visible { "shown" } else { "hidden" })
+}
+
+fn curve_mode_status(curve_mode: bool) -> String {
+    format!("Line curve mode: {}", if curve_mode { "on" } else { "off" })
+}
+
+fn tangent_constraint_status(tangent_constraint: bool) -> String {
+    format!(
+        "Tangent constraint: {}",
+        if tangent_constraint { "on" } else { "off" }
+    )
+}
+
+/// Computes updated bezier handles for the shared vertex `v` between a chained line-tool
+/// segment and the previous committed line it starts from (#73). `prev_far` is the previous
+/// line's own far endpoint (its start); `prev_bezier_baseline` is that line's `bezier` value
+/// before any of this segment's live preview touched it; `b` is this segment's far endpoint
+/// (live mouse while drawing, or the actual commit point). Returns the previous line's
+/// updated `bezier` and this segment's own `bezier`.
+///
+/// When `curve_mode` is off, neither side is touched (the previous line's baseline is
+/// returned unchanged and this segment stays straight). When `curve_mode` is on and
+/// `tangent_constraint` is on, both sides are smoothed via [`smooth_joint_bezier`] — the
+/// previous line's far-from-`v` handle is preserved from its baseline (or freshly computed if
+/// it wasn't already curved) and only its near-`v` handle changes. When `tangent_constraint`
+/// is off, the previous line is left untouched and this segment gets independent "corner"
+/// handles instead of mirrored ones.
+pub(crate) fn chained_curve_handles(
+    prev_far: (f32, f32),
+    prev_bezier_baseline: Option<[(f32, f32); 2]>,
+    v: (f32, f32),
+    b: (f32, f32),
+    curve_mode: bool,
+    tangent_constraint: bool,
+) -> (Option<[(f32, f32); 2]>, Option<[(f32, f32); 2]>) {
+    if !curve_mode {
+        return (prev_bezier_baseline, None);
+    }
+    if tangent_constraint {
+        let ([h1_far, h1_near], [h2_near, h2_far]) = smooth_joint_bezier(prev_far, v, b);
+        let prev0 = prev_bezier_baseline.map(|bez| bez[0]).unwrap_or(h1_far);
+        (Some([prev0, h1_near]), Some([h2_near, h2_far]))
+    } else {
+        let near = independent_corner_handle(v, b);
+        let far = independent_corner_handle(b, v);
+        (prev_bezier_baseline, Some([near, far]))
+    }
+}
+
+/// Whether the two lines meeting at `point` currently have mirrored, tangent-continuous
+/// handles (within a small epsilon of what [`smooth_joint_bezier`] would produce) — used by
+/// the `T` shortcut on a selection to decide which way to toggle (#73).
+fn vertex_is_tangent_continuous(doc: &Document, sketch: SketchId, point: ConstraintPoint) -> bool {
+    let Some([(line1, end1), (line2, end2)]) =
+        vertex_drag::incident_two_lines(doc, sketch, point)
+    else {
+        return false;
+    };
+    let (Some(l1), Some(l2)) = (doc.lines.get(line1), doc.lines.get(line2)) else {
+        return false;
+    };
+    let (Some(b1), Some(b2)) = (l1.bezier, l2.bezier) else {
+        return false;
+    };
+    let (v, a) = match end1 {
+        LineEnd::Start => ((l1.x0, l1.y0), (l1.x1, l1.y1)),
+        LineEnd::End => ((l1.x1, l1.y1), (l1.x0, l1.y0)),
+    };
+    let b = match end2 {
+        LineEnd::Start => (l2.x1, l2.y1),
+        LineEnd::End => (l2.x0, l2.y0),
+    };
+    let ([_, h1_near], [h2_near, _]) = smooth_joint_bezier(a, v, b);
+    let actual_h1_near = match end1 {
+        LineEnd::Start => b1[0],
+        LineEnd::End => b1[1],
+    };
+    let actual_h2_near = match end2 {
+        LineEnd::Start => b2[0],
+        LineEnd::End => b2[1],
+    };
+    const EPS: f32 = 1e-2;
+    (actual_h1_near.0 - h1_near.0).abs() < EPS
+        && (actual_h1_near.1 - h1_near.1).abs() < EPS
+        && (actual_h2_near.0 - h2_near.0).abs() < EPS
+        && (actual_h2_near.1 - h2_near.1).abs() < EPS
 }
 
 fn draw_mode_status(tool: &str, construction: bool) -> String {
@@ -1344,6 +1532,7 @@ fn element_label(element: SceneElement) -> String {
         SceneElement::Point(_) => "Point".to_string(),
         SceneElement::Extrusion(i) => format!("Extrusion {i}"),
         SceneElement::Body(i) => format!("Body {i}"),
+        SceneElement::FaceEdge(_) => "Face edge".to_string(),
     }
 }
 
@@ -1389,13 +1578,15 @@ impl AppState {
             line_a,
             line_b,
             rotation_sign,
-        } = target
+        } = &target
         {
-            if crate::constraints::find_angle_constraint(&self.doc, line_a, line_b).is_none() {
+            if crate::constraints::find_angle_constraint(&self.doc, line_a.clone(), line_b.clone())
+                .is_none()
+            {
                 self.placing_angle_dimension = Some(PlacingAngleDimension {
-                    line_a,
-                    line_b,
-                    rotation_sign,
+                    line_a: line_a.clone(),
+                    line_b: line_b.clone(),
+                    rotation_sign: *rotation_sign,
                 });
                 self.status =
                     "Move the mouse to choose the angle, then click to place".to_string();
@@ -1408,19 +1599,21 @@ impl AppState {
 
     fn start_committed_dimension_edit(&mut self, target: DimensionTarget) {
         if self.sketch_session.is_none()
-            || require_dimension_target_editable(&self.document_health, &self.doc, target).is_err()
+            || require_dimension_target_editable(&self.document_health, &self.doc, target.clone())
+                .is_err()
         {
             return;
         }
-        let edit_target = if let Some(id) = find_dimension_constraint(&self.doc, target) {
+        let edit_target = if let Some(id) = find_dimension_constraint(&self.doc, target.clone()) {
             DimEditTarget::Constraint(id)
         } else {
-            DimEditTarget::New(target)
+            DimEditTarget::New(target.clone())
         };
-        let text = match edit_target {
-            DimEditTarget::Constraint(id) => committed_dim_expression(&self.doc, id)
-                .unwrap_or_else(|| default_dimension_expression(&self.doc, target)),
-            DimEditTarget::New(_) => default_dimension_expression(&self.doc, target),
+        let sketch = self.sketch_session.map(|s| s.sketch).unwrap_or_default();
+        let text = match &edit_target {
+            DimEditTarget::Constraint(id) => committed_dim_expression(&self.doc, *id)
+                .unwrap_or_else(|| default_dimension_expression(&self.doc, sketch, target.clone())),
+            DimEditTarget::New(_) => default_dimension_expression(&self.doc, sketch, target.clone()),
         };
         let kind_label = match target {
             DimensionTarget::Distance(_) => "length",
@@ -1460,6 +1653,32 @@ impl AppState {
                 .as_ref()
                 .map(|cl| cl.construction)
                 .unwrap_or(self.draw_construction),
+        )
+    }
+
+    /// Active or pending curve-mode (`B`) toggle while the line tool is selected (#73).
+    pub fn line_curve_mode(&self) -> Option<bool> {
+        if self.tool != Tool::Line {
+            return None;
+        }
+        Some(
+            self.creating_line
+                .as_ref()
+                .map(|cl| cl.curve_mode)
+                .unwrap_or(self.draw_curve_mode),
+        )
+    }
+
+    /// Active or pending tangent-constraint (`T`) toggle while the line tool is selected (#73).
+    pub fn line_tangent_constraint(&self) -> Option<bool> {
+        if self.tool != Tool::Line {
+            return None;
+        }
+        Some(
+            self.creating_line
+                .as_ref()
+                .map(|cl| cl.tangent_constraint)
+                .unwrap_or(self.draw_tangent_constraint),
         )
     }
 
@@ -1777,7 +1996,7 @@ impl AppState {
                     self.creating_rect = None;
                 }
                 if self.creating_line.is_some() && tool != Tool::Line {
-                    self.creating_line = None;
+                    self.discard_creating_line();
                 }
                 if self.creating_circle.is_some() && tool != Tool::Circle {
                     self.creating_circle = None;
@@ -1792,6 +2011,11 @@ impl AppState {
                     && !matches!(tool, Tool::Chamfer | Tool::Fillet)
                 {
                     self.creating_vertex_treatment = None;
+                }
+                if self.creating_edge_treatment.is_some()
+                    && !matches!(tool, Tool::Chamfer | Tool::Fillet)
+                {
+                    self.creating_edge_treatment = None;
                 }
                 // Extruding acts on the 3D model, not sketch geometry: leave sketch
                 // editing when the extrude tool is picked from inside a sketch.
@@ -1830,10 +2054,14 @@ impl AppState {
                     Tool::Extrude => {
                         "Extrude tool — click coplanar faces, then set a distance".to_string()
                     }
-                    Tool::Chamfer if self.sketch_session.is_some() => "Chamfer tool".to_string(),
-                    Tool::Chamfer => "Chamfer tool — open a sketch first".to_string(),
-                    Tool::Fillet if self.sketch_session.is_some() => "Fillet tool".to_string(),
-                    Tool::Fillet => "Fillet tool — open a sketch first".to_string(),
+                    Tool::Chamfer if self.sketch_session.is_some() => {
+                        "Chamfer tool — click a sketch vertex".to_string()
+                    }
+                    Tool::Chamfer => "Chamfer tool — click a body edge".to_string(),
+                    Tool::Fillet if self.sketch_session.is_some() => {
+                        "Fillet tool — click a sketch vertex".to_string()
+                    }
+                    Tool::Fillet => "Fillet tool — click a body edge".to_string(),
                 };
                 if tool == Tool::Dimension {
                     self.try_begin_dimension_from_selection();
@@ -1847,6 +2075,7 @@ impl AppState {
                 self.rect_opposite_snap = None;
                 self.circle_center_snap = None;
                 self.extension_anchors.clear();
+                self.normal_inference_anchor = None;
                 if self.editing_committed_dim.take().is_some()
                     || self.placing_angle_dimension.take().is_some()
                 {
@@ -1854,7 +2083,7 @@ impl AppState {
                 } else if self.creating_extrusion.take().is_some() {
                     self.status = "Cancelled extrusion".to_string();
                 } else if self.creating_rect.take().is_some()
-                    || self.creating_line.take().is_some()
+                    || self.discard_creating_line()
                     || self.creating_circle.take().is_some()
                     || self.creating_plane.take().is_some()
                     || self.creating_vertex_treatment.take().is_some()
@@ -1866,7 +2095,7 @@ impl AppState {
                         self.status = "Exited sketch".to_string();
                     } else {
                         self.creating_rect = None;
-                        self.creating_line = None;
+                        self.discard_creating_line();
                         self.creating_circle = None;
                         self.tool = Tool::Select;
                         self.status =
@@ -1997,7 +2226,12 @@ impl AppState {
                     }
                     let rect = self.doc.rects.last().unwrap();
                     let (w, h) = (rect.w, rect.h);
-                    self.status = format!("Added rectangle ({w:.1} × {h:.1} mm)");
+                    let unit = crate::model::effective_length_unit(&self.doc, session.sketch);
+                    self.status = format!(
+                        "Added rectangle ({} × {})",
+                        crate::value::format_length_display_in(w, unit),
+                        crate::value::format_length_display_in(h, unit)
+                    );
                     ActionResult::Ok
                 } else {
                     self.rect_origin_snap = None;
@@ -2082,9 +2316,28 @@ impl AppState {
                 let (u1, v1) = world_to_local(&frame, end);
                 let mut line = Line::from_local_endpoints(session.sketch, u0, v0, u1, v1);
                 line.construction = cl.construction;
-                // A click-drag-release gesture (rather than click-click) shapes a curve.
-                line.bezier = bezier_from_drag_path((u0, v0), (u1, v1), &cl.drag_path);
                 if line.length() > 0.5 {
+                    // #73: while curve-mode is on, retroactively smooth (or corner-ize) the
+                    // joint with the previous chained segment, and give this segment matching
+                    // handles. No-op (both stay as they were / `None`) when curve-mode is off.
+                    if let Some(prev_idx) = cl.chained_from {
+                        if let Some(prev_far) =
+                            self.doc.lines.get(prev_idx).map(|l| (l.x0, l.y0))
+                        {
+                            let (prev_bezier, line_bezier) = chained_curve_handles(
+                                prev_far,
+                                cl.chained_from_bezier,
+                                (u0, v0),
+                                (u1, v1),
+                                cl.curve_mode,
+                                cl.tangent_constraint,
+                            );
+                            if let Some(prev) = self.doc.lines.get_mut(prev_idx) {
+                                prev.bezier = prev_bezier;
+                            }
+                            line.bezier = line_bezier;
+                        }
+                    }
                     self.doc.lines.push(line);
                     self.doc.shape_order.push(ShapeKind::Line);
                     let line_index = self.doc.lines.len() - 1;
@@ -2131,6 +2384,10 @@ impl AppState {
                         );
                     }
                     let len = self.doc.lines.last().unwrap().length();
+                    let len_label = crate::value::format_length_display_in(
+                        len,
+                        crate::model::effective_length_unit(&self.doc, session.sketch),
+                    );
                     // Chain into the next segment: start a new line at this endpoint so polygons
                     // can be drawn with successive clicks. The new start snaps to the just-placed
                     // endpoint (coincident on commit), keeping the polyline connected. Skip this
@@ -2150,12 +2407,16 @@ impl AppState {
                             user_edited: false,
                             pending_focus: true,
                             construction: cl.construction,
-                            drag_path: Vec::new(),
+                            curve_mode: self.draw_curve_mode,
+                            tangent_constraint: self.draw_tangent_constraint,
+                            chained_from: Some(line_index),
+                            chained_from_bezier: self.doc.lines[line_index].bezier,
                         });
-                        self.status =
-                            format!("Added line ({:.1} mm) • click for next point • Esc to finish", len);
+                        self.status = format!(
+                            "Added line ({len_label}) • click for next point • Esc to finish"
+                        );
                     } else {
-                        self.status = format!("Added line ({:.1} mm)", len);
+                        self.status = format!("Added line ({len_label})");
                     }
                     ActionResult::Ok
                 } else {
@@ -2303,7 +2564,13 @@ impl AppState {
                         );
                     }
                     let diameter = self.doc.circles.last().unwrap().diameter();
-                    self.status = format!("Added circle (Ø{diameter:.1} mm)");
+                    self.status = format!(
+                        "Added circle ({})",
+                        crate::value::format_diameter_display_in(
+                            diameter,
+                            crate::model::effective_length_unit(&self.doc, session.sketch)
+                        )
+                    );
                     ActionResult::Ok
                 } else {
                     self.circle_center_snap = None;
@@ -2401,7 +2668,7 @@ impl AppState {
                         require_constraint_editable(&self.document_health, &self.doc, *id)
                     }
                     DimEditTarget::New(target) => {
-                        require_dimension_target_editable(&self.document_health, &self.doc, *target)
+                        require_dimension_target_editable(&self.document_health, &self.doc, target.clone())
                     }
                 };
                 if let Err(e) = frozen {
@@ -2523,7 +2790,11 @@ impl AppState {
                             self.construction_plane_edit_undo.push(previous_planes);
                             self.doc.shape_order.push(ShapeKind::ConstructionPlaneEdit);
                             self.status = format!(
-                                "Updated construction plane {index} ({live_offset:.1} mm from {})",
+                                "Updated construction plane {index} ({} from {})",
+                                crate::value::format_length_display_in(
+                                    live_offset,
+                                    self.doc.default_length_unit
+                                ),
                                 cp.reference.label()
                             );
                             ActionResult::Ok
@@ -2546,7 +2817,11 @@ impl AppState {
                         false,
                     );
                     self.status = format!(
-                        "Added construction plane ({live_offset:.1} mm from {})",
+                        "Added construction plane ({} from {})",
+                        crate::value::format_length_display_in(
+                            live_offset,
+                            self.doc.default_length_unit
+                        ),
                         cp.reference.label()
                     );
                     ActionResult::Ok
@@ -2801,12 +3076,12 @@ impl AppState {
                 let Some(sketch) = self.sketch_session.map(|s| s.sketch) else {
                     return ActionResult::Err("Not in sketch mode".to_string());
                 };
-                let element = vertex_drag::scene_element_for_point(point);
+                let element = vertex_drag::scene_element_for_point(point.clone());
                 if let Err(e) = require_element_editable(&self.document_health, element) {
                     self.status = e.clone();
                     return ActionResult::Err(e);
                 }
-                if !vertex_drag::can_drag_point(&self.doc, sketch, point) {
+                if !vertex_drag::can_drag_point(&self.doc, sketch, point.clone()) {
                     return ActionResult::Err("Vertex is fully constrained".to_string());
                 }
                 match vertex_drag::drag_point(&mut self.doc, sketch, point, u, v) {
@@ -2822,12 +3097,12 @@ impl AppState {
                 let Some(sketch) = self.sketch_session.map(|s| s.sketch) else {
                     return ActionResult::Err("Not in sketch mode".to_string());
                 };
-                let element = vertex_drag::scene_element_for_line(target);
+                let element = vertex_drag::scene_element_for_line(target.clone());
                 if let Err(e) = require_element_editable(&self.document_health, element) {
                     self.status = e.clone();
                     return ActionResult::Err(e);
                 }
-                if !vertex_drag::can_drag_line(&self.doc, sketch, target) {
+                if !vertex_drag::can_drag_line(&self.doc, sketch, target.clone()) {
                     return ActionResult::Err("Line is fully constrained".to_string());
                 }
                 match vertex_drag::begin_line_drag_session(
@@ -2850,7 +3125,7 @@ impl AppState {
                 let Some(session) = self.line_drag_session.clone() else {
                     return ActionResult::Err("No line drag in progress".to_string());
                 };
-                let element = vertex_drag::scene_element_for_line(session.target);
+                let element = vertex_drag::scene_element_for_line(session.target.clone());
                 if let Err(e) = require_element_editable(&self.document_health, element) {
                     self.status = e.clone();
                     return ActionResult::Err(e);
@@ -2881,16 +3156,15 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::ConvertVertexToBezier { point } => {
-                let Some(sketch) = crate::construction::point_sketch(&self.doc, point) else {
+                let Some(sketch) = crate::construction::point_sketch(&self.doc, point.clone()) else {
                     return ActionResult::Err("Vertex no longer exists".to_string());
                 };
-                let Some([(line1, end1), (line2, end2)]) =
-                    vertex_drag::incident_two_lines(&self.doc, sketch, point)
-                else {
+                let Some(corner) = vertex_drag::treatment_corner(&self.doc, sketch, point) else {
                     return ActionResult::Err(
                         "Vertex must join exactly two lines to become a curve".to_string(),
                     );
                 };
+                let vertex_drag::VertexTreatmentCorner { line1, end1, line2, end2, v, a, b } = corner;
                 for &li in &[line1, line2] {
                     if let Err(e) =
                         require_element_editable(&self.document_health, SceneElement::Line(li))
@@ -2899,20 +3173,6 @@ impl AppState {
                         return ActionResult::Err(e);
                     }
                 }
-                let Some(l1) = self.doc.lines.get(line1) else {
-                    return ActionResult::Err("Line no longer exists".to_string());
-                };
-                let (v, a) = match end1 {
-                    LineEnd::Start => ((l1.x0, l1.y0), (l1.x1, l1.y1)),
-                    LineEnd::End => ((l1.x1, l1.y1), (l1.x0, l1.y0)),
-                };
-                let Some(l2) = self.doc.lines.get(line2) else {
-                    return ActionResult::Err("Line no longer exists".to_string());
-                };
-                let b = match end2 {
-                    LineEnd::Start => (l2.x1, l2.y1),
-                    LineEnd::End => (l2.x0, l2.y0),
-                };
                 let ([h1_far, h1_near], [h2_near, h2_far]) =
                     crate::model::smooth_joint_bezier(a, v, b);
                 if let Some(l1) = self.doc.lines.get_mut(line1) {
@@ -2953,16 +3213,15 @@ impl AppState {
                     self.status = e.clone();
                     return ActionResult::Err(e);
                 }
-                let Some(sketch) = crate::construction::point_sketch(&self.doc, point) else {
+                let Some(sketch) = crate::construction::point_sketch(&self.doc, point.clone()) else {
                     return ActionResult::Err("Vertex no longer exists".to_string());
                 };
-                let Some([(line1, end1), (line2, end2)]) =
-                    vertex_drag::incident_two_lines(&self.doc, sketch, point)
-                else {
+                let Some(corner) = vertex_drag::treatment_corner(&self.doc, sketch, point) else {
                     return ActionResult::Err(
                         "Vertex must join exactly two lines to chamfer/fillet".to_string(),
                     );
                 };
+                let vertex_drag::VertexTreatmentCorner { line1, end1, line2, end2, v, a, b } = corner;
                 for &li in &[line1, line2] {
                     if let Err(e) =
                         require_element_editable(&self.document_health, SceneElement::Line(li))
@@ -2971,20 +3230,6 @@ impl AppState {
                         return ActionResult::Err(e);
                     }
                 }
-                let Some(l1) = self.doc.lines.get(line1) else {
-                    return ActionResult::Err("Line no longer exists".to_string());
-                };
-                let (v, a) = match end1 {
-                    LineEnd::Start => ((l1.x0, l1.y0), (l1.x1, l1.y1)),
-                    LineEnd::End => ((l1.x1, l1.y1), (l1.x0, l1.y0)),
-                };
-                let Some(l2) = self.doc.lines.get(line2) else {
-                    return ActionResult::Err("Line no longer exists".to_string());
-                };
-                let b = match end2 {
-                    LineEnd::Start => (l2.x1, l2.y1),
-                    LineEnd::End => (l2.x0, l2.y0),
-                };
                 let Some(geom) = vertex_treatment_geometry(v, a, b, kind, amount) else {
                     let e = "Cannot treat this vertex: corner is degenerate".to_string();
                     self.status = e.clone();
@@ -3014,10 +3259,10 @@ impl AppState {
                     !c.deleted
                         && c.sketch == sketch
                         && matches!(
-                            c.kind,
+                            &c.kind,
                             ConstraintKind::Coincident { a, b }
-                                if (a == ConstraintEntity::Point(p_a) && b == ConstraintEntity::Point(p_b))
-                                    || (a == ConstraintEntity::Point(p_b) && b == ConstraintEntity::Point(p_a))
+                                if (*a == ConstraintEntity::Point(p_a.clone()) && *b == ConstraintEntity::Point(p_b.clone()))
+                                    || (*a == ConstraintEntity::Point(p_b.clone()) && *b == ConstraintEntity::Point(p_a.clone()))
                         )
                 }) {
                     tombstone_elements(&mut self.doc, &[SceneElement::Constraint(idx)]);
@@ -3026,6 +3271,12 @@ impl AppState {
                 let mut bridge =
                     Line::from_local_endpoints(sketch, geom.p1.0, geom.p1.1, geom.p2.0, geom.p2.1);
                 bridge.bezier = geom.bezier;
+                // Nest the bridging line under the lower-index trimmed line in the Elements
+                // pane (#76): a chamfer/fillet corner is shared by two lines, so there's no
+                // single unambiguous "the" parent — `line1` (from `treatment_corner`'s
+                // `incident_two_lines`-derived ordering) is the deterministic, documented
+                // scope call. See `hierarchy::build_sketch_entry`.
+                bridge.chamfer_fillet_parent = Some(line1);
                 self.doc.lines.push(bridge);
                 self.doc.shape_order.push(ShapeKind::Line);
 
@@ -3033,6 +3284,61 @@ impl AppState {
                 self.status = match kind {
                     VertexTreatmentKind::Chamfer => "Added chamfer".to_string(),
                     VertexTreatmentKind::Fillet => "Added fillet".to_string(),
+                };
+                ActionResult::Ok
+            }
+            Action::CommitEdgeTreatment { extrusion, edge, kind, amount } => {
+                if !(amount > 0.0) {
+                    let e = "Amount must be positive".to_string();
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
+                if let Err(e) = require_element_editable(
+                    &self.document_health,
+                    SceneElement::Extrusion(extrusion),
+                ) {
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
+                if !crate::extrude::extrusion_edge_exists(&self.doc, extrusion, edge) {
+                    let e = "Edge no longer exists or isn't chamfer/fillet-able (only vertical \
+                        and side/cap edges of a Rect/Polygon-profiled extrusion are supported)"
+                        .to_string();
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
+                let n = self
+                    .doc
+                    .extrusions
+                    .get(extrusion)
+                    .and_then(|ext| ext.faces.get(edge.face()))
+                    .map(crate::extrude::side_face_count)
+                    .unwrap_or(0);
+                let existing = &self.doc.extrusions[extrusion].edge_treatments;
+                if crate::extrude::edge_treatment_conflicts(existing, edge, n) {
+                    let e = "Cannot treat this edge: it shares a corner with another treated \
+                        edge (blending 3+ bevels at a shared corner isn't supported)"
+                        .to_string();
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
+                if !crate::extrude::edge_treatment_would_bevel(&self.doc, extrusion, edge, kind, amount)
+                {
+                    let e = "Cannot treat this edge: corner is degenerate".to_string();
+                    self.status = e.clone();
+                    return ActionResult::Err(e);
+                }
+                let treatment = EdgeTreatment { edge, kind, amount };
+                let Some(updated) =
+                    crate::extrude::extrusion_with_edge_treatment(&self.doc, extrusion, treatment)
+                else {
+                    return ActionResult::Err("Extrusion no longer exists".to_string());
+                };
+                self.doc.extrusions[extrusion] = updated;
+                self.refresh_document_health();
+                self.status = match kind {
+                    VertexTreatmentKind::Chamfer => format!("Chamfered edge ({amount:.1} mm)"),
+                    VertexTreatmentKind::Fillet => format!("Filleted edge ({amount:.1} mm)"),
                 };
                 ActionResult::Ok
             }
@@ -3071,7 +3377,12 @@ impl AppState {
                     return ActionResult::Err(e);
                 }
                 self.refresh_document_health();
-                self.status = format!("Added rectangle ({width:.1} × {height:.1} mm)");
+                let unit = crate::model::effective_length_unit(&self.doc, session.sketch);
+                self.status = format!(
+                    "Added rectangle ({} × {})",
+                    crate::value::format_length_display_in(width, unit),
+                    crate::value::format_length_display_in(height, unit)
+                );
                 ActionResult::Ok
             }
             Action::CreateCircle { cx, cy, r } => {
@@ -3101,7 +3412,13 @@ impl AppState {
                     return ActionResult::Err(e);
                 }
                 self.refresh_document_health();
-                self.status = format!("Added circle (⌀{:.1} mm)", r * 2.0);
+                self.status = format!(
+                    "Added circle ({})",
+                    crate::value::format_diameter_display_in(
+                        r * 2.0,
+                        crate::model::effective_length_unit(&self.doc, session.sketch)
+                    )
+                );
                 ActionResult::Ok
             }
             Action::CreateLineSegment { x0, y0, x1, y1, bezier } => {
@@ -3130,7 +3447,13 @@ impl AppState {
                     return ActionResult::Err(e);
                 }
                 self.refresh_document_health();
-                self.status = format!("Added line ({length:.1} mm)");
+                self.status = format!(
+                    "Added line ({})",
+                    crate::value::format_length_display_in(
+                        length,
+                        crate::model::effective_length_unit(&self.doc, session.sketch)
+                    )
+                );
                 ActionResult::Ok
             }
             Action::CreateExtrusion {
@@ -3155,12 +3478,19 @@ impl AppState {
                     expression: String::new(),
                     name: None,
                     deleted: false,
+                    edge_treatments: Vec::new(),
                 });
                 self.doc.shape_order.push(ShapeKind::Extrusion);
                 let extrusion_index = self.doc.extrusions.len() - 1;
                 self.attach_new_extrusion_to_body(extrusion_index, body_mode);
                 self.refresh_document_health();
-                self.status = format!("Added extrusion ({distance:.1} mm)");
+                self.status = format!(
+                    "Added extrusion ({})",
+                    crate::value::format_length_display_in(
+                        distance,
+                        crate::model::effective_length_unit(&self.doc, sketch)
+                    )
+                );
                 ActionResult::Ok
             }
             Action::ToggleExtrudeFace { face } => {
@@ -3182,7 +3512,10 @@ impl AppState {
                             sketch,
                             faces: vec![face],
                             distance: DEFAULT_EXTRUDE_DISTANCE,
-                            text: crate::value::format_length_display(DEFAULT_EXTRUDE_DISTANCE),
+                            text: crate::value::format_length_display_in(
+                                DEFAULT_EXTRUDE_DISTANCE,
+                                crate::model::effective_length_unit(&self.doc, sketch),
+                            ),
                             user_edited: false,
                             pending_focus: true,
                             target: None,
@@ -3200,7 +3533,10 @@ impl AppState {
                 if let Some(ce) = &mut self.creating_extrusion {
                     ce.distance = distance;
                     if !ce.user_edited {
-                        ce.text = crate::value::format_length_display(distance.abs());
+                        ce.text = crate::value::format_length_display_in(
+                            distance.abs(),
+                            crate::model::effective_length_unit(&self.doc, ce.sketch),
+                        );
                     }
                 }
                 ActionResult::Ok
@@ -3247,7 +3583,10 @@ impl AppState {
                     sketch: extrusion.sketch,
                     faces: extrusion.faces.clone(),
                     distance: extrusion.distance,
-                    text: crate::value::format_length_display(extrusion.distance.abs()),
+                    text: crate::value::format_length_display_in(
+                        extrusion.distance.abs(),
+                        crate::model::effective_length_unit(&self.doc, extrusion.sketch),
+                    ),
                     user_edited: false,
                     pending_focus: true,
                     target: extrusion.target.clone(),
@@ -3279,8 +3618,15 @@ impl AppState {
                         extrusion.target = ce.target;
                     }
                     self.apply_extrude_body_mode(idx, ce.body_mode);
-                    self.status = format!("Updated extrusion ({distance:.1} mm)");
+                    self.status = format!(
+                        "Updated extrusion ({})",
+                        crate::value::format_length_display_in(
+                            distance,
+                            crate::model::effective_length_unit(&self.doc, ce.sketch)
+                        )
+                    );
                 } else {
+                    let unit = crate::model::effective_length_unit(&self.doc, ce.sketch);
                     self.doc.extrusions.push(Extrusion {
                         sketch: ce.sketch,
                         faces: ce.faces.clone(),
@@ -3289,11 +3635,15 @@ impl AppState {
                         expression: String::new(),
                         name: None,
                         deleted: false,
+                        edge_treatments: Vec::new(),
                     });
                     self.doc.shape_order.push(ShapeKind::Extrusion);
                     let ei = self.doc.extrusions.len() - 1;
                     self.attach_new_extrusion_to_body(ei, ce.body_mode);
-                    self.status = format!("Added extrusion ({distance:.1} mm)");
+                    self.status = format!(
+                        "Added extrusion ({})",
+                        crate::value::format_length_display_in(distance, unit)
+                    );
                 }
                 self.refresh_document_health();
                 ActionResult::Ok
@@ -3338,10 +3688,10 @@ impl AppState {
                 element,
                 construction,
             } => {
-                if let Err(e) = require_element_editable(&self.document_health, element) {
+                if let Err(e) = require_element_editable(&self.document_health, element.clone()) {
                     return ActionResult::Err(e);
                 }
-                match set_edge_construction(&mut self.doc, element, construction) {
+                match set_edge_construction(&mut self.doc, element.clone(), construction) {
                 Ok(()) => {
                     self.status = format!(
                         "{} {}",
@@ -3462,8 +3812,135 @@ impl AppState {
                     Err(e) => ActionResult::Err(e),
                 }
             }
+            Action::ApplyCurveMode { curve_mode } => {
+                if let Some(cl) = &mut self.creating_line {
+                    cl.curve_mode = curve_mode;
+                    self.draw_curve_mode = curve_mode;
+                    self.status = curve_mode_status(curve_mode);
+                    return ActionResult::Ok;
+                }
+                if self.tool == Tool::Line {
+                    self.draw_curve_mode = curve_mode;
+                    self.status = curve_mode_status(curve_mode);
+                    return ActionResult::Ok;
+                }
+                ActionResult::Err("Select the line tool to set curve mode".to_string())
+            }
+            Action::ToggleCurveMode => {
+                if let Some(cl) = &mut self.creating_line {
+                    cl.curve_mode = !cl.curve_mode;
+                    self.draw_curve_mode = cl.curve_mode;
+                    self.status = curve_mode_status(cl.curve_mode);
+                    return ActionResult::Ok;
+                }
+                if self.tool == Tool::Line {
+                    self.draw_curve_mode = !self.draw_curve_mode;
+                    self.status = curve_mode_status(self.draw_curve_mode);
+                    return ActionResult::Ok;
+                }
+                match self.toggle_curve_at_selected_vertices() {
+                    Ok(status) => {
+                        self.status = status;
+                        ActionResult::Ok
+                    }
+                    Err(e) => {
+                        self.status = e.clone();
+                        ActionResult::Err(e)
+                    }
+                }
+            }
+            Action::ApplyTangentConstraint { tangent_constraint } => {
+                if let Some(cl) = &mut self.creating_line {
+                    cl.tangent_constraint = tangent_constraint;
+                    self.draw_tangent_constraint = tangent_constraint;
+                    self.status = tangent_constraint_status(tangent_constraint);
+                    return ActionResult::Ok;
+                }
+                if self.tool == Tool::Line {
+                    self.draw_tangent_constraint = tangent_constraint;
+                    self.status = tangent_constraint_status(tangent_constraint);
+                    return ActionResult::Ok;
+                }
+                ActionResult::Err("Select the line tool to set the tangent constraint".to_string())
+            }
+            Action::ToggleTangentConstraint => {
+                if let Some(cl) = &mut self.creating_line {
+                    cl.tangent_constraint = !cl.tangent_constraint;
+                    self.draw_tangent_constraint = cl.tangent_constraint;
+                    self.status = tangent_constraint_status(cl.tangent_constraint);
+                    return ActionResult::Ok;
+                }
+                if self.tool == Tool::Line {
+                    self.draw_tangent_constraint = !self.draw_tangent_constraint;
+                    self.status = tangent_constraint_status(self.draw_tangent_constraint);
+                    return ActionResult::Ok;
+                }
+                match self.toggle_tangent_at_selected_vertices() {
+                    Ok(status) => {
+                        self.status = status;
+                        ActionResult::Ok
+                    }
+                    Err(e) => {
+                        self.status = e.clone();
+                        ActionResult::Err(e)
+                    }
+                }
+            }
+            Action::SetVertexTangent { point, continuous } => {
+                let Some(sketch) = crate::construction::point_sketch(&self.doc, point.clone()) else {
+                    return ActionResult::Err("Vertex no longer exists".to_string());
+                };
+                let Some([(line1, _), (line2, _)]) =
+                    vertex_drag::incident_two_lines(&self.doc, sketch, point.clone())
+                else {
+                    return ActionResult::Err(
+                        "Vertex must join exactly two lines to set tangency".to_string(),
+                    );
+                };
+                for &li in &[line1, line2] {
+                    if let Err(e) =
+                        require_element_editable(&self.document_health, SceneElement::Line(li))
+                    {
+                        self.status = e.clone();
+                        return ActionResult::Err(e);
+                    }
+                }
+                if continuous {
+                    return self.apply(Action::ConvertVertexToBezier { point });
+                }
+                let Some([(line1, end1), (line2, end2)]) =
+                    vertex_drag::incident_two_lines(&self.doc, sketch, point.clone())
+                else {
+                    return ActionResult::Err(
+                        "Vertex must join exactly two lines to set tangency".to_string(),
+                    );
+                };
+                for (line, end) in [(line1, end1), (line2, end2)] {
+                    let Some(l) = self.doc.lines.get(line) else { continue };
+                    let (v, far) = match end {
+                        LineEnd::Start => ((l.x0, l.y0), (l.x1, l.y1)),
+                        LineEnd::End => ((l.x1, l.y1), (l.x0, l.y0)),
+                    };
+                    let near_handle = independent_corner_handle(v, far);
+                    let far_handle = l
+                        .bezier
+                        .map(|b| match end {
+                            LineEnd::Start => b[1],
+                            LineEnd::End => b[0],
+                        })
+                        .unwrap_or_else(|| independent_corner_handle(far, v));
+                    if let Some(l) = self.doc.lines.get_mut(line) {
+                        l.bezier = Some(match end {
+                            LineEnd::Start => [near_handle, far_handle],
+                            LineEnd::End => [far_handle, near_handle],
+                        });
+                    }
+                }
+                self.status = "Made handles independent".to_string();
+                ActionResult::Ok
+            }
             Action::SetElementVisible { element, visible } => {
-                self.element_visibility.set_visible(element, visible);
+                self.element_visibility.set_visible(element.clone(), visible);
                 self.status = format!(
                     "{} {}",
                     element_label(element),
@@ -3472,7 +3949,7 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::ToggleElementVisibility(element) => {
-                let visible = self.element_visibility.toggle(element);
+                let visible = self.element_visibility.toggle(element.clone());
                 self.status = format!(
                     "{} {}",
                     element_label(element),
@@ -3481,13 +3958,13 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::CommitElementName { element, name } => {
-                if let Err(e) = require_element_editable(&self.document_health, element) {
+                if let Err(e) = require_element_editable(&self.document_health, element.clone()) {
                     self.status = e.clone();
                     return ActionResult::Err(e);
                 }
-                match set_element_name(&mut self.doc, element, name) {
+                match set_element_name(&mut self.doc, element.clone(), name) {
                     Ok(()) => {
-                        let label = element_name(&self.doc, element)
+                        let label = element_name(&self.doc, element.clone())
                             .map(str::to_string)
                             .unwrap_or_else(|| element_label(element));
                         self.status = format!("Renamed to {label}");
@@ -3541,7 +4018,7 @@ impl AppState {
                 };
                 self.panes.set(Pane::Context, true);
                 self.context_pane.focus_name_field = true;
-                self.context_pane.synced_element = Some(element);
+                self.context_pane.synced_element = Some(element.clone());
                 self.context_pane.name_draft =
                     element_name(&self.doc, element).unwrap_or_default().to_string();
                 self.status = "Rename element".to_string();
@@ -3576,13 +4053,129 @@ impl AppState {
     }
 
     /// Add the constraint implied by leaving a snapped point on its target (deduped).
+    /// Drops the in-progress line, reverting any live curve-mode preview it applied to the
+    /// previous chained segment's `bezier` field back to that segment's pre-preview baseline
+    /// (#73). Use this instead of a bare `self.creating_line = None` whenever a line draw is
+    /// abandoned without going through [`Action::CommitLine`] (which finalizes the mutation
+    /// with real values instead). Returns whether a line was in progress.
+    fn discard_creating_line(&mut self) -> bool {
+        let Some(cl) = self.creating_line.take() else {
+            return false;
+        };
+        if let Some(prev_idx) = cl.chained_from {
+            if let Some(prev) = self.doc.lines.get_mut(prev_idx) {
+                prev.bezier = cl.chained_from_bezier;
+            }
+        }
+        true
+    }
+
+    /// Distinct selected sketch vertices (deduped by coincident group) that are
+    /// `LineEndpoint`s — the set the retroactive `B`/`T` shortcuts operate on (#73).
+    fn selected_vertex_points(&self) -> Vec<ConstraintPoint> {
+        let mut seen: Vec<ConstraintPoint> = Vec::new();
+        let mut reps: Vec<ConstraintPoint> = Vec::new();
+        for element in self.scene_selection.iter() {
+            let SceneElement::Point(point) = element else {
+                continue;
+            };
+            if !matches!(point, ConstraintPoint::LineEndpoint { .. }) || seen.contains(&point) {
+                continue;
+            }
+            if let Some(sketch) = crate::construction::point_sketch(&self.doc, point.clone()) {
+                seen.extend(vertex_drag::coincident_group(&self.doc, sketch, point.clone()));
+            } else {
+                seen.push(point.clone());
+            }
+            reps.push(point);
+        }
+        reps
+    }
+
+    /// `B` shortcut on a Select-tool vertex selection (#73): straightens both incident lines
+    /// if either is already curved, else curves them smoothly (matching
+    /// [`Action::ConvertVertexToBezier`]). Vertices that don't join exactly two plain lines
+    /// are silently skipped.
+    fn toggle_curve_at_selected_vertices(&mut self) -> Result<String, String> {
+        let vertices = self.selected_vertex_points();
+        if vertices.is_empty() {
+            return Err("Select a sketch vertex to toggle its curve".to_string());
+        }
+        let mut toggled = 0usize;
+        for point in vertices {
+            let Some(sketch) = crate::construction::point_sketch(&self.doc, point.clone()) else {
+                continue;
+            };
+            let Some([(line1, _), (line2, _)]) =
+                vertex_drag::incident_two_lines(&self.doc, sketch, point.clone())
+            else {
+                continue;
+            };
+            let curved = self.doc.lines.get(line1).is_some_and(Line::is_curved)
+                || self.doc.lines.get(line2).is_some_and(Line::is_curved);
+            let ok = if curved {
+                let r1 = self.apply(Action::StraightenLine { line: line1 });
+                let r2 = self.apply(Action::StraightenLine { line: line2 });
+                matches!(r1, ActionResult::Ok) || matches!(r2, ActionResult::Ok)
+            } else {
+                matches!(
+                    self.apply(Action::ConvertVertexToBezier { point }),
+                    ActionResult::Ok
+                )
+            };
+            if ok {
+                toggled += 1;
+            }
+        }
+        if toggled == 0 {
+            Err("Selected vertex doesn't join exactly two lines".to_string())
+        } else {
+            Ok(format!("Toggled curve at {toggled} vertex(es)"))
+        }
+    }
+
+    /// `T` shortcut on a Select-tool vertex selection (#73): re-smooths (mirrors) each
+    /// selected vertex's handles if it isn't already tangent-continuous, else breaks the
+    /// mirroring into independent "corner" handles (see [`Action::SetVertexTangent`]).
+    /// Vertices that don't join exactly two plain lines are silently skipped.
+    fn toggle_tangent_at_selected_vertices(&mut self) -> Result<String, String> {
+        let vertices = self.selected_vertex_points();
+        if vertices.is_empty() {
+            return Err("Select a sketch vertex to toggle its tangent constraint".to_string());
+        }
+        let mut toggled = 0usize;
+        for point in vertices {
+            let Some(sketch) = crate::construction::point_sketch(&self.doc, point.clone()) else {
+                continue;
+            };
+            if vertex_drag::incident_two_lines(&self.doc, sketch, point.clone()).is_none() {
+                continue;
+            }
+            let continuous = !vertex_is_tangent_continuous(&self.doc, sketch, point.clone());
+            if matches!(
+                self.apply(Action::SetVertexTangent { point, continuous }),
+                ActionResult::Ok
+            ) {
+                toggled += 1;
+            }
+        }
+        if toggled == 0 {
+            Err("Selected vertex doesn't join exactly two lines".to_string())
+        } else {
+            Ok(format!("Toggled tangent constraint at {toggled} vertex(es)"))
+        }
+    }
+
     fn add_snap_constraint(
         &mut self,
         sketch: SketchId,
         point: ConstraintPoint,
         target: crate::snapping::SnapTarget,
     ) -> Result<(), String> {
-        if crate::snapping::snap_constraint_already_present(&self.doc, point, target) {
+        if let crate::snapping::SnapTarget::NormalAtMidpoint(anchor_line) = target.clone() {
+            return self.add_normal_at_midpoint_constraint(sketch, point, anchor_line);
+        }
+        if crate::snapping::snap_constraint_already_present(&self.doc, point.clone(), target.clone()) {
             return Ok(());
         }
         let kind = crate::snapping::snap_constraint_kind(point, target);
@@ -3604,13 +4197,91 @@ impl AppState {
         Ok(())
     }
 
+    /// Commit a [`crate::snapping::SnapTarget::NormalAtMidpoint`] snap (#41). There is no single
+    /// existing constraint that pins a point to "the infinite line normal to `anchor_line`
+    /// through its midpoint", so this invents a construction line to carry it: a fresh
+    /// (dashed, non-solid) [`Line`] running from `anchor_line`'s midpoint out toward `point`'s
+    /// placed location, pinned there with a `Midpoint` constraint, held perpendicular to
+    /// `anchor_line` with a `Perpendicular` constraint, and finally `point` is pinned onto that
+    /// new line's infinite carrier with a `Coincident` point-on-line constraint (mirroring how
+    /// `OnLine`/`OnLineExtension` pin a point to an existing line's carrier).
+    fn add_normal_at_midpoint_constraint(
+        &mut self,
+        sketch: SketchId,
+        point: ConstraintPoint,
+        anchor_line: ConstraintLine,
+    ) -> Result<(), String> {
+        let ((x0, y0), (x1, y1)) =
+            crate::geometric_constraints::line_uv_endpoints(&self.doc, sketch, anchor_line.clone())?;
+        let (mx, my) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let anchor_len = dx.hypot(dy);
+        let (ex, ey) = crate::geometric_constraints::point_uv(&self.doc, sketch, point.clone())
+            .ok()
+            .filter(|&(ex, ey)| (ex - mx).hypot(ey - my) > 1e-6)
+            .unwrap_or_else(|| {
+                // Degenerate: the placed point resolved exactly onto the midpoint. Fall back to
+                // a small nonzero length along the perpendicular so the line isn't zero-length.
+                let fallback_len = if anchor_len > 1e-6 { anchor_len } else { 1.0 };
+                let perp_len = anchor_len.max(1e-6);
+                (mx - dy / perp_len * fallback_len, my + dx / perp_len * fallback_len)
+            });
+        let mut line = Line::from_local_endpoints(sketch, mx, my, ex, ey);
+        line.construction = true;
+        self.doc.lines.push(line);
+        self.doc.shape_order.push(ShapeKind::Line);
+        let new_line_index = self.doc.lines.len() - 1;
+        let new_line = ConstraintLine::Line(new_line_index);
+
+        let push_constraint = |doc: &mut Document, kind: ConstraintKind| {
+            doc.constraints.push(crate::model::Constraint {
+                sketch,
+                kind,
+                expression: String::new(),
+                dim_offset: None,
+                name: None,
+                deleted: false,
+            });
+            doc.shape_order.push(ShapeKind::Constraint);
+        };
+        push_constraint(
+            &mut self.doc,
+            ConstraintKind::Midpoint {
+                point: ConstraintPoint::LineEndpoint {
+                    line: new_line_index,
+                    end: LineEnd::Start,
+                },
+                line: anchor_line.clone(),
+            },
+        );
+        push_constraint(
+            &mut self.doc,
+            ConstraintKind::Perpendicular {
+                line_a: new_line.clone(),
+                line_b: anchor_line,
+            },
+        );
+        push_constraint(
+            &mut self.doc,
+            ConstraintKind::Coincident {
+                a: ConstraintEntity::Point(point),
+                b: ConstraintEntity::Line(new_line),
+            },
+        );
+
+        crate::constraints::solve_document_constraints(&mut self.doc)?;
+        self.refresh_document_health();
+        Ok(())
+    }
+
     fn exit_sketch_session(&mut self) {
         self.active_snap = None;
         self.extension_anchors.clear();
+        self.normal_inference_anchor = None;
         self.sketch_session = None;
         self.sketch_reframe_pending = false;
         self.creating_rect = None;
-        self.creating_line = None;
+        self.discard_creating_line();
         self.editing_committed_dim = None;
         self.placing_angle_dimension = None;
         // Return to the pre-sketch camera pose; the transition restores world-orbit mode on
@@ -3716,7 +4387,7 @@ impl AppState {
         }
         self.sketch_session = Some(SketchSession { sketch });
         self.creating_rect = None;
-        self.creating_line = None;
+        self.discard_creating_line();
         if !self.tool.is_sketch_edit_tool() {
             self.tool = Tool::Select;
         }
@@ -4354,17 +5025,17 @@ mod tests {
             line: 0,
             end: LineEnd::End,
         };
-        let target = crate::snapping::SnapTarget::Vertex(anchor);
+        let target = crate::snapping::SnapTarget::Vertex(anchor.clone());
 
         let before = state.doc.constraints.len();
         state.apply(Action::ApplySnapConstraint {
-            point: moved,
-            target,
+            point: moved.clone(),
+            target: target.clone(),
         });
         assert_eq!(state.doc.constraints.len(), before + 1);
 
-        let a = crate::geometric_constraints::point_uv(&state.doc, anchor).unwrap();
-        let m = crate::geometric_constraints::point_uv(&state.doc, moved).unwrap();
+        let a = crate::geometric_constraints::point_uv(&state.doc, sketch, anchor.clone()).unwrap();
+        let m = crate::geometric_constraints::point_uv(&state.doc, sketch, moved.clone()).unwrap();
         assert!(
             (a.0 - m.0).abs() < 1e-2 && (a.1 - m.1).abs() < 1e-2,
             "snapped endpoints should coincide: {a:?} vs {m:?}"
@@ -4379,6 +5050,70 @@ mod tests {
     }
 
     #[test]
+    fn apply_normal_at_midpoint_snap_invents_construction_line_and_constraints() {
+        // #41: touching a line's midpoint, moving away, then leaving a point on the guide
+        // perpendicular to it should invent a construction line + Midpoint/Perpendicular/
+        // Coincident constraints, rather than requiring a new constraint primitive.
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state
+            .doc
+            .lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        // A second line whose endpoint is the point being placed, positioned on the
+        // perpendicular through the anchor's midpoint (5, 0) — i.e. u=5.
+        state
+            .doc
+            .lines
+            .push(Line::from_local_endpoints(sketch, 5.0, 4.0, 20.0, 4.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        state.refresh_document_health();
+
+        let anchor = ConstraintLine::Line(0);
+        let point = ConstraintPoint::LineEndpoint {
+            line: 1,
+            end: LineEnd::Start,
+        };
+        let target = crate::snapping::SnapTarget::NormalAtMidpoint(anchor.clone());
+
+        let lines_before = state.doc.lines.len();
+        let constraints_before = state.doc.constraints.len();
+        let result = state.apply(Action::ApplySnapConstraint { point: point.clone(), target });
+        assert_eq!(result, ActionResult::Ok);
+
+        // A new construction line was invented.
+        assert_eq!(state.doc.lines.len(), lines_before + 1);
+        let new_line_index = state.doc.lines.len() - 1;
+        assert!(state.doc.lines[new_line_index].construction);
+
+        // Three new constraints were added: Midpoint, Perpendicular, and a point-on-line
+        // Coincident pinning the placed point to the new line's carrier.
+        assert_eq!(state.doc.constraints.len(), constraints_before + 3);
+        let new_line = ConstraintLine::Line(new_line_index);
+        let kinds: Vec<_> = state.doc.constraints[constraints_before..]
+            .iter()
+            .map(|c| c.kind.clone())
+            .collect();
+        assert!(kinds.iter().any(|k| matches!(
+            k,
+            ConstraintKind::Midpoint { line, .. } if *line == anchor
+        )));
+        assert!(kinds.iter().any(|k| matches!(
+            k,
+            ConstraintKind::Perpendicular { line_a, line_b }
+                if *line_a == new_line && *line_b == anchor
+        )));
+        assert!(kinds.iter().any(|k| matches!(
+            k,
+            ConstraintKind::Coincident {
+                a: ConstraintEntity::Point(p),
+                b: ConstraintEntity::Line(l),
+            } if *p == point && *l == new_line
+        )));
+    }
+
+    #[test]
     fn set_snapping_toggles_flag() {
         let mut state = AppState::default();
         assert!(state.snapping_enabled);
@@ -4386,6 +5121,57 @@ mod tests {
         assert!(!state.snapping_enabled);
         state.apply(Action::SetSnapping(true));
         assert!(state.snapping_enabled);
+    }
+
+    #[test]
+    fn set_document_units_updates_defaults() {
+        let mut state = AppState::default();
+        assert_eq!(state.doc.default_length_unit, LengthUnit::Mm);
+        assert_eq!(state.doc.default_angle_unit, AngleUnit::Deg);
+        let result = state.apply(Action::SetDocumentUnits {
+            length: LengthUnit::In,
+            angle: AngleUnit::Rad,
+        });
+        assert_eq!(result, ActionResult::Ok);
+        assert_eq!(state.doc.default_length_unit, LengthUnit::In);
+        assert_eq!(state.doc.default_angle_unit, AngleUnit::Rad);
+    }
+
+    #[test]
+    fn set_sketch_units_overrides_and_clears() {
+        let mut state = AppState::default();
+        let sketch = state.doc.add_sketch(FaceId::ConstructionPlane(0));
+        let result = state.apply(Action::SetSketchUnits {
+            sketch,
+            length: Some(LengthUnit::Cm),
+            angle: Some(AngleUnit::Rad),
+        });
+        assert_eq!(result, ActionResult::Ok);
+        assert_eq!(state.doc.sketches[sketch].length_unit, Some(LengthUnit::Cm));
+        assert_eq!(state.doc.sketches[sketch].angle_unit, Some(AngleUnit::Rad));
+
+        // `None` clears the override back to inheriting the document default.
+        state.apply(Action::SetSketchUnits {
+            sketch,
+            length: None,
+            angle: None,
+        });
+        assert_eq!(state.doc.sketches[sketch].length_unit, None);
+        assert_eq!(state.doc.sketches[sketch].angle_unit, None);
+    }
+
+    #[test]
+    fn set_sketch_units_errors_for_missing_sketch() {
+        let mut state = AppState::default();
+        let result = state.apply(Action::SetSketchUnits {
+            sketch: 42,
+            length: Some(LengthUnit::Mm),
+            angle: None,
+        });
+        assert_eq!(
+            result,
+            ActionResult::Err("Sketch 42 not found".to_string())
+        );
     }
 
     #[test]
@@ -4711,7 +5497,10 @@ mod tests {
             user_edited: false,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
         state.apply(Action::CommitLine);
         state.creating_circle = Some(CreatingCircle {
@@ -5167,7 +5956,10 @@ mod tests {
             user_edited: true,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
         state.apply(Action::CommitLine);
         assert_eq!(state.doc.lines.len(), 1);
@@ -5178,7 +5970,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_line_with_a_meaningful_drag_path_creates_a_curve() {
+    fn commit_line_without_curve_mode_stays_straight() {
         let mut state = AppState::default();
         begin_default_sketch(&mut state);
         state.creating_line = Some(CreatingLine {
@@ -5188,17 +5980,22 @@ mod tests {
             user_edited: false,
             pending_focus: false,
             construction: false,
-            drag_path: vec![(0.0, 0.0), (5.0, 3.0), (10.0, 0.0)],
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
         state.apply(Action::CommitLine);
         assert_eq!(state.doc.lines.len(), 1);
-        assert!(state.doc.lines[0].is_curved());
+        assert!(!state.doc.lines[0].is_curved());
     }
 
     #[test]
-    fn commit_line_without_a_meaningful_drag_stays_straight() {
+    fn commit_line_curve_mode_smooths_the_shared_vertex_with_the_previous_segment() {
         let mut state = AppState::default();
         begin_default_sketch(&mut state);
+        state.tool = Tool::Line;
+        state.draw_curve_mode = true;
         state.creating_line = Some(CreatingLine {
             origin: Vec3::ZERO,
             text: String::new(),
@@ -5206,10 +6003,87 @@ mod tests {
             user_edited: false,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: true,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
         state.apply(Action::CommitLine);
         assert_eq!(state.doc.lines.len(), 1);
+        // The first segment of a fresh chain has nothing to smooth against yet.
+        assert!(!state.doc.lines[0].is_curved());
+        // Chaining should have carried curve-mode into the new segment.
+        let cl = state
+            .creating_line
+            .as_ref()
+            .expect("should chain into a new segment");
+        assert!(cl.curve_mode);
+        assert_eq!(cl.chained_from, Some(0));
+
+        state.creating_line.as_mut().unwrap().last_mouse = Vec3::new(20.0, 5.0, 0.0);
+        state.apply(Action::CommitLine);
+        assert_eq!(state.doc.lines.len(), 2);
+        // The shared vertex (10,0) is now smoothed retroactively on both sides.
+        assert!(state.doc.lines[0].is_curved());
+        assert!(state.doc.lines[1].is_curved());
+        let h0_far = state.doc.lines[0].bezier.unwrap()[0];
+        // Line 0 runs along +x from (0,0) to (10,0): its far (from-vertex) handle sits a third
+        // of the way along that chord, independent of where the next point ended up.
+        assert!((h0_far.0 - 10.0 / 3.0).abs() < 1e-3);
+        assert!(h0_far.1.abs() < 1e-3);
+    }
+
+    #[test]
+    fn commit_line_curve_mode_without_tangent_constraint_gives_independent_handles() {
+        let mut state = AppState::default();
+        begin_default_sketch(&mut state);
+        state.tool = Tool::Line;
+        state.draw_curve_mode = true;
+        state.draw_tangent_constraint = false;
+        state.creating_line = Some(CreatingLine {
+            origin: Vec3::ZERO,
+            text: String::new(),
+            last_mouse: Vec3::new(10.0, 0.0, 0.0),
+            user_edited: false,
+            pending_focus: false,
+            construction: false,
+            curve_mode: true,
+            tangent_constraint: false,
+            chained_from: None,
+            chained_from_bezier: None,
+        });
+        state.apply(Action::CommitLine);
+        state.creating_line.as_mut().unwrap().last_mouse = Vec3::new(20.0, 5.0, 0.0);
+        state.apply(Action::CommitLine);
+        // The previous segment is left completely untouched (tangent constraint is off).
+        assert!(!state.doc.lines[0].is_curved());
+        // But the new segment still gets its own independent "corner" handles.
+        assert!(state.doc.lines[1].is_curved());
+    }
+
+    #[test]
+    fn cancel_operation_reverts_the_previous_lines_live_curve_preview() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        state.doc.shape_order.push(ShapeKind::Line);
+        // Simulate a live curve-mode preview frame having bent the previous line's end handle.
+        state.doc.lines[0].bezier = Some([(3.0, 0.0), (9.0, 2.0)]);
+        state.creating_line = Some(CreatingLine {
+            origin: Vec3::new(10.0, 0.0, 0.0),
+            text: String::new(),
+            last_mouse: Vec3::new(20.0, 5.0, 0.0),
+            user_edited: false,
+            pending_focus: false,
+            construction: false,
+            curve_mode: true,
+            tangent_constraint: true,
+            chained_from: Some(0),
+            chained_from_bezier: None,
+        });
+        state.apply(Action::CancelOperation);
+        assert!(state.creating_line.is_none());
+        // Reverted to the pre-preview baseline (straight, since `chained_from_bezier` was `None`).
         assert!(!state.doc.lines[0].is_curved());
     }
 
@@ -5330,6 +6204,124 @@ mod tests {
     }
 
     #[test]
+    fn set_vertex_tangent_continuous_smooths_both_lines() {
+        let mut state = AppState::default();
+        let (_, point) = two_coincident_lines_at_a_right_angle(&mut state);
+        let result = state.apply(Action::SetVertexTangent { point, continuous: true });
+        assert!(matches!(result, ActionResult::Ok), "{result:?}");
+        assert!(state.doc.lines[0].is_curved());
+        assert!(state.doc.lines[1].is_curved());
+    }
+
+    #[test]
+    fn set_vertex_tangent_independent_gives_each_line_its_own_corner_handle() {
+        let mut state = AppState::default();
+        let (_, point) = two_coincident_lines_at_a_right_angle(&mut state);
+        let result = state.apply(Action::SetVertexTangent { point, continuous: false });
+        assert!(matches!(result, ActionResult::Ok), "{result:?}");
+        assert!(state.doc.lines[0].is_curved());
+        assert!(state.doc.lines[1].is_curved());
+        let h0_near = state.doc.lines[0].bezier.unwrap()[1];
+        let h1_near = state.doc.lines[1].bezier.unwrap()[0];
+        // Line 0 runs along +x from (0,0) to (10,0): its near-vertex handle sits a third of the
+        // way back from (10,0) toward (0,0), independent of line 1's own direction.
+        assert!((h0_near.0 - (10.0 - 10.0 / 3.0)).abs() < 1e-3);
+        assert!(h0_near.1.abs() < 1e-3);
+        // Line 1 runs along +y from (10,0) to (10,10): its near-vertex handle sits a third of
+        // the way toward (10,10).
+        assert!((h1_near.0 - 10.0).abs() < 1e-3);
+        assert!((h1_near.1 - 10.0 / 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn set_vertex_tangent_rejects_a_vertex_with_only_one_line() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let point = ConstraintPoint::LineEndpoint { line: 0, end: LineEnd::Start };
+        let result = state.apply(Action::SetVertexTangent { point, continuous: true });
+        assert!(matches!(result, ActionResult::Err(_)));
+    }
+
+    #[test]
+    fn toggle_curve_mode_on_selected_vertex_curves_then_straightens() {
+        let mut state = AppState::default();
+        let (_, point) = two_coincident_lines_at_a_right_angle(&mut state);
+        crate::selection::click_scene_selection(
+            &mut state.scene_selection,
+            SceneElement::Point(point),
+            false,
+        );
+        assert!(matches!(state.apply(Action::ToggleCurveMode), ActionResult::Ok));
+        assert!(state.doc.lines[0].is_curved());
+        assert!(state.doc.lines[1].is_curved());
+        assert!(matches!(state.apply(Action::ToggleCurveMode), ActionResult::Ok));
+        assert!(!state.doc.lines[0].is_curved());
+        assert!(!state.doc.lines[1].is_curved());
+    }
+
+    #[test]
+    fn toggle_tangent_constraint_on_selected_vertex_curves_then_breaks_mirroring() {
+        let mut state = AppState::default();
+        let (_, point) = two_coincident_lines_at_a_right_angle(&mut state);
+        crate::selection::click_scene_selection(
+            &mut state.scene_selection,
+            SceneElement::Point(point),
+            false,
+        );
+        // Starts straight (no bezier at all), so `T` first makes it tangent-continuous.
+        assert!(matches!(state.apply(Action::ToggleTangentConstraint), ActionResult::Ok));
+        let h0 = state.doc.lines[0].bezier.expect("should be curved now");
+        // Toggling again should break the mirroring into independent corner handles.
+        assert!(matches!(state.apply(Action::ToggleTangentConstraint), ActionResult::Ok));
+        let h0_after = state.doc.lines[0].bezier.expect("should still be curved");
+        assert_ne!(h0, h0_after);
+    }
+
+    #[test]
+    fn toggle_curve_mode_while_drawing_a_line_flips_creating_line_and_persists() {
+        let mut state = AppState::default();
+        begin_default_sketch(&mut state);
+        state.tool = Tool::Line;
+        state.creating_line = Some(CreatingLine {
+            origin: Vec3::ZERO,
+            text: String::new(),
+            last_mouse: Vec3::new(10.0, 0.0, 0.0),
+            user_edited: false,
+            pending_focus: false,
+            construction: false,
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
+        });
+        assert!(!state.draw_curve_mode);
+        assert!(matches!(state.apply(Action::ToggleCurveMode), ActionResult::Ok));
+        assert!(state.creating_line.as_ref().unwrap().curve_mode);
+        assert!(state.draw_curve_mode);
+    }
+
+    #[test]
+    fn toggle_curve_mode_persists_for_the_line_tool_when_not_drawing() {
+        let mut state = AppState::default();
+        state.tool = Tool::Line;
+        assert!(!state.draw_curve_mode);
+        assert!(matches!(state.apply(Action::ToggleCurveMode), ActionResult::Ok));
+        assert!(state.draw_curve_mode);
+        assert_eq!(state.line_curve_mode(), Some(true));
+    }
+
+    #[test]
+    fn toggle_tangent_constraint_persists_for_the_line_tool_when_not_drawing() {
+        let mut state = AppState::default();
+        state.tool = Tool::Line;
+        assert!(state.draw_tangent_constraint);
+        assert!(matches!(state.apply(Action::ToggleTangentConstraint), ActionResult::Ok));
+        assert!(!state.draw_tangent_constraint);
+        assert_eq!(state.line_tangent_constraint(), Some(false));
+    }
+
+    #[test]
     fn commit_vertex_treatment_chamfer_truncates_and_bridges_with_a_straight_line() {
         let mut state = AppState::default();
         let (_, point) = two_coincident_lines_at_a_right_angle(&mut state);
@@ -5349,6 +6341,8 @@ mod tests {
         assert_eq!(state.doc.lines.len(), 3);
         assert!(!state.doc.lines[2].is_curved());
         assert_eq!(state.doc.shape_order.last(), Some(&ShapeKind::Line));
+        // Nests under line 0 (the lower-index trimmed line, #76).
+        assert_eq!(state.doc.lines[2].chamfer_fillet_parent, Some(0));
     }
 
     #[test]
@@ -5466,6 +6460,225 @@ mod tests {
         assert_eq!(state.doc.lines.len(), 2);
     }
 
+    /// A 10x10x5 box (single `Rect` extrusion + its body) for #77 edge-treatment tests.
+    fn box_extrusion_state() -> AppState {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state
+            .doc
+            .rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
+        state.doc.shape_order.push(ShapeKind::Rect);
+        state.apply(Action::CreateExtrusion {
+            sketch,
+            faces: vec![ExtrudeFace::Rect(0)],
+            distance: 5.0,
+            merge_into_body: false,
+        });
+        state
+    }
+
+    #[test]
+    fn commit_edge_treatment_chamfers_a_vertical_edge() {
+        let mut state = box_extrusion_state();
+        let edge = crate::model::ExtrusionEdgeRef::Vertical { face: 0, edge: 0 };
+        let untreated_tris = crate::extrude::extrusion_mesh(&state.doc, &state.doc.extrusions[0])
+            .unwrap()
+            .triangles
+            .len();
+        let result = state.apply(Action::CommitEdgeTreatment {
+            extrusion: 0,
+            edge,
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 2.0,
+        });
+        assert!(matches!(result, ActionResult::Ok), "{result:?}");
+        assert_eq!(state.doc.extrusions[0].edge_treatments.len(), 1);
+        assert_eq!(state.doc.extrusions[0].edge_treatments[0].edge, edge);
+        let treated_tris = crate::extrude::extrusion_mesh(&state.doc, &state.doc.extrusions[0])
+            .unwrap()
+            .triangles
+            .len();
+        assert_ne!(untreated_tris, treated_tris, "mesh should visibly change");
+    }
+
+    #[test]
+    fn commit_edge_treatment_fillets_a_cap_edge() {
+        let mut state = box_extrusion_state();
+        let edge = crate::model::ExtrusionEdgeRef::Cap { face: 0, edge: 1, top: true };
+        let result = state.apply(Action::CommitEdgeTreatment {
+            extrusion: 0,
+            edge,
+            kind: VertexTreatmentKind::Fillet,
+            amount: 1.5,
+        });
+        assert!(matches!(result, ActionResult::Ok), "{result:?}");
+        assert_eq!(state.doc.extrusions[0].edge_treatments[0].kind, VertexTreatmentKind::Fillet);
+    }
+
+    #[test]
+    fn commit_edge_treatment_re_editing_the_same_edge_replaces_rather_than_stacks() {
+        let mut state = box_extrusion_state();
+        let edge = crate::model::ExtrusionEdgeRef::Vertical { face: 0, edge: 0 };
+        state.apply(Action::CommitEdgeTreatment {
+            extrusion: 0,
+            edge,
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 1.0,
+        });
+        state.apply(Action::CommitEdgeTreatment {
+            extrusion: 0,
+            edge,
+            kind: VertexTreatmentKind::Fillet,
+            amount: 2.5,
+        });
+        assert_eq!(state.doc.extrusions[0].edge_treatments.len(), 1);
+        assert_eq!(state.doc.extrusions[0].edge_treatments[0].kind, VertexTreatmentKind::Fillet);
+        assert_eq!(state.doc.extrusions[0].edge_treatments[0].amount, 2.5);
+    }
+
+    #[test]
+    fn commit_edge_treatment_rejects_a_conflicting_shared_vertex() {
+        let mut state = box_extrusion_state();
+        state.apply(Action::CommitEdgeTreatment {
+            extrusion: 0,
+            edge: crate::model::ExtrusionEdgeRef::Vertical { face: 0, edge: 0 },
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 2.0,
+        });
+        // Cap edge 0 (base) touches profile vertices 0 and 1, sharing vertex 1 with the
+        // vertical edge already treated above — a vertex miter, out of scope (SPEC §3.4).
+        let result = state.apply(Action::CommitEdgeTreatment {
+            extrusion: 0,
+            edge: crate::model::ExtrusionEdgeRef::Cap { face: 0, edge: 0, top: false },
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 2.0,
+        });
+        assert!(matches!(result, ActionResult::Err(_)));
+        assert_eq!(state.doc.extrusions[0].edge_treatments.len(), 1);
+    }
+
+    #[test]
+    fn commit_edge_treatment_rejects_nonpositive_amount_and_out_of_range_edge() {
+        let mut state = box_extrusion_state();
+        let bad_amount = state.apply(Action::CommitEdgeTreatment {
+            extrusion: 0,
+            edge: crate::model::ExtrusionEdgeRef::Vertical { face: 0, edge: 0 },
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 0.0,
+        });
+        assert!(matches!(bad_amount, ActionResult::Err(_)));
+
+        let out_of_range = state.apply(Action::CommitEdgeTreatment {
+            extrusion: 0,
+            edge: crate::model::ExtrusionEdgeRef::Vertical { face: 0, edge: 99 },
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 2.0,
+        });
+        assert!(matches!(out_of_range, ActionResult::Err(_)));
+        assert!(state.doc.extrusions[0].edge_treatments.is_empty());
+    }
+
+    #[test]
+    fn commit_edge_treatment_rejects_a_circle_profile_edge() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state
+            .doc
+            .circles
+            .push(crate::model::Circle::from_local_center_radius(sketch, 0.0, 0.0, 5.0, 0.0));
+        state.doc.shape_order.push(ShapeKind::Circle);
+        state.apply(Action::CreateExtrusion {
+            sketch,
+            faces: vec![ExtrudeFace::Circle(0)],
+            distance: 6.0,
+            merge_into_body: false,
+        });
+        let result = state.apply(Action::CommitEdgeTreatment {
+            extrusion: 0,
+            edge: crate::model::ExtrusionEdgeRef::Vertical { face: 0, edge: 0 },
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 1.0,
+        });
+        assert!(matches!(result, ActionResult::Err(_)));
+    }
+
+    /// Signed volume of a closed mesh via the divergence theorem (mirrors #77's
+    /// `mesh_signed_volume` in src/extrude.rs) — an independent check that the committed
+    /// extrusion's geometry matches the expected intersection-region volume.
+    fn mesh_signed_volume(mesh: &crate::extrude::SolidMesh) -> f32 {
+        mesh.triangles.iter().map(|[a, b, c]| a.dot(b.cross(*c)) / 6.0).sum()
+    }
+
+    /// End-to-end test for #16/#62: an overlapping rect+circle sketch, resolving a click
+    /// inside their intersection to `ExtrudeFace::Boolean { Intersection, .. }` via the same
+    /// `extrude::overlapping_partner`/`resolve_boolean_click` pair `pick_extrude_face` (main.rs)
+    /// uses, toggling it through the normal `Action::ToggleExtrudeFace` path, committing the
+    /// extrusion, and checking the resulting mesh's volume against the independently-computed
+    /// intersection area × height (divergence-theorem check, mirroring #77's tests).
+    #[test]
+    fn boolean_intersection_face_toggles_and_extrudes_with_sane_volume() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        // Rect covers the right half-plane (and then some); circle radius 5 at the origin.
+        // Their intersection is a right half-disk, area = pi*r^2/2.
+        state
+            .doc
+            .rects
+            .push(Rect::from_local_corners(sketch, 0.0, -20.0, 20.0, 20.0));
+        state.doc.shape_order.push(ShapeKind::Rect);
+        state.doc.circles.push(crate::model::Circle::from_local_center_radius(
+            sketch, 0.0, 0.0, 5.0, 0.0,
+        ));
+        state.doc.shape_order.push(ShapeKind::Circle);
+        state.refresh_document_health();
+
+        let rect_face = ExtrudeFace::Rect(0);
+        let circle_face = ExtrudeFace::Circle(0);
+        let partner = crate::extrude::overlapping_partner(&state.doc, sketch, &rect_face);
+        assert_eq!(partner, Some(circle_face.clone()), "rect/circle should be the unique overlapping pair");
+
+        // A click at (2, 0) lands inside both loops (the rect covers x >= 0, and the point is
+        // well within the radius-5 circle) — so it should resolve to their Intersection.
+        let resolved = crate::extrude::resolve_boolean_click(
+            &state.doc,
+            sketch,
+            &rect_face,
+            &circle_face,
+            (2.0, 0.0),
+        );
+        let expected_face = ExtrudeFace::Boolean {
+            op: crate::model::BooleanOp::Intersection,
+            a: Box::new(rect_face.clone()),
+            b: Box::new(circle_face.clone()),
+        };
+        assert_eq!(resolved, Some(expected_face.clone()));
+
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace { face: resolved.unwrap() });
+        assert_eq!(
+            state.creating_extrusion.as_ref().unwrap().faces,
+            vec![expected_face]
+        );
+        state.apply(Action::SetExtrudeDistance { distance: 4.0 });
+        state.apply(Action::CommitExtrusion);
+
+        assert_eq!(state.doc.extrusions.len(), 1);
+        assert_eq!(state.doc.bodies.len(), 1);
+        let mesh = crate::extrude::body_solid_mesh(&state.doc, 0).expect("mesh");
+        assert!(!mesh.triangles.is_empty());
+
+        let expected_area = std::f32::consts::PI * 25.0 / 2.0;
+        let expected_volume = expected_area * 4.0;
+        let volume = mesh_signed_volume(&mesh).abs();
+        // The circle itself is only a 48-gon approximation (see `CIRCLE_SEGMENTS`), so allow a
+        // couple percent slack.
+        assert!(
+            (volume - expected_volume).abs() < expected_volume * 0.02,
+            "volume {volume} !~= {expected_volume}"
+        );
+    }
+
     #[test]
     fn line_tool_chains_into_next_segment() {
         let mut state = AppState::default();
@@ -5478,7 +6691,10 @@ mod tests {
             user_edited: true,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
         state.apply(Action::CommitLine);
 
@@ -5532,7 +6748,10 @@ mod tests {
             user_edited: true,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
         // The end latched onto the existing vertex at (10, 0).
         state.line_end_snap = Some(crate::snapping::SnapTarget::Vertex(
@@ -5701,7 +6920,7 @@ mod tests {
             rotation_sign: 1,
         };
         state.placing_angle_dimension = None;
-        state.apply(Action::BeginDimensionEdit { target });
+        state.apply(Action::BeginDimensionEdit { target: target.clone() });
         assert_eq!(
             state.editing_committed_dim.as_ref().unwrap().target,
             DimEditTarget::New(target)
@@ -5754,7 +6973,10 @@ mod tests {
             user_edited: true,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         };
         let frame = xy_frame();
         let doc = Document::default();
@@ -5793,7 +7015,10 @@ mod tests {
             user_edited: true,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         };
         let frame = xy_frame();
         let doc = Document::default();
@@ -5813,7 +7038,10 @@ mod tests {
             user_edited: true,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         };
         let frame = xy_frame();
         let doc = Document::default();
@@ -6683,7 +7911,10 @@ mod tests {
             user_edited: true,
             pending_focus: false,
             construction: true,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
         state.apply(Action::CommitLine);
         assert!(state.doc.lines[0].construction);
@@ -6726,7 +7957,10 @@ mod tests {
             user_edited: false,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
         state.apply(Action::FocusLineLength);
         assert!(state.creating_line.as_ref().unwrap().pending_focus);

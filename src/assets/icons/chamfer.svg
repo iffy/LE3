@@ -1,5 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <!-- L-shaped corner with the vertex truncated by a straight chamfer cut -->
-  <polyline points="7,26 7,13 13,7 26,7" />
-  <circle cx="10" cy="10" r="2.2" fill="currentColor" stroke="none" />
+  <!-- filled L-shaped corner plate with a large, unmistakable diagonal chamfer cut across the
+       outer corner (#72: bigger/bolder than a thin single-stroke profile), plus a light shade
+       on the two far (bottom/right) end faces for a touch of depth (mirrors body.svg's
+       per-face opacity) — the shaded strips are separate non-overlapping regions, not an
+       overlay on top of the already-opaque main fill, so the shade is actually visible -->
+  <path
+    d="M 6 25 L 6 20 L 20 6 L 25 6 L 25 13 L 13 13 L 13 25 Z"
+    fill="currentColor"
+    stroke="none"
+  />
+  <path d="M 6 25 L 6 28 L 13 28 L 13 25 Z" fill="currentColor" fill-opacity="0.45" stroke="none" />
+  <path d="M 25 6 L 28 6 L 28 13 L 25 13 Z" fill="currentColor" fill-opacity="0.45" stroke="none" />
 </svg>

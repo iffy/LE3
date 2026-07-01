@@ -6,8 +6,8 @@ use crate::construction::PlaneDim;
 use crate::geometric_constraints::GeometricConstraintType;
 use crate::hierarchy::SceneElement;
 use crate::model::{
-    ConstraintLine, ConstraintPoint, DistanceTarget, FaceId, LineEnd, RectEdge, SketchId,
-    VertexTreatmentKind,
+    ConstraintLine, ConstraintPoint, DistanceTarget, ExtrusionEdgeRef, FaceId, LineEnd, RectEdge,
+    SketchId, VertexTreatmentKind,
 };
 use crate::names::find_element_by_name;
 use crate::script::{parse_key, Instruction, ScriptRunner, SyntheticInput};
@@ -69,8 +69,8 @@ pub struct LuaElement {
 
 impl UserData for LuaElement {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("kind", |_, this, ()| Ok(element_kind_name(this.element)));
-        methods.add_method("index", |_, this, ()| Ok(element_index(this.element)));
+        methods.add_method("kind", |_, this, ()| Ok(element_kind_name(this.element.clone())));
+        methods.add_method("index", |_, this, ()| Ok(element_index(this.element.clone())));
     }
 }
 
@@ -85,6 +85,7 @@ fn element_kind_name(element: SceneElement) -> &'static str {
         SceneElement::Point(_) => "point",
         SceneElement::Extrusion(_) => "extrusion",
         SceneElement::Body(_) => "body",
+        SceneElement::FaceEdge(_) => "face_edge",
     }
 }
 
@@ -99,7 +100,7 @@ fn element_index(element: SceneElement) -> usize {
         | SceneElement::Extrusion(i)
         | SceneElement::Body(i) => i,
         SceneElement::RectEdge(i, _) => i,
-        SceneElement::Point(_) => 0,
+        SceneElement::Point(_) | SceneElement::FaceEdge(_) => 0,
     }
 }
 
@@ -161,7 +162,7 @@ fn resolve_element(lua: &Lua, value: Value) -> mlua::Result<SceneElement> {
     match value {
         Value::UserData(ud) => {
             if let Ok(el) = ud.borrow::<LuaElement>() {
-                return Ok(el.element);
+                return Ok(el.element.clone());
             }
             Err(mlua::Error::external("expected bearcad element"))
         }
@@ -194,6 +195,16 @@ fn parse_element_table(lua: &Lua, table: Table) -> mlua::Result<SceneElement> {
         };
     }
     let kind: String = table.get("kind").or_else(|_| table.get("type"))?;
+    // A face's own vertex or edge (#26/#27): `{ kind = "face", face = { ... }, index = 0 }` for
+    // a `FaceVertex`, or the same shape plus `edge = true` for a `FaceEdge`. Unlike the other
+    // point-level selectors below, `kind` itself (not a sibling flag) signals this one, and
+    // there's no plain-element fallback for it.
+    if kind.eq_ignore_ascii_case("face") {
+        if table.get::<Option<bool>>("edge")?.unwrap_or(false) {
+            return Ok(SceneElement::FaceEdge(parse_constraint_line_table(table)?));
+        }
+        return Ok(SceneElement::Point(parse_constraint_point_table(table)?));
+    }
     let index: usize = table.get("index")?;
     if let Ok(edge_name) = table.get::<String>("edge") {
         let edge = RectEdge::from_name(&edge_name).ok_or_else(|| {
@@ -214,8 +225,108 @@ fn parse_element_table(lua: &Lua, table: Table) -> mlua::Result<SceneElement> {
         .ok_or_else(|| mlua::Error::external(format!("unknown element kind '{kind}'")))
 }
 
+/// Parses a `begin_sketch`/`face = { ... }` table into a `FaceId`. 3D body faces
+/// (`extrude_cap`/`extrude_side`) need extra descriptors (extrusion + profile + which face), so
+/// they can't go through the plain `(kind, index)` `FaceId::from_script` path; everything else
+/// does. Shared by `begin_sketch` and the `face` arms of `parse_constraint_point_table`/
+/// `parse_constraint_line_table` below (#26/#27's `FaceVertex`/`FaceEdge` from a script).
+fn parse_face_id_table(table: Table) -> mlua::Result<FaceId> {
+    let kind: String = table.get("kind").or_else(|_| table.get("type"))?;
+    match kind.to_ascii_lowercase().as_str() {
+        "extrude_cap" | "extrude_side" => {
+            let extrusion: usize = table.get("extrusion")?;
+            let profile_kind: String =
+                table.get("profile").or_else(|_| table.get("profile_kind"))?;
+            let profile_index: usize = table
+                .get("profile_index")
+                .or_else(|_| table.get("index"))?;
+            let profile = match profile_kind.to_ascii_lowercase().as_str() {
+                "rect" | "rectangle" => crate::model::ExtrudeFace::Rect(profile_index),
+                "circle" => crate::model::ExtrudeFace::Circle(profile_index),
+                other => {
+                    return Err(mlua::Error::external(format!(
+                        "unknown extrude profile kind '{other}'"
+                    )))
+                }
+            };
+            if kind.eq_ignore_ascii_case("extrude_cap") {
+                let top: bool = table.get("top").unwrap_or(true);
+                Ok(FaceId::ExtrudeCap {
+                    extrusion,
+                    profile,
+                    top,
+                })
+            } else {
+                let edge: u8 = table.get("edge").unwrap_or(0);
+                Ok(FaceId::ExtrudeSide {
+                    extrusion,
+                    profile,
+                    edge,
+                })
+            }
+        }
+        _ => {
+            let index: usize = table.get("index")?;
+            FaceId::from_script(&kind, index).ok_or_else(|| {
+                mlua::Error::external(format!("unknown sketch face kind '{kind}'"))
+            })
+        }
+    }
+}
+
+/// An `ExtrudeFace` from a face-spec table: `{rect = i}`, `{circle = i}`, `{polygon = {..}}`,
+/// or a nested `{boolean = {op = "intersection"|"difference", a = <face spec>, b = <face
+/// spec>}}` (#16/#62). Mirrors `extrude_face_spec_table`/`boolean_face_lua_table` in
+/// src/script.rs, which render this same shape back out for the recorded-script export.
+fn parse_extrude_face_table(table: &Table) -> mlua::Result<crate::model::ExtrudeFace> {
+    if let Some(i) = table.get::<Option<usize>>("rect")? {
+        return Ok(crate::model::ExtrudeFace::Rect(i));
+    }
+    if let Some(i) = table.get::<Option<usize>>("circle")? {
+        return Ok(crate::model::ExtrudeFace::Circle(i));
+    }
+    if let Some(lines) = table.get::<Option<Vec<usize>>>("polygon")? {
+        return Ok(crate::model::ExtrudeFace::Polygon(lines));
+    }
+    if let Some(boolean) = table.get::<Option<Table>>("boolean")? {
+        return parse_boolean_face_table(&boolean);
+    }
+    Err(mlua::Error::external(
+        "face spec requires one of rect/circle/polygon/boolean",
+    ))
+}
+
+fn parse_boolean_face_table(table: &Table) -> mlua::Result<crate::model::ExtrudeFace> {
+    let op: String = table.get("op")?;
+    let op = match op.to_ascii_lowercase().as_str() {
+        "intersection" => crate::model::BooleanOp::Intersection,
+        "difference" => crate::model::BooleanOp::Difference,
+        other => {
+            return Err(mlua::Error::external(format!(
+                "unknown boolean op '{other}' (expected 'intersection' or 'difference')"
+            )))
+        }
+    };
+    let a: Table = table.get("a")?;
+    let b: Table = table.get("b")?;
+    Ok(crate::model::ExtrudeFace::Boolean {
+        op,
+        a: Box::new(parse_extrude_face_table(&a)?),
+        b: Box::new(parse_extrude_face_table(&b)?),
+    })
+}
+
 fn parse_constraint_line_table(table: Table) -> mlua::Result<ConstraintLine> {
     let kind: String = table.get("kind").or_else(|_| table.get("type"))?;
+    if kind.eq_ignore_ascii_case("face") {
+        // { kind = "face", face = { kind = "extrude_cap", extrusion = 0, profile = "rect",
+        //   profile_index = 0, top = true }, index = 2 } — edge `index` of that face's own
+        // boundary loop (#26/#27's `FaceEdge`).
+        let face_table: Table = table.get("face")?;
+        let face = parse_face_id_table(face_table)?;
+        let index: usize = table.get("index")?;
+        return Ok(ConstraintLine::FaceEdge { face, index });
+    }
     let index: usize = table.get("index")?;
     match kind.to_ascii_lowercase().as_str() {
         "line" => Ok(ConstraintLine::Line(index)),
@@ -234,6 +345,14 @@ fn parse_constraint_line_table(table: Table) -> mlua::Result<ConstraintLine> {
 
 fn parse_constraint_point_table(table: Table) -> mlua::Result<ConstraintPoint> {
     let kind: String = table.get("kind").or_else(|_| table.get("type"))?;
+    if kind.eq_ignore_ascii_case("face") {
+        // { kind = "face", face = { ... }, index = 0 } — vertex `index` of that face's own
+        // boundary loop (#26/#27's `FaceVertex`).
+        let face_table: Table = table.get("face")?;
+        let face = parse_face_id_table(face_table)?;
+        let index: usize = table.get("index")?;
+        return Ok(ConstraintPoint::FaceVertex { face, index });
+    }
     let index: usize = table.get("index")?;
     match kind.to_ascii_lowercase().as_str() {
         "line" => {
@@ -256,6 +375,26 @@ fn parse_constraint_point_table(table: Table) -> mlua::Result<ConstraintPoint> {
         "circle" => Ok(ConstraintPoint::CircleCenter(index)),
         other => Err(mlua::Error::external(format!(
             "unknown point parent '{other}'"
+        ))),
+    }
+}
+
+/// Parses a `bearcad.chamfer_edge`/`fillet_edge` `edge = { ... }` table (#77) into an
+/// `ExtrusionEdgeRef`: `{ kind = "vertical", face = 0, edge = 2 }` for the vertical edge
+/// between side walls 2 and 3 of face 0, or `{ kind = "cap", face = 0, edge = 2, top = true }`
+/// for the edge where side wall 2 meets the top (or, with `top = false`/omitted, base) cap.
+fn parse_extrusion_edge_table(table: Table) -> mlua::Result<ExtrusionEdgeRef> {
+    let kind: String = table.get("kind").or_else(|_| table.get("type"))?;
+    let face: usize = table.get("face")?;
+    let edge: usize = table.get("edge")?;
+    match kind.to_ascii_lowercase().as_str() {
+        "vertical" => Ok(ExtrusionEdgeRef::Vertical { face, edge }),
+        "cap" => {
+            let top: bool = table.get("top").unwrap_or(false);
+            Ok(ExtrusionEdgeRef::Cap { face, edge, top })
+        }
+        other => Err(mlua::Error::external(format!(
+            "unknown extrusion edge kind '{other}' (expected 'vertical' or 'cap')"
         ))),
     }
 }
@@ -409,51 +548,7 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, args: MultiValue| {
             let args = args.into_vec();
             let face = if let Some(Value::Table(table)) = args.first() {
-                let kind: String = table.get("kind").or_else(|_| table.get("type"))?;
-                match kind.to_ascii_lowercase().as_str() {
-                    // 3D body faces need extra descriptors (extrusion + profile + which face),
-                    // so they can't go through the (kind, index) `from_script` path.
-                    "extrude_cap" | "extrude_side" => {
-                        let extrusion: usize = table.get("extrusion")?;
-                        let profile_kind: String =
-                            table.get("profile").or_else(|_| table.get("profile_kind"))?;
-                        let profile_index: usize = table
-                            .get("profile_index")
-                            .or_else(|_| table.get("index"))?;
-                        let profile = match profile_kind.to_ascii_lowercase().as_str() {
-                            "rect" | "rectangle" => {
-                                crate::model::ExtrudeFace::Rect(profile_index)
-                            }
-                            "circle" => crate::model::ExtrudeFace::Circle(profile_index),
-                            other => {
-                                return Err(mlua::Error::external(format!(
-                                    "unknown extrude profile kind '{other}'"
-                                )))
-                            }
-                        };
-                        if kind.eq_ignore_ascii_case("extrude_cap") {
-                            let top: bool = table.get("top").unwrap_or(true);
-                            FaceId::ExtrudeCap {
-                                extrusion,
-                                profile,
-                                top,
-                            }
-                        } else {
-                            let edge: u8 = table.get("edge").unwrap_or(0);
-                            FaceId::ExtrudeSide {
-                                extrusion,
-                                profile,
-                                edge,
-                            }
-                        }
-                    }
-                    _ => {
-                        let index: usize = table.get("index")?;
-                        FaceId::from_script(&kind, index).ok_or_else(|| {
-                            mlua::Error::external(format!("unknown sketch face kind '{kind}'"))
-                        })?
-                    }
-                }
+                parse_face_id_table(table.clone())?
             } else {
                 let kind = match args.first() {
                     Some(Value::String(s)) => s.to_str()?.to_string(),
@@ -1329,9 +1424,16 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
             if let Some(lines) = opts.get::<Option<Vec<usize>>>("polygon")? {
                 faces.push(crate::model::ExtrudeFace::Polygon(lines));
             }
+            // `boolean = {op = "intersection"|"difference", a = <face spec>, b = <face
+            // spec>}`: a boolean-combined region of two other (possibly nested) faces
+            // (#16/#62) — the toggleable intersection/difference regions of two overlapping
+            // shapes.
+            if let Some(boolean) = opts.get::<Option<Table>>("boolean")? {
+                faces.push(parse_boolean_face_table(&boolean)?);
+            }
             if faces.is_empty() {
                 return Err(mlua::Error::external(
-                    "extrude requires a `rect`/`circle`/`polygon` or `rects`/`circles` face list",
+                    "extrude requires a `rect`/`circle`/`polygon`/`boolean` or `rects`/`circles` face list",
                 ));
             }
             // `body = "merge"` joins the body of the face being extruded from (if any) instead
@@ -1341,13 +1443,7 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
             // Sketch from the first face's geometry (all faces should be coplanar).
             let sketch = unsafe {
                 let doc = &tick.state().doc;
-                match &faces[0] {
-                    crate::model::ExtrudeFace::Rect(i) => doc.rects.get(*i).map(|r| r.sketch),
-                    crate::model::ExtrudeFace::Circle(i) => doc.circles.get(*i).map(|c| c.sketch),
-                    crate::model::ExtrudeFace::Polygon(lines) => {
-                        lines.first().and_then(|&i| doc.lines.get(i)).map(|l| l.sketch)
-                    }
-                }
+                crate::actions::extrude_face_sketch(doc, &faces[0])
             }
             .ok_or_else(|| mlua::Error::external("extrude face does not exist"))?;
             unsafe {
@@ -1396,6 +1492,51 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
             unsafe {
                 tick.exec(Instruction::VertexTreatment {
                     point,
+                    kind: VertexTreatmentKind::Fillet,
+                    amount: radius,
+                })?;
+            }
+            Ok(())
+        })?,
+    )?;
+
+    // Chamfer/fillet an analytic edge of an extrusion's 3D solid (#77): `extrusion` is an
+    // index into the document's extrusions, `edge` resolves via `parse_extrusion_edge_table`
+    // (`{ kind = "vertical", face = 0, edge = 2 }` or `{ kind = "cap", face = 0, edge = 2,
+    // top = true }`). Scoped to `Rect`/`Polygon`-profiled extrusions' vertical and side/cap
+    // edges — see SPEC §3.4.
+    api.set(
+        "chamfer_edge",
+        lua.create_function(|lua, opts: Table| {
+            let tick = lua.app_data_ref::<ScriptTickData>().unwrap();
+            let extrusion: usize = opts.get("extrusion")?;
+            let edge_table: Table = opts.get("edge")?;
+            let edge = parse_extrusion_edge_table(edge_table)?;
+            let distance: f32 = opts.get("distance")?;
+            unsafe {
+                tick.exec(Instruction::EdgeTreatment {
+                    extrusion,
+                    edge,
+                    kind: VertexTreatmentKind::Chamfer,
+                    amount: distance,
+                })?;
+            }
+            Ok(())
+        })?,
+    )?;
+
+    api.set(
+        "fillet_edge",
+        lua.create_function(|lua, opts: Table| {
+            let tick = lua.app_data_ref::<ScriptTickData>().unwrap();
+            let extrusion: usize = opts.get("extrusion")?;
+            let edge_table: Table = opts.get("edge")?;
+            let edge = parse_extrusion_edge_table(edge_table)?;
+            let radius: f32 = opts.get("radius")?;
+            unsafe {
+                tick.exec(Instruction::EdgeTreatment {
+                    extrusion,
+                    edge,
                     kind: VertexTreatmentKind::Fillet,
                     amount: radius,
                 })?;
@@ -1516,6 +1657,7 @@ mod tests {
             ("transparent", ShadingMode::TransparentSolid),
             ("solid", ShadingMode::Solid),
             ("solid_wireframe", ShadingMode::SolidWireframe),
+            ("realistic", ShadingMode::Realistic),
         ] {
             let state = run_lua(&format!(r#"bearcad.ui.shading("{name}")"#));
             assert_eq!(state.cam.shading_mode(), expected, "shading({name})");
@@ -1552,7 +1694,7 @@ mod tests {
             for _, name in ipairs({ "rect", "line", "circle", "extrude", "new", "select",
                                     "add_constraint", "parameter", "export_stl", "export_step",
                                     "import_stl", "import_step", "chamfer_vertex",
-                                    "fillet_vertex" }) do
+                                    "fillet_vertex", "chamfer_edge", "fillet_edge" }) do
                 assert(type(bearcad[name]) == "function", "bearcad." .. name .. " should stay top-level")
             end
         "#,
@@ -1614,10 +1756,10 @@ mod tests {
             state.doc.constraints.iter().any(|c| {
                 !c.deleted
                     && matches!(
-                        c.kind,
+                        &c.kind,
                         crate::model::ConstraintKind::Coincident { a, b }
-                            if (a == end_point && b == start_point)
-                                || (a == start_point && b == end_point)
+                            if (*a == end_point && *b == start_point)
+                                || (*a == start_point && *b == end_point)
                     )
             }),
             "expected a Coincident constraint between the two selected line endpoints, got: {:?}",
@@ -1649,10 +1791,10 @@ mod tests {
             state.doc.constraints.iter().any(|c| {
                 !c.deleted
                     && matches!(
-                        c.kind,
+                        &c.kind,
                         crate::model::ConstraintKind::Coincident { a, b }
-                            if (a == corner_point && b == line_point)
-                                || (a == line_point && b == corner_point)
+                            if (*a == corner_point && *b == line_point)
+                                || (*a == line_point && *b == corner_point)
                     )
             }),
             "expected a Coincident constraint between the rect corner and the line start, got: {:?}",
@@ -1777,6 +1919,83 @@ mod tests {
         );
         assert_eq!(state.doc.lines.len(), 3, "a bridging line should be added");
         assert!(state.doc.lines[2].is_curved(), "fillet bridges with a curved line");
+    }
+
+    /// #77: `bearcad.chamfer_edge`/`fillet_edge` chamfer/fillet an analytic edge of an
+    /// extrusion's 3D solid — declared directly (extrusion index + structured edge reference),
+    /// not via screen-space picking.
+    #[test]
+    fn lua_chamfer_edge_bevels_a_vertical_edge_and_visibly_changes_the_mesh() {
+        let state = run_lua(
+            r#"
+            bearcad.rect{ x = 0, y = 0, width = 10, height = 10 }
+            bearcad.extrude{ rect = 0, distance = 5 }
+            bearcad.chamfer_edge{
+                extrusion = 0,
+                edge = { kind = "vertical", face = 0, edge = 0 },
+                distance = 2,
+            }
+        "#,
+        );
+        assert_eq!(state.doc.extrusions[0].edge_treatments.len(), 1);
+        assert_eq!(
+            state.doc.extrusions[0].edge_treatments[0].kind,
+            VertexTreatmentKind::Chamfer
+        );
+        let mesh = crate::extrude::extrusion_mesh(&state.doc, &state.doc.extrusions[0]).unwrap();
+        // An untreated 10x10x5 box extrusion is 12 triangles; the chamfer adds geometry.
+        assert_ne!(mesh.triangles.len(), 12);
+    }
+
+    #[test]
+    fn lua_fillet_edge_bevels_a_cap_edge_with_a_faceted_arc() {
+        let state = run_lua(
+            r#"
+            bearcad.rect{ x = 0, y = 0, width = 10, height = 10 }
+            bearcad.extrude{ rect = 0, distance = 5 }
+            bearcad.fillet_edge{
+                extrusion = 0,
+                edge = { kind = "cap", face = 0, edge = 1, top = true },
+                radius = 1.5,
+            }
+        "#,
+        );
+        assert_eq!(state.doc.extrusions[0].edge_treatments.len(), 1);
+        assert_eq!(
+            state.doc.extrusions[0].edge_treatments[0].kind,
+            VertexTreatmentKind::Fillet
+        );
+        assert!(matches!(
+            state.doc.extrusions[0].edge_treatments[0].edge,
+            ExtrusionEdgeRef::Cap { face: 0, edge: 1, top: true }
+        ));
+    }
+
+    #[test]
+    fn lua_chamfer_edge_rejects_an_out_of_range_edge() {
+        // `tick.exec` (like the other declarative-modeling calls) doesn't turn an `ActionResult
+        // ::Err` into a Lua-level script error — it's reported through `AppState::status`
+        // instead, same as the interactive gizmo tool would see it.
+        let state = run_lua(
+            r#"
+            bearcad.rect{ x = 0, y = 0, width = 10, height = 10 }
+            bearcad.extrude{ rect = 0, distance = 5 }
+            bearcad.chamfer_edge{
+                extrusion = 0,
+                edge = { kind = "vertical", face = 0, edge = 99 },
+                distance = 2,
+            }
+        "#,
+        );
+        assert!(
+            state.doc.extrusions[0].edge_treatments.is_empty(),
+            "an out-of-range edge shouldn't be stored"
+        );
+        assert!(
+            state.status.to_ascii_lowercase().contains("edge"),
+            "status should explain the rejection: {}",
+            state.status
+        );
     }
 
     #[test]
@@ -2004,6 +2223,71 @@ mod tests {
     }
 
     #[test]
+    fn lua_select_face_vertex_makes_coincident_with_sketch_point() {
+        // #26: a sketch point can be pinned coincident to a corner of the body face it's
+        // drawn on, purely from script — `{ kind = "face", face = {...}, index = N }` selects
+        // the vertex the same way `{ kind = "line", ["end"] = "start" }` selects a line endpoint.
+        let state = run_lua(
+            r#"
+            bearcad.new()
+            bearcad.rect{ width = 80, height = 50 }
+            bearcad.extrude{ rect = 0, distance = 20 }
+            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
+            bearcad.line{ x = 5, y = 5, x1 = 15, y1 = 2 }
+            -- `bearcad.line` auto-locks the drawn length (see `Action::CreateLineSegment`),
+            -- which would fight the coincidence below over the start point; drop that lock
+            -- first so the point is free to land exactly on the face vertex. (Constraints
+            -- 0/1 are the rect's own auto-locked width/height from `bearcad.rect` above;
+            -- 2 is this line's length lock.)
+            bearcad.select{ kind = "constraint", index = 2 }
+            bearcad.delete_selection()
+            bearcad.select{ kind = "line", index = 0, ["end"] = "start" }
+            bearcad.select({
+                kind = "face",
+                face = { kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true },
+                index = 2,
+            }, true)
+            bearcad.add_geometric_constraint("coincident")
+        "#,
+        );
+        let sketch = state.doc.sketches.len() - 1;
+        let cap = crate::model::FaceId::ExtrudeCap {
+            extrusion: 0,
+            profile: crate::model::ExtrudeFace::Rect(0),
+            top: true,
+        };
+        let expected_a = crate::model::ConstraintEntity::Point(ConstraintPoint::LineEndpoint {
+            line: 0,
+            end: LineEnd::Start,
+        });
+        let expected_b = crate::model::ConstraintEntity::Point(ConstraintPoint::FaceVertex {
+            face: cap,
+            index: 2,
+        });
+        assert!(
+            state.doc.constraints.iter().any(|c| {
+                !c.deleted
+                    && matches!(
+                        &c.kind,
+                        crate::model::ConstraintKind::Coincident { a, b }
+                            if (*a == expected_a && *b == expected_b)
+                                || (*a == expected_b && *b == expected_a)
+                    )
+            }),
+            "expected a Coincident constraint between the line start and the cap's corner 2, got: {:?}",
+            state.doc.constraints
+        );
+        // The solver actually pinned the line's start to the cap's corner 2 (80, 50).
+        let (u, v) = crate::geometric_constraints::point_uv(
+            &state.doc,
+            sketch,
+            ConstraintPoint::LineEndpoint { line: 0, end: LineEnd::Start },
+        )
+        .unwrap();
+        assert!((u - 80.0).abs() < 1e-2 && (v - 50.0).abs() < 1e-2, "got ({u},{v})");
+    }
+
+    #[test]
     fn deleting_extrusion_removes_its_body() {
         let mut state = run_lua(
             r#"
@@ -2059,6 +2343,74 @@ mod tests {
             find_element_by_name(&state.doc, "Main box"),
             Some(SceneElement::Line(0))
         );
+    }
+
+    #[test]
+    fn lua_set_units_sets_document_defaults() {
+        let state = run_lua(
+            r#"
+            bearcad.new()
+            bearcad.set_units{ length = "in", angle = "rad" }
+        "#,
+        );
+        assert_eq!(state.doc.default_length_unit, LengthUnit::In);
+        assert_eq!(state.doc.default_angle_unit, AngleUnit::Rad);
+    }
+
+    #[test]
+    fn lua_set_units_partial_document_call_keeps_other_axis() {
+        let state = run_lua(
+            r#"
+            bearcad.new()
+            bearcad.set_units{ length = "cm" }
+        "#,
+        );
+        assert_eq!(state.doc.default_length_unit, LengthUnit::Cm);
+        assert_eq!(state.doc.default_angle_unit, AngleUnit::Deg);
+    }
+
+    #[test]
+    fn lua_set_units_sets_and_clears_sketch_override() {
+        let state = run_lua(
+            r#"
+            bearcad.new()
+            bearcad.begin_sketch("construction_plane", 0)
+            bearcad.set_units{ sketch = 0, length = "ft" }
+        "#,
+        );
+        assert_eq!(state.doc.sketches[0].length_unit, Some(LengthUnit::Ft));
+        assert_eq!(state.doc.sketches[0].angle_unit, None);
+
+        let state = run_lua(
+            r#"
+            bearcad.new()
+            bearcad.begin_sketch("construction_plane", 0)
+            bearcad.set_units{ sketch = 0, length = "ft" }
+            bearcad.set_units{ sketch = 0 }
+        "#,
+        );
+        assert_eq!(
+            state.doc.sketches[0].length_unit, None,
+            "omitting length on a sketch call clears the override back to inherit"
+        );
+    }
+
+    #[test]
+    fn lua_set_units_rejects_unknown_unit_name() {
+        let mut runner = ScriptRunner::from_lua_source(
+            r#"
+            bearcad.set_units{ length = "furlongs" }
+        "#,
+        )
+        .unwrap();
+        runner.verbose = false;
+        let mut state = AppState::default();
+        let mut synthetic = SyntheticInput::default();
+        let ctx = egui::Context::default();
+        while !runner.done {
+            runner.tick(&mut state, &mut synthetic, None, &ctx);
+        }
+        assert!(runner.error.is_some(), "unknown unit name should error");
     }
 
     #[test]

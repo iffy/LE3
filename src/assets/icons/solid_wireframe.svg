@@ -1,6 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <!-- isometric cube, opaque fill with a dashed edge overlay poking through it
-       (mirrors the depth-test-disabled wireframe pass drawn over the solid body) -->
-  <polygon points="16,4 28,10 28,22 16,28 4,22 4,10" fill="currentColor" />
-  <path d="M28 10 L16 16 L4 10 M16 16 L16 28" stroke-dasharray="2.5 3" />
+  <!-- isometric cube, opaque fill with the hidden edges cut out of the fill as true negative-
+       space slits (via a mask), rather than a faint dashed line overlay — reads as clearly
+       distinct from the plain solid cube at a glance (#79) -->
+  <mask id="solid_wireframe_hidden_edges">
+    <rect x="0" y="0" width="32" height="32" fill="white" />
+    <path d="M28 10 L16 16 L4 10 M16 16 L16 28" stroke="black" stroke-width="2.4" fill="none" />
+  </mask>
+  <polygon
+    points="16,4 28,10 28,22 16,28 4,22 4,10"
+    fill="currentColor"
+    mask="url(#solid_wireframe_hidden_edges)"
+  />
 </svg>

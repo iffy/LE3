@@ -1,0 +1,1 @@
+Elements pane: add List/Tree/Graph-node view toggle with new icons; Tree indents nested elements by depth, Graph draws a 2D node-link diagram (column=depth, scrollable) and highlights ancestor/descendant edges on selection

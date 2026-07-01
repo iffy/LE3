@@ -10,10 +10,19 @@ license = "MIT OR Apache-2.0"
 name = "bearcad"
 path = "src/main.rs"
 
+[features]
+# Statically link the OpenCASCADE (OCCT) geometry kernel (#86). Off by default:
+# the normal build and CI need no C++ toolchain or built OCCT. See README.md
+# ("Building with the OCCT kernel") and SPEC.md §10.
+occt = []
+
 [build-dependencies]
 ico = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 winres = "0.1"
+# Compiles the C++ FFI shim (cpp/bearcad_kernel.cpp) only when the `occt` feature
+# is on; unused otherwise. Small, so kept as an unconditional build-dep.
+cc = "1"
 
 [dependencies]
 # wgpu backend (Metal on macOS) per SPEC §1; the default glow/OpenGL backend

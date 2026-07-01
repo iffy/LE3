@@ -43,11 +43,15 @@ pub enum IconId {
     ShadingTransparentSolid,
     ShadingSolid,
     ShadingSolidWireframe,
+    ShadingRealistic,
+    ViewList,
+    ViewTree,
+    ViewGraph,
 }
 
 impl IconId {
     #[cfg(test)]
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 34] = [
         Self::Select,
         Self::Rectangle,
         Self::Line,
@@ -78,6 +82,10 @@ impl IconId {
         Self::ShadingTransparentSolid,
         Self::ShadingSolid,
         Self::ShadingSolidWireframe,
+        Self::ShadingRealistic,
+        Self::ViewList,
+        Self::ViewTree,
+        Self::ViewGraph,
     ];
 
     pub fn svg_source(self) -> &'static str {
@@ -112,6 +120,10 @@ impl IconId {
             Self::ShadingTransparentSolid => include_str!("assets/icons/transparent_solid.svg"),
             Self::ShadingSolid => include_str!("assets/icons/solid.svg"),
             Self::ShadingSolidWireframe => include_str!("assets/icons/solid_wireframe.svg"),
+            Self::ShadingRealistic => include_str!("assets/icons/realistic.svg"),
+            Self::ViewList => include_str!("assets/icons/view_list.svg"),
+            Self::ViewTree => include_str!("assets/icons/view_tree.svg"),
+            Self::ViewGraph => include_str!("assets/icons/view_graph.svg"),
         }
     }
 
@@ -147,6 +159,10 @@ impl IconId {
             Self::ShadingTransparentSolid => "Transparent solid",
             Self::ShadingSolid => "Solid",
             Self::ShadingSolidWireframe => "Solid + wireframe",
+            Self::ShadingRealistic => "Realistic",
+            Self::ViewList => "List view",
+            Self::ViewTree => "Tree view",
+            Self::ViewGraph => "Graph view",
         }
     }
 }
@@ -172,6 +188,7 @@ pub fn icon_for_shading_mode(mode: crate::camera::ShadingMode) -> IconId {
         crate::camera::ShadingMode::TransparentSolid => IconId::ShadingTransparentSolid,
         crate::camera::ShadingMode::Solid => IconId::ShadingSolid,
         crate::camera::ShadingMode::SolidWireframe => IconId::ShadingSolidWireframe,
+        crate::camera::ShadingMode::Realistic => IconId::ShadingRealistic,
     }
 }
 
@@ -187,7 +204,7 @@ pub fn icon_for_constraint(kind: GeometricConstraintType) -> IconId {
     }
 }
 
-pub fn icon_for_constraint_kind(kind: ConstraintKind) -> IconId {
+pub fn icon_for_constraint_kind(kind: &ConstraintKind) -> IconId {
     match kind {
         ConstraintKind::Distance { .. } => IconId::Dimension,
         ConstraintKind::Parallel { .. } => IconId::Parallel,
@@ -342,6 +359,10 @@ mod tests {
             icon_for_shading_mode(ShadingMode::SolidWireframe),
             IconId::ShadingSolidWireframe
         );
+        assert_eq!(
+            icon_for_shading_mode(ShadingMode::Realistic),
+            IconId::ShadingRealistic
+        );
     }
 
     #[test]
@@ -385,20 +406,20 @@ mod tests {
         };
 
         assert_eq!(
-            icon_for_constraint_kind(ConstraintKind::Distance {
+            icon_for_constraint_kind(&ConstraintKind::Distance {
                 target: DistanceTarget::LineLength(0),
             }),
             IconId::Dimension
         );
         assert_eq!(
-            icon_for_constraint_kind(ConstraintKind::Parallel {
+            icon_for_constraint_kind(&ConstraintKind::Parallel {
                 line_a: ConstraintLine::Line(0),
                 line_b: ConstraintLine::Line(1),
             }),
             IconId::Parallel
         );
         assert_eq!(
-            icon_for_constraint_kind(ConstraintKind::Angle {
+            icon_for_constraint_kind(&ConstraintKind::Angle {
                 line_a: ConstraintLine::Line(0),
                 line_b: ConstraintLine::Line(1),
                 rotation_sign: 1,
@@ -406,7 +427,7 @@ mod tests {
             IconId::Constraint
         );
         assert_eq!(
-            icon_for_constraint_kind(ConstraintKind::Coincident {
+            icon_for_constraint_kind(&ConstraintKind::Coincident {
                 a: ConstraintEntity::Point(ConstraintPoint::LineEndpoint {
                     line: 0,
                     end: LineEnd::Start,

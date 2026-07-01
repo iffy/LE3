@@ -1,6 +1,10 @@
 # Compiled output
 /target/
 
+# OCCT static build output (#86); built on demand by scripts/build-occt.sh, never committed
+/third_party/OCCT/occt-build/
+/third_party/OCCT/occt-install/
+
 # Local release packaging output
 /dist/
 /target/generated/

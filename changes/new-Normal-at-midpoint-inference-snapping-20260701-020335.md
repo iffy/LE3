@@ -1,0 +1,1 @@
+Normal-at-midpoint inference snapping (#41): touch a line's midpoint, then snap onto the infinite perpendicular through it, committing a construction line + Midpoint/Perpendicular/Coincident constraints

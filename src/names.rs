@@ -2,7 +2,8 @@
 
 use crate::constraints::constraint_label;
 use crate::hierarchy::{HierarchyNode, SceneElement};
-use crate::model::Document;
+use crate::model::{effective_length_unit, Document};
+use crate::value::format_length_display_in;
 
 /// Map a selected element to the object that owns a user-visible name.
 pub fn nameable_element(element: SceneElement) -> Option<SceneElement> {
@@ -16,7 +17,7 @@ pub fn nameable_element(element: SceneElement) -> Option<SceneElement> {
         | SceneElement::Constraint(_)
         | SceneElement::Extrusion(_)
         | SceneElement::Body(_) => Some(element),
-        SceneElement::Point(_) => None,
+        SceneElement::Point(_) | SceneElement::FaceEdge(_) => None,
     }
 }
 
@@ -103,7 +104,7 @@ pub fn element_name(doc: &Document, element: SceneElement) -> Option<&str> {
         SceneElement::Constraint(index) => doc.constraints.get(index)?.name.as_deref(),
         SceneElement::Extrusion(index) => doc.extrusions.get(index)?.name.as_deref(),
         SceneElement::Body(index) => doc.bodies.get(index)?.name.as_deref(),
-        SceneElement::RectEdge(_, _) | SceneElement::Point(_) => None,
+        SceneElement::RectEdge(_, _) | SceneElement::Point(_) | SceneElement::FaceEdge(_) => None,
     }?;
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -185,12 +186,18 @@ pub fn set_element_name(doc: &mut Document, element: SceneElement, name: String)
         SceneElement::Point(_) => {
             return Err("points cannot be renamed".to_string());
         }
+        SceneElement::FaceEdge(_) => {
+            return Err("face edges cannot be renamed".to_string());
+        }
     }
     Ok(())
 }
 
 pub fn default_node_label(doc: &Document, node: HierarchyNode) -> String {
     match node {
+        // The synthetic root has no stored filename/title to draw on (#87) — `Document`
+        // doesn't carry one — so it always gets this fixed label.
+        HierarchyNode::Document => "Document".to_string(),
         HierarchyNode::ConstructionPlane(i) => {
             if i == 0 {
                 "Construction plane (XY)".to_string()
@@ -201,28 +208,52 @@ pub fn default_node_label(doc: &Document, node: HierarchyNode) -> String {
         HierarchyNode::Sketch(i) => format!("Sketch {i}"),
         HierarchyNode::Rect(i) => {
             let rect = &doc.rects[i];
-            format!("Rectangle {i} ({:.1} × {:.1} mm)", rect.w, rect.h)
+            let unit = effective_length_unit(doc, rect.sketch);
+            format!(
+                "Rectangle {i} ({} × {})",
+                format_length_display_in(rect.w, unit),
+                format_length_display_in(rect.h, unit)
+            )
         }
         HierarchyNode::Line(i) => {
-            let len = doc.lines[i].length();
-            format!("Line {i} ({len:.1} mm)")
+            let line = &doc.lines[i];
+            let len = line.length();
+            let unit = effective_length_unit(doc, line.sketch);
+            let len_label = format_length_display_in(len, unit);
+            // A chamfer/fillet bridging line (#76) gets a more recognizable default label than
+            // a generic "Line N" — fillet vs. chamfer is distinguishable by whether the bridge
+            // is curved (a fillet always sets `bezier`; a chamfer's bridge is always straight).
+            if line.chamfer_fillet_parent.is_some() {
+                let kind = if line.bezier.is_some() { "Fillet" } else { "Chamfer" };
+                format!("{kind} {i} ({len_label})")
+            } else {
+                format!("Line {i} ({len_label})")
+            }
         }
         HierarchyNode::Circle(i) => {
-            let diameter = doc.circles[i].diameter();
-            format!("Circle {i} (Ø{diameter:.1} mm)")
+            let circle = &doc.circles[i];
+            let diameter = circle.diameter();
+            let unit = effective_length_unit(doc, circle.sketch);
+            format!("Circle {i} ({})", crate::value::format_diameter_display_in(diameter, unit))
         }
         HierarchyNode::Constraint(i) => constraint_label(doc, i),
         HierarchyNode::Extrusion(i) => {
-            let distance = doc.extrusions.get(i).map(|e| e.distance).unwrap_or(0.0);
-            format!("Extrusion {i} ({distance:.1} mm)")
+            let extrusion = doc.extrusions.get(i);
+            let distance = extrusion.map(|e| e.distance).unwrap_or(0.0);
+            let unit = extrusion
+                .map(|e| effective_length_unit(doc, e.sketch))
+                .unwrap_or(doc.default_length_unit);
+            format!("Extrusion {i} ({})", format_length_display_in(distance, unit))
         }
         HierarchyNode::Body(i) => format!("Body {i}"),
     }
 }
 
 pub fn node_label(doc: &Document, node: HierarchyNode) -> String {
-    let element = crate::hierarchy::scene_element_for_node(node);
-    element_name(doc, element)
+    // HierarchyNode::Document has no SceneElement, and thus no custom-name storage — it
+    // always falls through to its fixed default label.
+    crate::hierarchy::scene_element_for_node(node)
+        .and_then(|element| element_name(doc, element))
         .map(str::to_string)
         .unwrap_or_else(|| default_node_label(doc, node))
 }
@@ -260,6 +291,26 @@ mod tests {
     }
 
     #[test]
+    fn chamfer_fillet_bridge_line_gets_a_recognizable_default_label() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        // A straight bridge (chamfer): default label says "Chamfer", not "Line".
+        let mut chamfer_bridge = Line::from_local_endpoints(sketch, 10.0, 0.0, 15.0, 5.0);
+        chamfer_bridge.chamfer_fillet_parent = Some(0);
+        doc.lines.push(chamfer_bridge);
+        assert!(node_label(&doc, HierarchyNode::Line(1)).starts_with("Chamfer 1"));
+        // A curved bridge (fillet): default label says "Fillet".
+        let mut fillet_bridge = Line::from_local_endpoints(sketch, 10.0, 0.0, 15.0, 5.0);
+        fillet_bridge.chamfer_fillet_parent = Some(0);
+        fillet_bridge.bezier = Some([(11.0, 0.0), (14.0, 4.0)]);
+        doc.lines.push(fillet_bridge);
+        assert!(node_label(&doc, HierarchyNode::Line(2)).starts_with("Fillet 2"));
+        // An ordinary line (no chamfer/fillet parent) keeps the generic label.
+        assert!(node_label(&doc, HierarchyNode::Line(0)).starts_with("Line 0"));
+    }
+
+    #[test]
     fn custom_name_replaces_default_label() {
         let mut doc = Document::default();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
@@ -282,6 +333,21 @@ mod tests {
         set_element_name(&mut doc, SceneElement::Rect(0), "   ".to_string()).unwrap();
         assert_eq!(element_name(&doc, SceneElement::Rect(0)), None);
         assert!(node_label(&doc, HierarchyNode::Rect(0)).starts_with("Rectangle 0"));
+    }
+
+    #[test]
+    fn default_node_label_respects_document_default_length_unit() {
+        // #85: setting the document's default unit to inches must be reflected in the
+        // Elements-pane label for descendant geometry, not hardcoded mm.
+        let mut doc = Document::default();
+        doc.default_length_unit = crate::value::LengthUnit::In;
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 25.4, 50.8));
+        let label = node_label(&doc, HierarchyNode::Rect(0));
+        assert!(label.contains("1.0 in"), "expected inches in {label:?}");
+        assert!(label.contains("2.0 in"), "expected inches in {label:?}");
+        assert!(!label.contains("mm"), "should not show mm: {label:?}");
     }
 
     #[test]

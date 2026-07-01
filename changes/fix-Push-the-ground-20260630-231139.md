@@ -1,0 +1,1 @@
+Push the ground grid slightly away from the camera instead of rendering it exactly on the z=0 plane, so a coincident, unbiased surface (most commonly an extruded body's base cap) reliably wins the depth test instead of z-fighting with the grid — visible as the ground appearing to slice through a body when orbiting below it and zooming out.

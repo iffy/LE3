@@ -1179,6 +1179,7 @@ fn shading_mode_tooltip(mode: crate::camera::ShadingMode) -> &'static str {
         ShadingMode::TransparentSolid => "Transparent solid",
         ShadingMode::Solid => "Solid",
         ShadingMode::SolidWireframe => "Solid + wireframe",
+        ShadingMode::Realistic => "Realistic",
     }
 }
 

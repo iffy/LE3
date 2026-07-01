@@ -22,6 +22,12 @@ pub struct ContextInput<'a> {
     pub draw_rect_construction: Option<bool>,
     pub draw_line_construction: Option<bool>,
     pub draw_circle_construction: Option<bool>,
+    /// Curve-mode (`B`) toggle while the line tool is active (#73): the next point drawn gets
+    /// bezier handles on both sides (or one, if it's a chain's starting point).
+    pub draw_line_curve_mode: Option<bool>,
+    /// Tangent-constraint (`T`) toggle while the line tool is active (#73): only meaningful
+    /// alongside curve mode.
+    pub draw_line_tangent_constraint: Option<bool>,
     /// Whether a sketch is open (snapping only applies inside a sketch).
     pub in_sketch: bool,
     /// Current snapping on/off state (shown as a toggle for snapping tools).
@@ -52,6 +58,10 @@ pub enum TriState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextPaneContent {
     pub name: Option<NameControl>,
+    /// Curve-mode (`B`) checkbox while the line tool is active (#73).
+    pub curve_mode: Option<bool>,
+    /// Tangent-constraint (`T`) checkbox while the line tool is active (#73).
+    pub tangent_constraint: Option<bool>,
     pub construction: Option<ConstructionControl>,
     pub constraints: Option<Vec<ConstraintPaneRow>>,
     /// `Some(enabled)` when the current tool snaps; renders an enable/disable toggle.
@@ -144,6 +154,8 @@ pub fn context_pane_content(input: &ContextInput<'_>) -> ContextPaneContent {
     if let Some(construction) = input.draw_rect_construction {
         return ContextPaneContent {
             name,
+            curve_mode: None,
+            tangent_constraint: None,
             construction: Some(ConstructionControl {
                 value: tri_state_from_bool(construction),
                 target_count: 1,
@@ -157,6 +169,8 @@ pub fn context_pane_content(input: &ContextInput<'_>) -> ContextPaneContent {
     if let Some(construction) = input.draw_line_construction {
         return ContextPaneContent {
             name,
+            curve_mode: input.draw_line_curve_mode,
+            tangent_constraint: input.draw_line_tangent_constraint,
             construction: Some(ConstructionControl {
                 value: tri_state_from_bool(construction),
                 target_count: 1,
@@ -170,6 +184,8 @@ pub fn context_pane_content(input: &ContextInput<'_>) -> ContextPaneContent {
     if let Some(construction) = input.draw_circle_construction {
         return ContextPaneContent {
             name,
+            curve_mode: None,
+            tangent_constraint: None,
             construction: Some(ConstructionControl {
                 value: tri_state_from_bool(construction),
                 target_count: 1,
@@ -186,6 +202,8 @@ pub fn context_pane_content(input: &ContextInput<'_>) -> ContextPaneContent {
         .then(|| constraint_pane_rows(input.selection));
     ContextPaneContent {
         name,
+        curve_mode: None,
+        tangent_constraint: None,
         construction: (!targets.is_empty()).then(|| ConstructionControl {
             value: construction_tri_state(input.doc, &targets),
             target_count: targets.len(),
@@ -218,8 +236,8 @@ fn units_control_from_selection(doc: &Document, selection: &SceneSelection) -> O
     let sketch = doc.sketches.get(id)?;
     Some(UnitsControl {
         sketch: Some(id),
-        effective_length: sketch.length_unit.unwrap_or(doc.default_length_unit),
-        effective_angle: sketch.angle_unit.unwrap_or(doc.default_angle_unit),
+        effective_length: crate::model::effective_length_unit(doc, id),
+        effective_angle: crate::model::effective_angle_unit(doc, id),
         length_override: sketch.length_unit,
         angle_override: sketch.angle_unit,
         document_length: doc.default_length_unit,
@@ -236,11 +254,11 @@ pub fn sync_name_draft(
         state.synced_element = None;
         return;
     };
-    if state.synced_element == Some(control.element) {
+    if state.synced_element == Some(control.element.clone()) {
         return;
     }
-    state.synced_element = Some(control.element);
-    state.name_draft = element_name(doc, control.element)
+    state.synced_element = Some(control.element.clone());
+    state.name_draft = element_name(doc, control.element.clone())
         .unwrap_or_default()
         .to_string();
 }
@@ -263,7 +281,7 @@ pub fn construction_targets_from_selection(selection: &SceneSelection) -> Vec<Sc
             _ => {}
         }
     }
-    targets.sort_by_key(|element| scene_element_sort_key(*element));
+    targets.sort_by_key(|element| scene_element_sort_key(element.clone()));
     targets.dedup();
     targets
 }
@@ -298,7 +316,7 @@ pub fn construction_tri_state(doc: &Document, targets: &[SceneElement]) -> TriSt
     let mut any_on = false;
     let mut any_off = false;
     for element in targets {
-        let Some(value) = edge_construction_for_element(doc, *element) else {
+        let Some(value) = edge_construction_for_element(doc, element.clone()) else {
             continue;
         };
         if value {
@@ -368,7 +386,7 @@ pub fn set_construction_for_targets(
 ) -> Result<usize, String> {
     let mut updated = 0usize;
     for element in targets {
-        set_edge_construction(doc, *element, construction)?;
+        set_edge_construction(doc, element.clone(), construction)?;
         updated += 1;
     }
     Ok(updated)
@@ -380,10 +398,10 @@ pub fn toggle_construction_for_targets(
 ) -> Result<usize, String> {
     let mut updated = 0usize;
     for element in targets {
-        let Some(current) = edge_construction_for_element(doc, *element) else {
+        let Some(current) = edge_construction_for_element(doc, element.clone()) else {
             continue;
         };
-        set_edge_construction(doc, *element, !current)?;
+        set_edge_construction(doc, element.clone(), !current)?;
         updated += 1;
     }
     Ok(updated)
@@ -397,6 +415,8 @@ pub fn show_pane(
     health: &DocumentHealth,
     selection: &SceneSelection,
     on_name_committed: &mut impl FnMut(SceneElement, String),
+    on_curve_mode_changed: &mut impl FnMut(bool),
+    on_tangent_constraint_changed: &mut impl FnMut(bool),
     on_construction_changed: &mut impl FnMut(bool),
     on_constraint_clicked: &mut impl FnMut(crate::geometric_constraints::GeometricConstraintType),
     on_snapping_changed: &mut impl FnMut(bool),
@@ -437,7 +457,7 @@ pub fn show_pane(
     if let Some(control) = &content.name {
         any_control = true;
         ui.label(shortcuts::compact_label("Name", Some(shortcuts::FOCUS_ELEMENT_NAME)));
-        let id = egui::Id::new(("element_name", control.element));
+        let id = egui::Id::new(("element_name", control.element.clone()));
         let mut committed = false;
         ui.add_enabled_ui(controls_enabled, |ui| {
             let output = TextEdit::singleline(&mut pane_state.name_draft)
@@ -468,7 +488,7 @@ pub fn show_pane(
             }
         });
         if committed {
-            on_name_committed(control.element, pane_state.name_draft.clone());
+            on_name_committed(control.element.clone(), pane_state.name_draft.clone());
         }
         ui.add_space(4.0);
     }
@@ -506,6 +526,39 @@ pub fn show_pane(
                 }
             });
         }
+        ui.add_space(4.0);
+    }
+
+    if let Some(mut curve_mode) = content.curve_mode {
+        any_control = true;
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            if shortcuts::checkbox_with_shortcut(
+                ui,
+                &mut curve_mode,
+                "Curve",
+                Some(shortcuts::TOGGLE_CURVE_MODE),
+            )
+            .changed()
+            {
+                on_curve_mode_changed(curve_mode);
+            }
+        });
+    }
+
+    if let Some(mut tangent_constraint) = content.tangent_constraint {
+        any_control = true;
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            if shortcuts::checkbox_with_shortcut(
+                ui,
+                &mut tangent_constraint,
+                "Tangent",
+                Some(shortcuts::TOGGLE_TANGENT_CONSTRAINT),
+            )
+            .changed()
+            {
+                on_tangent_constraint_changed(tangent_constraint);
+            }
+        });
         ui.add_space(4.0);
     }
 
@@ -687,6 +740,8 @@ mod tests {
             draw_rect_construction: None,
             draw_line_construction: None,
             draw_circle_construction: None,
+            draw_line_curve_mode: None,
+            draw_line_tangent_constraint: None,
             in_sketch: false,
             snapping_enabled: true,
             extrude_merge_candidate: None,
@@ -701,6 +756,8 @@ mod tests {
             context_pane_content(&input(&doc, &SceneSelection::default())),
             ContextPaneContent {
                 name: None,
+                curve_mode: None,
+                tangent_constraint: None,
                 construction: None,
                 constraints: None,
                 snapping: None,
@@ -731,6 +788,8 @@ mod tests {
             context_pane_content(&input(&doc, &sel)),
             ContextPaneContent {
                 name: None,
+                curve_mode: None,
+                tangent_constraint: None,
                 construction: Some(ConstructionControl {
                     value: TriState::Off,
                     target_count: 2,
@@ -775,6 +834,8 @@ mod tests {
             draw_rect_construction: Some(true),
             draw_line_construction: None,
             draw_circle_construction: None,
+            draw_line_curve_mode: None,
+            draw_line_tangent_constraint: None,
             in_sketch: false,
             snapping_enabled: true,
             extrude_merge_candidate: None,
@@ -784,6 +845,8 @@ mod tests {
             content,
             ContextPaneContent {
                 name: None,
+                curve_mode: None,
+                tangent_constraint: None,
                 construction: Some(ConstructionControl {
                     value: TriState::On,
                     target_count: 1,
@@ -805,6 +868,27 @@ mod tests {
     }
 
     #[test]
+    fn shows_curve_mode_and_tangent_constraint_while_drawing_a_line() {
+        let doc = Document::default();
+        let content = context_pane_content(&ContextInput {
+            doc: &doc,
+            selection: &SceneSelection::default(),
+            tool: Tool::Line,
+            draw_rect_construction: None,
+            draw_line_construction: Some(false),
+            draw_circle_construction: None,
+            draw_line_curve_mode: Some(true),
+            draw_line_tangent_constraint: Some(false),
+            in_sketch: true,
+            snapping_enabled: true,
+            extrude_merge_candidate: None,
+            extrude_body_mode: None,
+        });
+        assert_eq!(content.curve_mode, Some(true));
+        assert_eq!(content.tangent_constraint, Some(false));
+    }
+
+    #[test]
     fn shows_name_when_single_element_selected() {
         let mut doc = Document::default();
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
@@ -817,6 +901,8 @@ mod tests {
                 name: Some(NameControl {
                     element: SceneElement::Line(0),
                 }),
+                curve_mode: None,
+                tangent_constraint: None,
                 construction: Some(ConstructionControl {
                     value: TriState::Off,
                     target_count: 1,
@@ -830,6 +916,61 @@ mod tests {
     }
 
     #[test]
+    fn shows_inherited_units_when_sketch_selected() {
+        let mut doc = Document::default();
+        doc.default_length_unit = LengthUnit::In;
+        doc.default_angle_unit = AngleUnit::Rad;
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        let mut sel = SceneSelection::default();
+        click_scene_selection(&mut sel, SceneElement::Sketch(sketch), false);
+        let content = context_pane_content(&input(&doc, &sel));
+        assert_eq!(
+            content.units,
+            Some(UnitsControl {
+                sketch: Some(sketch),
+                effective_length: LengthUnit::In,
+                effective_angle: AngleUnit::Rad,
+                length_override: None,
+                angle_override: None,
+                document_length: LengthUnit::In,
+                document_angle: AngleUnit::Rad,
+            })
+        );
+    }
+
+    #[test]
+    fn shows_overridden_units_when_sketch_selected() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.sketches[sketch].length_unit = Some(LengthUnit::Cm);
+        let mut sel = SceneSelection::default();
+        click_scene_selection(&mut sel, SceneElement::Sketch(sketch), false);
+        let content = context_pane_content(&input(&doc, &sel));
+        assert_eq!(
+            content.units,
+            Some(UnitsControl {
+                sketch: Some(sketch),
+                effective_length: LengthUnit::Cm,
+                effective_angle: AngleUnit::Deg,
+                length_override: Some(LengthUnit::Cm),
+                angle_override: None,
+                document_length: LengthUnit::Mm,
+                document_angle: AngleUnit::Deg,
+            })
+        );
+    }
+
+    #[test]
+    fn hides_units_control_when_non_sketch_element_selected() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 1.0, 0.0));
+        let mut sel = SceneSelection::default();
+        click_scene_selection(&mut sel, SceneElement::Line(0), false);
+        assert_eq!(context_pane_content(&input(&doc, &sel)).units, None);
+    }
+
+    #[test]
     fn shows_construction_before_drawing_when_rectangle_tool_active() {
         let doc = Document::default();
         let content = context_pane_content(&ContextInput {
@@ -839,6 +980,8 @@ mod tests {
             draw_rect_construction: Some(false),
             draw_line_construction: None,
             draw_circle_construction: None,
+            draw_line_curve_mode: None,
+            draw_line_tangent_constraint: None,
             in_sketch: false,
             snapping_enabled: true,
             extrude_merge_candidate: None,
@@ -864,6 +1007,8 @@ mod tests {
             draw_rect_construction: Some(true),
             draw_line_construction: None,
             draw_circle_construction: None,
+            draw_line_curve_mode: None,
+            draw_line_tangent_constraint: None,
             in_sketch: false,
             snapping_enabled: true,
             extrude_merge_candidate: None,
@@ -875,6 +1020,8 @@ mod tests {
                 name: Some(NameControl {
                     element: SceneElement::Line(0),
                 }),
+                curve_mode: None,
+                tangent_constraint: None,
                 construction: Some(ConstructionControl {
                     value: TriState::On,
                     target_count: 1,
@@ -897,6 +1044,8 @@ mod tests {
             draw_rect_construction: None,
             draw_line_construction: None,
             draw_circle_construction: None,
+            draw_line_curve_mode: None,
+            draw_line_tangent_constraint: None,
             in_sketch: false,
             snapping_enabled: true,
             extrude_merge_candidate: None,

@@ -30,6 +30,8 @@ pub enum MenuCommand {
     UndoLast,
     Clear,
     About,
+    /// Open the third-party open-source licenses document (Help menu). See #86.
+    Licenses,
     /// Install the `bearcad` CLI symlink onto PATH (Help menu). See #49.
     InstallCli,
     ToggleCommandPalette,
@@ -52,6 +54,7 @@ pub struct MenuIds {
     pub undo: MenuId,
     pub clear: MenuId,
     pub about: MenuId,
+    pub licenses: MenuId,
     pub install_cli: MenuId,
     pub command_palette: MenuId,
     pub pane_checks: Vec<(Pane, MenuId)>,
@@ -124,6 +127,9 @@ pub fn command_for_id(
     if ids.about == id {
         return Some(MenuCommand::About);
     }
+    if ids.licenses == id {
+        return Some(MenuCommand::Licenses);
+    }
     if ids.install_cli == id {
         return Some(MenuCommand::InstallCli);
     }
@@ -174,6 +180,8 @@ impl MenuCommand {
             MenuCommand::UndoLast => Some(Action::UndoLast),
             MenuCommand::Clear => Some(Action::Clear),
             MenuCommand::About => None,
+            // Opens a URL in the browser, handled in the app frame loop.
+            MenuCommand::Licenses => None,
             // Performs filesystem side effects + status reporting in the app frame loop.
             MenuCommand::InstallCli => None,
             MenuCommand::ToggleCommandPalette => Some(Action::ToggleCommandPalette),
@@ -275,6 +283,7 @@ impl NativeMenu {
             Some(Accelerator::new(Some(primary), Code::KeyP)),
         );
         let about = MenuItem::with_id("about", "About BearCAD", true, None);
+        let licenses = MenuItem::with_id("licenses", "Licenses", true, None);
         let install_cli = MenuItem::with_id(
             "install_cli",
             "Install \"bearcad\" Command in PATH",
@@ -331,6 +340,7 @@ impl NativeMenu {
         help_menu.append(&export_session_commands)?;
         help_menu.append(&install_cli)?;
         help_menu.append(&PredefinedMenuItem::separator())?;
+        help_menu.append(&licenses)?;
         help_menu.append(&about)?;
 
         menu.append_items(&[&file_menu, &edit_menu, &view_menu, &help_menu])?;
@@ -354,6 +364,7 @@ impl NativeMenu {
             undo: undo.id().clone(),
             clear: clear.id().clone(),
             about: about.id().clone(),
+            licenses: licenses.id().clone(),
             install_cli: install_cli.id().clone(),
             command_palette: command_palette.id().clone(),
             pane_checks: pane_ids,
@@ -444,6 +455,7 @@ mod tests {
             undo: MenuId::new("undo"),
             clear: MenuId::new("clear"),
             about: MenuId::new("about"),
+            licenses: MenuId::new("licenses"),
             install_cli: MenuId::new("install_cli"),
             command_palette: MenuId::new("command_palette"),
             pane_checks: vec![(Pane::ViewCube, pane_menu_id.clone())],

@@ -14,6 +14,17 @@ Local-first, parametric CAD. Built by robots.
 | Windows (x86_64) | [bearcad.exe](https://github.com/iffy/BearCAD/releases/latest/download/bearcad.exe) |
 | Linux (x86_64) | [bearcad-linux-x86_64.tar.gz](https://github.com/iffy/BearCAD/releases/latest/download/bearcad-linux-x86_64.tar.gz) |
 
+## Docs
+
+Full documentation — a tool-by-tool GUI/navigation reference and the Lua scripting API — lives in
+[`docs-site/`](docs-site/) (a [Docusaurus](https://docusaurus.io/) site) and publishes to
+[iffy.github.io/BearCAD](https://iffy.github.io/BearCAD/) via GitHub Pages once enabled in repo
+settings. Run it locally with:
+
+```sh
+cd docs-site && npm install && npm start
+```
+
 ## Status
 
 - **GUI** with a **wgpu**-accelerated 3D viewport (orbit/pan/zoom, view cube, HUD bear).
@@ -50,6 +61,44 @@ cargo run
 cargo run -- --help    # usage and exit
 cargo test
 ```
+
+## Building with the OCCT kernel
+
+BearCAD's real BREP geometry kernel is [OpenCASCADE (OCCT)](https://dev.opencascade.org/),
+linked in behind the **`occt`** Cargo feature. The feature is **off by default** —
+the standard `cargo build` / `cargo test` above need no C++ toolchain and no OCCT,
+so day-to-day development and CI are unaffected. Build with the kernel like this:
+
+```sh
+# 1. Fetch the pinned OCCT source (once):
+git submodule update --init --depth 1 third_party/OCCT
+
+# 2. Build OCCT as static libraries (needs cmake + a C++17 compiler; takes a while):
+scripts/build-occt.sh
+
+# 3. Build/run BearCAD with the kernel linked in:
+cargo run --features occt
+```
+
+`scripts/build-occt.sh` builds only the modeling toolkits (no visualization or
+data-exchange modules) into `third_party/OCCT/occt-install`, which `build.rs`
+statically links against.
+
+### Recompiling against a different OCCT version
+
+BearCAD links OCCT **statically**. The LGPL 2.1 permits this on the condition that
+you can relink the app against a different (e.g. modified or newer) OCCT. To do
+so, point the **`OCCT_DIR`** environment variable at any OCCT install prefix — one
+containing `include/opencascade/*.hxx` and `lib/libTK*.a` — and rebuild:
+
+```sh
+OCCT_DIR=/path/to/your/occt-install cargo build --features occt
+```
+
+When `OCCT_DIR` is set it takes precedence over the bundled submodule build, so
+you can swap in your own OCCT (from Homebrew, a distro package, or a custom build)
+without touching BearCAD's source. See
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the full licensing story.
 
 ## Script quickstart
 

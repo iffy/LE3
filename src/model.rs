@@ -51,6 +51,21 @@ impl FaceId {
             _ => None,
         }
     }
+
+    /// The extrusion index that owns this face, for the two body-face variants (#26/#27's
+    /// `FaceVertex`/`FaceEdge` dependency tracking piggybacks on this: a sketch on a body face,
+    /// or a constraint referencing that face's own boundary, both depend on the extrusion that
+    /// produced it — same relationship `hierarchy::face_element` already tracks for sketches).
+    pub fn extrusion_index(&self) -> Option<usize> {
+        match self {
+            FaceId::ExtrudeCap { extrusion, .. } | FaceId::ExtrudeSide { extrusion, .. } => {
+                Some(*extrusion)
+            }
+            FaceId::Rect(_) | FaceId::Circle(_) | FaceId::Polygon(_) | FaceId::ConstructionPlane(_) => {
+                None
+            }
+        }
+    }
 }
 
 /// Index into [`Document::sketches`].
@@ -318,15 +333,16 @@ pub struct Line {
     /// `None` means a straight segment (the common case).
     #[serde(default)]
     pub bezier: Option<[(f32, f32); 2]>,
+    /// Set when this line is the bridging line created by a chamfer/fillet vertex treatment
+    /// (#37/#38): the index of the (lower-index) trimmed line it nests under in the Elements
+    /// pane (see [`crate::hierarchy`], #76). `None` for an ordinary line.
+    #[serde(default)]
+    pub chamfer_fillet_parent: Option<usize>,
 }
 
 /// Number of straight sub-segments used to approximate a curved [`Line`] for rendering,
 /// hit-testing, and extrusion tessellation (mirrors [`CIRCLE_SEGMENTS`]-style faceting).
 pub const BEZIER_SEGMENTS: usize = 24;
-
-/// Minimum perpendicular deviation (mm) a drag path must reach before it is treated as
-/// shaping a curve rather than a plain click; below this a line tool drag stays straight.
-const BEZIER_MIN_BULGE_MM: f32 = 1.0;
 
 impl Line {
     pub fn from_local_endpoints(
@@ -349,6 +365,7 @@ impl Line {
             name: None,
             deleted: false,
             bezier: None,
+            chamfer_fillet_parent: None,
         }
     }
 
@@ -388,44 +405,6 @@ fn cubic_bezier_point(p0: (f32, f32), c0: (f32, f32), c1: (f32, f32), p1: (f32, 
     )
 }
 
-/// Derive tangent-handle control points for a line-tool click-drag gesture, from the
-/// sampled pointer path recorded while the button was held. Returns `None` when the path
-/// is too short or too straight to be a deliberate curve (a plain click/tap stays straight).
-///
-/// Finds the path point of maximum perpendicular deviation from the `p0`→`p1` chord and
-/// fits a quadratic bezier through it at t=0.5, then converts to cubic control points.
-pub fn bezier_from_drag_path(p0: (f32, f32), p1: (f32, f32), path: &[(f32, f32)]) -> Option<[(f32, f32); 2]> {
-    if path.len() < 3 {
-        return None;
-    }
-    let cx = p1.0 - p0.0;
-    let cy = p1.1 - p0.1;
-    let chord_len = (cx * cx + cy * cy).sqrt();
-    if chord_len < 1e-6 {
-        return None;
-    }
-    let (nx, ny) = (-cy / chord_len, cx / chord_len);
-    let mut best_dev = 0.0f32;
-    let mut best_point = p0;
-    for &(px, py) in path {
-        let dev = (px - p0.0) * nx + (py - p0.1) * ny;
-        if dev.abs() > best_dev.abs() {
-            best_dev = dev;
-            best_point = (px, py);
-        }
-    }
-    if best_dev.abs() < BEZIER_MIN_BULGE_MM {
-        return None;
-    }
-    let q = (
-        2.0 * best_point.0 - 0.5 * (p0.0 + p1.0),
-        2.0 * best_point.1 - 0.5 * (p0.1 + p1.1),
-    );
-    let c0 = (p0.0 + (2.0 / 3.0) * (q.0 - p0.0), p0.1 + (2.0 / 3.0) * (q.1 - p0.1));
-    let c1 = (p1.0 + (2.0 / 3.0) * (q.0 - p1.0), p1.1 + (2.0 / 3.0) * (q.1 - p1.1));
-    Some([c0, c1])
-}
-
 /// Smooths the joint at a shared vertex `v` between two lines (right-click "convert to bezier
 /// curve"), given each line's other endpoint `a`/`b`. The tangent through `v` runs along the
 /// `a`→`b` chord (Catmull-Rom style), so the curve stays visually smooth across the joint; each
@@ -453,6 +432,14 @@ pub fn smooth_joint_bezier(
     let h2_far = (b.0 + (v.0 - b.0) / 3.0, b.1 + (v.1 - b.1) / 3.0);
 
     ([h1_far, h1_near], [h2_near, h2_far])
+}
+
+/// Default "corner point" tangent handle a third of the way from `from` toward `to`. Used
+/// for a curve-mode segment's own handle when the tangent-constraint toggle is off: each
+/// side of a vertex gets this independent, un-mirrored handle instead of one derived from
+/// [`smooth_joint_bezier`] (#73).
+pub fn independent_corner_handle(from: (f32, f32), to: (f32, f32)) -> (f32, f32) {
+    (from.0 + (to.0 - from.0) / 3.0, from.1 + (to.1 - from.1) / 3.0)
 }
 
 /// Whether a sketch-vertex treatment truncates the two adjoining lines and bridges them with a
@@ -544,6 +531,47 @@ pub fn vertex_treatment_geometry(
     };
 
     Some(VertexTreatmentGeometry { p1, p2, bezier })
+}
+
+/// Which analytic edge family of an extrusion-sourced solid an [`EdgeTreatment`] targets
+/// (#77): a 3D edge chamfer/fillet is a mesh-bevel approximation limited to the two edge
+/// kinds that have a clean analytic definition for a `Rect`/`Polygon` profile — see
+/// `crate::extrude::side_quad_world`/`cap_polygon_world`. A `Circle` profile has neither (its
+/// side is curved, with no discrete side walls — `side_face_count` is 0), so it's out of
+/// scope; so are STL/STEP-imported bodies (no analytic profile at all). See SPEC §3.4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtrusionEdgeRef {
+    /// The vertical edge shared by side walls `edge` and `edge + 1` (mod the profile's vertex
+    /// count) of `face` (an index into [`Extrusion::faces`]) — i.e. the edge at profile vertex
+    /// `(edge + 1) % n`, running the full height from base to top cap.
+    Vertical { face: usize, edge: usize },
+    /// The edge where side wall `edge` of `face` meets a cap: the base cap when `top` is
+    /// `false`, the top cap when `true` (also a `cap_polygon_world` boundary edge).
+    Cap { face: usize, edge: usize, top: bool },
+}
+
+impl ExtrusionEdgeRef {
+    /// The face index this edge belongs to (an index into [`Extrusion::faces`]).
+    pub fn face(self) -> usize {
+        match self {
+            ExtrusionEdgeRef::Vertical { face, .. } => face,
+            ExtrusionEdgeRef::Cap { face, .. } => face,
+        }
+    }
+}
+
+/// A parametric chamfer/fillet bevel applied to one analytic edge of an [`Extrusion`]'s solid
+/// (#77): a mesh-bevel approximation, not a true BREP fillet (no tangent-continuous curved
+/// surface, no vertex-miter blending) — see SPEC §3.4. Re-evaluated from the document every
+/// frame by `crate::extrude::extrusion_mesh`, like everything else in this app; nothing here
+/// is a baked/one-time mesh edit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EdgeTreatment {
+    pub edge: ExtrusionEdgeRef,
+    pub kind: VertexTreatmentKind,
+    /// Chamfer distance or fillet radius (mm); must be positive to have any effect.
+    pub amount: f32,
 }
 
 /// A circle in face-local coordinates (millimetres, per SPEC §5.3).
@@ -666,21 +694,36 @@ pub enum LineEnd {
 }
 
 /// A point-like sketch entity for coincident and other constraints.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Not `Copy`: [`FaceVertex`](Self::FaceVertex) embeds a [`FaceId`], which is not `Copy`
+/// (its `Polygon`/extrusion-profile variants own a `Vec<usize>`). Callers that used to rely on
+/// implicit copies now need an explicit `.clone()`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintPoint {
     LineEndpoint { line: usize, end: LineEnd },
     /// Corner index 0–3 matches [`crate::face::rect_world_corners_in_frame`] order.
     RectCorner { rect: usize, corner: u8 },
     CircleCenter(usize),
+    /// A corner of an extrusion-backed face's own boundary loop (#26/#27): index into
+    /// [`crate::extrude::face_boundary_loop_world`]'s ordered vertex list. Scoped to
+    /// `FaceId::ExtrudeCap`/`FaceId::ExtrudeSide`; other face kinds never resolve. Fixed by
+    /// the body's geometry, not draggable — mirrors [`ConstraintEntity::Origin`].
+    FaceVertex { face: FaceId, index: usize },
 }
 
 /// A line-like sketch entity for parallel, perpendicular, and orientation constraints.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Not `Copy` — see [`ConstraintPoint`]'s doc comment.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintLine {
     Line(usize),
     RectEdge { rect: usize, edge: RectEdge },
+    /// An edge of an extrusion-backed face's own boundary loop (#26/#27): runs from
+    /// `boundary_loop[index]` to `boundary_loop[(index + 1) % boundary_loop.len()]`. Same
+    /// scope and fixed-geometry treatment as [`ConstraintPoint::FaceVertex`].
+    FaceEdge { face: FaceId, index: usize },
 }
 
 /// +1 or -1 disambiguation for constraints with two valid solutions.
@@ -691,7 +734,7 @@ pub fn default_constraint_sign() -> ConstraintSign {
 }
 
 /// Geometry a distance constraint applies to.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DistanceTarget {
     LineLength(usize),
@@ -725,7 +768,7 @@ pub enum DistanceTarget {
 }
 
 /// Target for the dimension tool (distance or angle).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DimensionTarget {
     Distance(DistanceTarget),
@@ -738,7 +781,7 @@ pub enum DimensionTarget {
 }
 
 /// Kind of sketch constraint.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintKind {
     Distance { target: DistanceTarget },
@@ -775,7 +818,7 @@ pub enum ConstraintKind {
 }
 
 /// Point or line reference for coincident constraints.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintEntity {
     Point(ConstraintPoint),
@@ -802,6 +845,19 @@ pub struct Constraint {
     pub deleted: bool,
 }
 
+/// A boolean combination of two coplanar sketch faces (#16/#62): the atomic regions a user
+/// can toggle when two shapes overlap (their shared intersection, or one minus the other).
+/// No `Union` variant is needed — unioning two shapes is already achievable by toggling both
+/// of their whole-shape `ExtrudeFace`s into the same extrusion (pre-existing multi-face
+/// selection), see SPEC.md.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BooleanOp {
+    Intersection,
+    /// `a` minus `b`.
+    Difference,
+}
+
 /// A closed sketch profile (face) included in an extrusion.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -810,15 +866,29 @@ pub enum ExtrudeFace {
     Circle(usize),
     /// A closed loop of plain `Line`s, identified by its ordered line indices (#66).
     Polygon(Vec<usize>),
+    /// A boolean-combined region of two other faces (#16/#62), computed on demand via
+    /// [`crate::polygon_boolean::polygon_boolean`] rather than stored as its own geometry.
+    /// Recursive (`a`/`b` can themselves be `Boolean`) so the data model stays general, even
+    /// though the interactive picker (see `src/face.rs`/`src/main.rs`) only ever constructs
+    /// depth-1 combinations of two raw (`Rect`/`Circle`/`Polygon`) shapes.
+    Boolean {
+        op: BooleanOp,
+        a: Box<ExtrudeFace>,
+        b: Box<ExtrudeFace>,
+    },
 }
 
 impl ExtrudeFace {
-    /// The sketchable face this profile corresponds to.
+    /// The sketchable face this profile corresponds to. For `Boolean`, there's no `FaceId` of
+    /// its own (it's not a stored shape) — this recurses into `a` since `a` and `b` always
+    /// share the same underlying sketch plane, so `a`'s frame (axes/normal) is equally valid;
+    /// only its in-plane origin differs, which callers of `face_id()` don't rely on.
     pub fn face_id(&self) -> FaceId {
         match self {
             ExtrudeFace::Rect(i) => FaceId::Rect(*i),
             ExtrudeFace::Circle(i) => FaceId::Circle(*i),
             ExtrudeFace::Polygon(lines) => FaceId::Polygon(lines.clone()),
+            ExtrudeFace::Boolean { a, .. } => a.face_id(),
         }
     }
 }
@@ -856,6 +926,10 @@ pub struct Extrusion {
     pub name: Option<String>,
     #[serde(default)]
     pub deleted: bool,
+    /// Parametric 3D edge chamfer/fillet bevels applied to this extrusion's own analytic
+    /// side/cap edges (#77) — see [`EdgeTreatment`].
+    #[serde(default)]
+    pub edge_treatments: Vec<EdgeTreatment>,
 }
 
 /// The feature(s) that produced a solid body.
@@ -981,9 +1055,9 @@ pub struct Document {
     pub shape_order: Vec<ShapeKind>,
     /// Document-wide default length unit (context pane, nothing selected; #52).
     ///
-    /// NOTE: this currently only stores/displays the user's choice. It does not yet drive
-    /// bare-number parsing defaults (`src/value.rs` still hardcodes mm) or dimension-label
-    /// formatting (`format_length_display` etc. still hardcode mm) — see SPEC §5.3.
+    /// Drives dimension-label and Elements-pane display formatting via
+    /// [`effective_length_unit`] (#85); bare-number expression parsing is unaffected and
+    /// still defaults to mm.
     #[serde(default)]
     pub default_length_unit: LengthUnit,
     /// Document-wide default angle unit (context pane, nothing selected; #52). Same scope
@@ -1103,15 +1177,6 @@ mod tests {
     }
 
     #[test]
-    fn bezier_from_drag_path_ignores_a_short_or_straight_path() {
-        // Too few samples.
-        assert_eq!(bezier_from_drag_path((0.0, 0.0), (10.0, 0.0), &[(0.0, 0.0), (10.0, 0.0)]), None);
-        // Enough samples but negligible deviation from the chord (a near-straight drag).
-        let straight_path = vec![(0.0, 0.0), (5.0, 0.01), (10.0, 0.0)];
-        assert_eq!(bezier_from_drag_path((0.0, 0.0), (10.0, 0.0), &straight_path), None);
-    }
-
-    #[test]
     fn smooth_joint_bezier_keeps_both_handles_on_the_a_to_b_tangent() {
         let a = (0.0, 0.0);
         let v = (10.0, 0.0);
@@ -1127,20 +1192,10 @@ mod tests {
     }
 
     #[test]
-    fn bezier_from_drag_path_fits_a_curve_through_the_bulge() {
-        let path = vec![(0.0, 0.0), (2.0, 1.0), (5.0, 4.0), (8.0, 1.0), (10.0, 0.0)];
-        let controls = bezier_from_drag_path((0.0, 0.0), (10.0, 0.0), &path);
-        assert!(controls.is_some());
-        let [c0, c1] = controls.unwrap();
-        // Both handles should bulge toward the same side as the drag path (positive y).
-        assert!(c0.1 > 0.0);
-        assert!(c1.1 > 0.0);
-        // Sampling the resulting curve should reproduce a peak near the recorded bulge.
-        let mut line = Line::from_local_endpoints(0, 0.0, 0.0, 10.0, 0.0);
-        line.bezier = Some([c0, c1]);
-        let pts = line.sample_local(BEZIER_SEGMENTS);
-        let peak = pts.iter().cloned().fold(f32::MIN, |acc, (_, y)| acc.max(y));
-        assert!(peak > 2.0);
+    fn independent_corner_handle_sits_a_third_of_the_way_toward_the_target() {
+        let h = independent_corner_handle((0.0, 0.0), (9.0, 6.0));
+        assert!((h.0 - 3.0).abs() < 1e-4);
+        assert!((h.1 - 2.0).abs() < 1e-4);
     }
 
     #[test]
@@ -1335,5 +1390,51 @@ mod tests {
         let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
         let circle = Circle::from_local_center_radius(sketch, 0.0, 0.0, 5.0, 0.0);
         assert!((circle.diameter() - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn default_document_units_are_mm_and_deg() {
+        let doc = Document::default();
+        assert_eq!(doc.default_length_unit, LengthUnit::Mm);
+        assert_eq!(doc.default_angle_unit, AngleUnit::Deg);
+    }
+
+    #[test]
+    fn new_sketch_inherits_document_units_by_default() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        assert_eq!(doc.sketches[sketch].length_unit, None);
+        assert_eq!(doc.sketches[sketch].angle_unit, None);
+        assert_eq!(effective_length_unit(&doc, sketch), LengthUnit::Mm);
+        assert_eq!(effective_angle_unit(&doc, sketch), AngleUnit::Deg);
+    }
+
+    #[test]
+    fn effective_units_follow_document_default_change() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.default_length_unit = LengthUnit::In;
+        doc.default_angle_unit = AngleUnit::Rad;
+        assert_eq!(effective_length_unit(&doc, sketch), LengthUnit::In);
+        assert_eq!(effective_angle_unit(&doc, sketch), AngleUnit::Rad);
+    }
+
+    #[test]
+    fn sketch_override_takes_precedence_over_document_default() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.sketches[sketch].length_unit = Some(LengthUnit::Cm);
+        doc.sketches[sketch].angle_unit = Some(AngleUnit::Rad);
+        assert_eq!(effective_length_unit(&doc, sketch), LengthUnit::Cm);
+        assert_eq!(effective_angle_unit(&doc, sketch), AngleUnit::Rad);
+        // Document default is unaffected by the sketch's override.
+        assert_eq!(doc.default_length_unit, LengthUnit::Mm);
+    }
+
+    #[test]
+    fn effective_units_for_missing_sketch_fall_back_to_document_default() {
+        let doc = Document::default();
+        assert_eq!(effective_length_unit(&doc, 99), LengthUnit::Mm);
+        assert_eq!(effective_angle_unit(&doc, 99), AngleUnit::Deg);
     }
 }

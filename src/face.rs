@@ -1084,6 +1084,7 @@ mod tests {
             expression: String::new(),
             name: None,
             deleted: false,
+            edge_treatments: Vec::new(),
         });
         doc
     }
@@ -1227,6 +1228,7 @@ mod tests {
             expression: String::new(),
             name: None,
             deleted: false,
+            edge_treatments: Vec::new(),
         });
         let profile = crate::model::ExtrudeFace::Circle(0);
         assert_eq!(crate::extrude::side_face_count(&profile), 0);

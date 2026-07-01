@@ -25,7 +25,7 @@ impl SceneSelection {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = SceneElement> + '_ {
-        self.elements.iter().copied()
+        self.elements.iter().cloned()
     }
 
     pub fn clear(&mut self) {
@@ -56,7 +56,7 @@ pub fn click_scene_selection(
     element: SceneElement,
     additive: bool,
 ) {
-    if selection.is_selected(element) {
+    if selection.is_selected(element.clone()) {
         selection.elements.remove(&element);
         return;
     }

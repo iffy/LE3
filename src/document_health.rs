@@ -137,7 +137,7 @@ pub fn selection_frozen_summary(
 ) -> Option<(HealthStatus, String)> {
     let mut worst: Option<(HealthStatus, String)> = None;
     for element in selection.iter() {
-        let status = health.element_status(element);
+        let status = health.element_status(element.clone());
         if !status.is_frozen() {
             continue;
         }
@@ -156,35 +156,50 @@ pub fn selection_frozen_summary(
     worst
 }
 
-fn scene_element_for_distance_target(target: DistanceTarget) -> SceneElement {
+fn scene_element_for_distance_target(target: &DistanceTarget) -> SceneElement {
     match target {
-        DistanceTarget::LineLength(index) => SceneElement::Line(index),
+        DistanceTarget::LineLength(index) => SceneElement::Line(*index),
         DistanceTarget::RectWidth(index) | DistanceTarget::RectHeight(index) => {
-            SceneElement::Rect(index)
+            SceneElement::Rect(*index)
         }
-        DistanceTarget::CircleDiameter(index) => SceneElement::Circle(index),
+        DistanceTarget::CircleDiameter(index) => SceneElement::Circle(*index),
         DistanceTarget::LineLineDistance { line_a, .. } => scene_element_for_line(line_a),
         DistanceTarget::PointPointDistance { anchor, .. } => scene_element_for_point(anchor),
         DistanceTarget::PointLineDistance { point, .. } => scene_element_for_point(point),
     }
 }
 
-fn scene_element_for_line(line: ConstraintLine) -> SceneElement {
+fn scene_element_for_line(line: &ConstraintLine) -> SceneElement {
     match line {
-        ConstraintLine::Line(index) => SceneElement::Line(index),
-        ConstraintLine::RectEdge { rect, .. } => SceneElement::Rect(rect),
+        ConstraintLine::Line(index) => SceneElement::Line(*index),
+        ConstraintLine::RectEdge { rect, .. } => SceneElement::Rect(*rect),
+        // A face's own edge depends on the extrusion that produced the face — same
+        // relationship `hierarchy::face_element` tracks for sketches placed on a body face.
+        ConstraintLine::FaceEdge { face, .. } => scene_element_for_face(face),
     }
 }
 
-fn scene_element_for_point(point: ConstraintPoint) -> SceneElement {
+fn scene_element_for_point(point: &ConstraintPoint) -> SceneElement {
     match point {
-        ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(line),
-        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(rect),
-        ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(circle),
+        ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(*line),
+        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(*rect),
+        ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(*circle),
+        ConstraintPoint::FaceVertex { face, .. } => scene_element_for_face(face),
     }
 }
 
-fn scene_element_for_dimension_target(target: DimensionTarget) -> SceneElement {
+/// Best-effort owner element for a `FaceVertex`/`FaceEdge`'s face: the extrusion that produced
+/// it (`SceneElement::Extrusion`) for the extrusion-backed faces these ever resolve to; falls
+/// back to the constraint itself (a no-op "owner") for any other `FaceId`, which should not
+/// occur in practice since `face_boundary_loop_world` never resolves for those.
+fn scene_element_for_face(face: &crate::model::FaceId) -> SceneElement {
+    // `usize::MAX` never indexes a real extrusion, so this resolves as a dead/unhealthy
+    // reference rather than a real element — `face_boundary_loop_world` never resolves for
+    // non-extrusion `FaceId`s in the first place, so this arm should be unreachable.
+    SceneElement::Extrusion(face.extrusion_index().unwrap_or(usize::MAX))
+}
+
+fn scene_element_for_dimension_target(target: &DimensionTarget) -> SceneElement {
     match target {
         DimensionTarget::Distance(distance) => scene_element_for_distance_target(distance),
         DimensionTarget::Angle { line_a, .. } => scene_element_for_line(line_a),
@@ -196,7 +211,7 @@ pub fn require_dimension_target_editable(
     doc: &Document,
     target: DimensionTarget,
 ) -> Result<(), String> {
-    require_element_editable(health, scene_element_for_dimension_target(target))?;
+    require_element_editable(health, scene_element_for_dimension_target(&target))?;
     if let Some(index) = find_dimension_constraint(doc, target) {
         require_element_editable(health, SceneElement::Constraint(index))?;
     }
@@ -209,10 +224,10 @@ pub fn require_constraint_editable(
     constraint: usize,
 ) -> Result<(), String> {
     require_element_editable(health, SceneElement::Constraint(constraint))?;
-    let Some(kind) = doc.constraints.get(constraint).map(|c| c.kind) else {
+    let Some(kind) = doc.constraints.get(constraint).map(|c| c.kind.clone()) else {
         return Ok(());
     };
-    match kind {
+    match &kind {
         ConstraintKind::Distance { target } => {
             require_element_editable(health, scene_element_for_distance_target(target))?;
         }
@@ -233,7 +248,7 @@ pub fn require_element_editable(
     health: &DocumentHealth,
     element: SceneElement,
 ) -> Result<(), String> {
-    match health.selection_frozen(element) {
+    match health.selection_frozen(element.clone()) {
         Some(status) => Err(
             health
                 .element_reason(element)
@@ -277,10 +292,13 @@ pub fn recompute_document_health(doc: &Document) -> DocumentHealth {
     health
 }
 
-fn geometry_elements_for_line(line: ConstraintLine) -> Vec<SceneElement> {
+fn geometry_elements_for_line(line: &ConstraintLine) -> Vec<SceneElement> {
     match line {
-        ConstraintLine::Line(index) => vec![SceneElement::Line(index)],
-        ConstraintLine::RectEdge { rect, edge } => vec![SceneElement::RectEdge(rect, edge)],
+        ConstraintLine::Line(index) => vec![SceneElement::Line(*index)],
+        ConstraintLine::RectEdge { rect, edge } => vec![SceneElement::RectEdge(*rect, *edge)],
+        // A face's own edge isn't owned by anything markable-unstable in the usual sense (it
+        // can't move); surface it via the extrusion instead, same as `scene_element_for_line`.
+        ConstraintLine::FaceEdge { face, .. } => vec![scene_element_for_face(face)],
     }
 }
 
@@ -290,7 +308,7 @@ fn mark_invalid_constraints_and_unstable_geometry(doc: &Document, health: &mut D
             continue;
         }
         let element = SceneElement::Constraint(index);
-        match constraint.kind {
+        match &constraint.kind {
             ConstraintKind::Distance { target } => {
                 if !distance_target_alive(doc, target) {
                     set_element_invalid(
@@ -449,20 +467,21 @@ fn mark_invalid_constraints_and_unstable_geometry(doc: &Document, health: &mut D
     }
 }
 
-fn geometry_elements_for_entity(entity: ConstraintEntity) -> Vec<SceneElement> {
+fn geometry_elements_for_entity(entity: &ConstraintEntity) -> Vec<SceneElement> {
     match entity {
         ConstraintEntity::Point(point) => vec![point_owner_element(point)],
         ConstraintEntity::Line(line) => geometry_elements_for_line(line),
-        ConstraintEntity::Circle(circle) => vec![SceneElement::Circle(circle)],
+        ConstraintEntity::Circle(circle) => vec![SceneElement::Circle(*circle)],
         ConstraintEntity::Origin => Vec::new(),
     }
 }
 
-fn point_owner_element(point: ConstraintPoint) -> SceneElement {
+fn point_owner_element(point: &ConstraintPoint) -> SceneElement {
     match point {
-        ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(line),
-        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(rect),
-        ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(circle),
+        ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(*line),
+        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(*rect),
+        ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(*circle),
+        ConstraintPoint::FaceVertex { face, .. } => scene_element_for_face(face),
     }
 }
 
@@ -525,11 +544,11 @@ fn set_element_invalid(
     reason: String,
     snapshot: Option<ElementSnapshot>,
 ) {
-    if health.element_status(element) == HealthStatus::Invalid {
+    if health.element_status(element.clone()) == HealthStatus::Invalid {
         return;
     }
-    capture_element_snapshot(health, doc, element, snapshot);
-    health.elements.insert(element, HealthStatus::Invalid);
+    capture_element_snapshot(health, doc, element.clone(), snapshot);
+    health.elements.insert(element.clone(), HealthStatus::Invalid);
     health.element_reasons.insert(element, reason);
 }
 
@@ -539,17 +558,17 @@ fn mark_unstable_geometry(
     element: SceneElement,
     reason: String,
 ) {
-    if !element_alive(doc, element) {
+    if !element_alive(doc, element.clone()) {
         return;
     }
-    if health.element_status(element) == HealthStatus::Invalid {
+    if health.element_status(element.clone()) == HealthStatus::Invalid {
         return;
     }
-    if health.element_status(element) == HealthStatus::Unstable {
+    if health.element_status(element.clone()) == HealthStatus::Unstable {
         return;
     }
-    capture_element_snapshot(health, doc, element, None);
-    health.elements.insert(element, HealthStatus::Unstable);
+    capture_element_snapshot(health, doc, element.clone(), None);
+    health.elements.insert(element.clone(), HealthStatus::Unstable);
     health.element_reasons.insert(element, reason);
 }
 
@@ -595,7 +614,7 @@ fn capture_element_snapshot(
     }
     if let Some(snapshot) = snapshot {
         health.element_snapshots.insert(element, snapshot);
-    } else if let Some(snapshot) = capture_geometry_snapshot(doc, element) {
+    } else if let Some(snapshot) = capture_geometry_snapshot(doc, element.clone()) {
         health.element_snapshots.insert(element, snapshot);
     }
 }
@@ -739,6 +758,69 @@ mod tests {
         assert_eq!(
             health.element_status(SceneElement::Sketch(sketch)),
             HealthStatus::Healthy
+        );
+    }
+
+    /// #26/#27: a constraint referencing a `FaceVertex`/`FaceEdge` must be flagged unhealthy
+    /// (not panic) once the extrusion that produced the face is deleted.
+    #[test]
+    fn constraint_on_deleted_extrusion_face_vertex_is_invalid_not_a_panic() {
+        use crate::model::{ConstraintEntity, ConstraintPoint, ExtrudeFace, Extrusion, LineEnd};
+
+        let mut doc = Document::default();
+        let base_sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.rects
+            .push(crate::model::Rect::from_local_corners(base_sketch, 0.0, 0.0, 20.0, 20.0));
+        doc.shape_order.push(ShapeKind::Rect);
+        doc.extrusions.push(Extrusion {
+            sketch: base_sketch,
+            faces: vec![ExtrudeFace::Rect(0)],
+            distance: 10.0,
+            target: None,
+            expression: String::new(),
+            name: None,
+            deleted: false,
+            edge_treatments: Vec::new(),
+        });
+        doc.shape_order.push(ShapeKind::Extrusion);
+
+        let cap = FaceId::ExtrudeCap {
+            extrusion: 0,
+            profile: ExtrudeFace::Rect(0),
+            top: true,
+        };
+        let sketch = doc.add_sketch(cap.clone());
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 3.0, 4.0, 8.0, 1.0));
+        doc.shape_order.push(ShapeKind::Line);
+        let point = ConstraintPoint::LineEndpoint { line: 0, end: LineEnd::Start };
+        doc.constraints.push(Constraint {
+            sketch,
+            kind: ConstraintKind::Coincident {
+                a: ConstraintEntity::Point(point),
+                b: ConstraintEntity::Point(ConstraintPoint::FaceVertex { face: cap, index: 2 }),
+            },
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+        doc.shape_order.push(ShapeKind::Constraint);
+
+        // Healthy while the extrusion (and its face) is still alive.
+        let health = recompute_document_health(&doc);
+        assert_eq!(
+            health.element_status(SceneElement::Constraint(0)),
+            HealthStatus::Healthy
+        );
+
+        // Deleting the extrusion should never panic (the reference must degrade gracefully),
+        // and the constraint must now be flagged invalid.
+        tombstone_element(&mut doc, SceneElement::Extrusion(0));
+        let health = recompute_document_health(&doc);
+        assert_eq!(
+            health.element_status(SceneElement::Constraint(0)),
+            HealthStatus::Invalid
         );
     }
 }

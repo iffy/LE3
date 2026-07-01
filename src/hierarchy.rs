@@ -5,7 +5,8 @@ pub const PANE_TITLE: &str = "Elements";
 
 use crate::actions::SketchSession;
 use crate::icons::{
-    icon_button, icon_for_constraint_kind, icon_for_visibility, sized_texture, IconId,
+    icon_button, icon_for_constraint_kind, icon_for_visibility, selectable_icon_button,
+    sized_texture, IconId,
 };
 use crate::document_health::{DocumentHealth, HealthStatus};
 use crate::document_lifecycle::{element_alive, sketch_alive};
@@ -24,6 +25,12 @@ use std::collections::{HashMap, HashSet};
 /// tiebreak when two nodes share a creation rank, so sibling ordering is deterministic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HierarchyNode {
+    /// Synthetic singleton root shown at the top of the Elements pane; every other
+    /// top-level node (root construction planes, orphaned extrusions, orphaned bodies)
+    /// nests under it. It carries no index — there is exactly one per document — and has
+    /// no corresponding [`SceneElement`]: it isn't individually selectable, hideable, or
+    /// otherwise dispatched through the scene graph (see [`scene_element_for_node`]).
+    Document,
     ConstructionPlane(usize),
     Sketch(SketchId),
     Rect(usize),
@@ -35,7 +42,11 @@ pub enum HierarchyNode {
 }
 
 /// Identifies an element whose visibility can be toggled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// Not `Copy` — see [`crate::model::ConstraintPoint`]'s doc comment: `Point` embeds a
+/// `ConstraintPoint`, which embeds a `FaceId` for `FaceVertex` (#26/#27), and `FaceId` isn't
+/// `Copy`. Callers that used to rely on implicit copies now need an explicit `.clone()`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SceneElement {
     ConstructionPlane(usize),
     Sketch(SketchId),
@@ -47,21 +58,28 @@ pub enum SceneElement {
     Constraint(usize),
     Extrusion(usize),
     Body(usize),
+    /// An edge of an extrusion-backed body face's own boundary loop (#26/#27), for
+    /// constraint-authoring selection — mirrors `Point` wrapping the whole `ConstraintPoint`
+    /// enum; only ever constructed with `ConstraintLine::FaceEdge` (the `Line`/`RectEdge`
+    /// variants already have their own dedicated `SceneElement::Line`/`RectEdge`).
+    FaceEdge(ConstraintLine),
 }
 
-impl From<HierarchyNode> for SceneElement {
-    fn from(node: HierarchyNode) -> Self {
-        match node {
-            HierarchyNode::ConstructionPlane(i) => SceneElement::ConstructionPlane(i),
-            HierarchyNode::Sketch(i) => SceneElement::Sketch(i),
-            HierarchyNode::Rect(i) => SceneElement::Rect(i),
-            HierarchyNode::Line(i) => SceneElement::Line(i),
-            HierarchyNode::Circle(i) => SceneElement::Circle(i),
-            HierarchyNode::Constraint(i) => SceneElement::Constraint(i),
-            HierarchyNode::Extrusion(i) => SceneElement::Extrusion(i),
-            HierarchyNode::Body(i) => SceneElement::Body(i),
-        }
-    }
+/// The [`SceneElement`] a hierarchy node dispatches through for selection, visibility,
+/// and health lookups — `None` for [`HierarchyNode::Document`], the synthetic root, which
+/// has no independent selectable/hideable identity of its own.
+pub fn scene_element_for_node(node: HierarchyNode) -> Option<SceneElement> {
+    Some(match node {
+        HierarchyNode::Document => return None,
+        HierarchyNode::ConstructionPlane(i) => SceneElement::ConstructionPlane(i),
+        HierarchyNode::Sketch(i) => SceneElement::Sketch(i),
+        HierarchyNode::Rect(i) => SceneElement::Rect(i),
+        HierarchyNode::Line(i) => SceneElement::Line(i),
+        HierarchyNode::Circle(i) => SceneElement::Circle(i),
+        HierarchyNode::Constraint(i) => SceneElement::Constraint(i),
+        HierarchyNode::Extrusion(i) => SceneElement::Extrusion(i),
+        HierarchyNode::Body(i) => SceneElement::Body(i),
+    })
 }
 
 /// User-toggled visibility for scene elements. Absent entries are visible.
@@ -84,13 +102,13 @@ impl ElementVisibility {
     }
 
     pub fn toggle(&mut self, element: SceneElement) -> bool {
-        let next = !self.is_visible(element);
+        let next = !self.is_visible(element.clone());
         self.set_visible(element, next);
         next
     }
 
     pub fn effective_visible(&self, doc: &Document, element: SceneElement) -> bool {
-        if !self.is_visible(element) {
+        if !self.is_visible(element.clone()) {
             return false;
         }
         match element {
@@ -132,6 +150,18 @@ impl ElementVisibility {
                         })
                     })
             }
+            // A face's own edge tracks the extrusion that produced its face, same as
+            // `FaceVertex` in `point_effective_visible` below.
+            SceneElement::FaceEdge(line) => {
+                let extrusion = match &line {
+                    ConstraintLine::FaceEdge { face, .. } => face.extrusion_index(),
+                    ConstraintLine::Line(_) | ConstraintLine::RectEdge { .. } => None,
+                };
+                self.effective_visible(
+                    doc,
+                    SceneElement::Extrusion(extrusion.unwrap_or(usize::MAX)),
+                )
+            }
         }
     }
 }
@@ -151,6 +181,14 @@ fn point_effective_visible(
         ConstraintPoint::CircleCenter(circle) => doc.circles.get(circle).is_some_and(|entity| {
             visibility.effective_visible(doc, SceneElement::Sketch(entity.sketch))
         }),
+        // A face's own vertex tracks the extrusion that produced its face — same dependency
+        // `face_element` gives a sketch placed on a body cap/side wall.
+        ConstraintPoint::FaceVertex { face, .. } => visibility.effective_visible(
+            doc,
+            face.extrusion_index()
+                .map(SceneElement::Extrusion)
+                .unwrap_or(SceneElement::Extrusion(usize::MAX)),
+        ),
     }
 }
 
@@ -174,6 +212,115 @@ fn face_element(face: FaceId) -> SceneElement {
 pub struct HierarchyEntry {
     pub node: HierarchyNode,
     pub children: Vec<HierarchyEntry>,
+}
+
+/// Which layout the Elements pane renders its nodes in (#issue 34). This is an ephemeral UI
+/// preference, not document data — it's stored on `App` (see `selected_bezier_handle` in
+/// main.rs for the same convention) and threaded into [`show_pane`], never persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HierarchyViewMode {
+    /// Flat, topologically-sorted list (the pre-existing default view).
+    #[default]
+    List,
+    /// The real nested tree, each level indented farther than its parent.
+    Tree,
+    /// A 2D node-link diagram: column = depth, row = position within that column.
+    Graph,
+}
+
+/// One node's position in the graph-node view's deterministic column/row layout — pure data,
+/// no `egui` types, so it's directly unit-testable. Column equals tree depth; row is the
+/// node's sequential position within that column in tree-walk (pre-order, depth-first) order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphNodePosition {
+    pub node: HierarchyNode,
+    pub parent: Option<HierarchyNode>,
+    pub depth: usize,
+    pub column: usize,
+    pub row: usize,
+}
+
+/// Compute the graph-node view's layout: depth-first walk of `tree`, assigning each node a
+/// column (its depth) and a row (its sequential order within that column). Deterministic and
+/// non-force-directed, per #34 — the whole graph is meant to fit horizontally by construction
+/// (column count is bounded by tree depth), with height handled by vertical scrolling.
+pub fn graph_node_positions(tree: &[HierarchyEntry]) -> Vec<GraphNodePosition> {
+    fn walk(
+        entry: &HierarchyEntry,
+        depth: usize,
+        parent: Option<HierarchyNode>,
+        next_row_in_column: &mut HashMap<usize, usize>,
+        out: &mut Vec<GraphNodePosition>,
+    ) {
+        let row = next_row_in_column.entry(depth).or_insert(0);
+        let this_row = *row;
+        *row += 1;
+        out.push(GraphNodePosition {
+            node: entry.node,
+            parent,
+            depth,
+            column: depth,
+            row: this_row,
+        });
+        for child in &entry.children {
+            walk(child, depth + 1, Some(entry.node), next_row_in_column, out);
+        }
+    }
+
+    let mut next_row_in_column = HashMap::new();
+    let mut positions = Vec::new();
+    for entry in tree {
+        walk(entry, 0, None, &mut next_row_in_column, &mut positions);
+    }
+    positions
+}
+
+/// Find `node`'s entry anywhere in `tree` (not just at the root — e.g. a sketch nests under
+/// its construction plane).
+fn find_hierarchy_entry(tree: &[HierarchyEntry], node: HierarchyNode) -> Option<&HierarchyEntry> {
+    for entry in tree {
+        if entry.node == node {
+            return Some(entry);
+        }
+        if let Some(found) = find_hierarchy_entry(&entry.children, node) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn collect_entry_descendants(entry: &HierarchyEntry, out: &mut HashSet<HierarchyNode>) {
+    for child in &entry.children {
+        out.insert(child.node);
+        collect_entry_descendants(child, out);
+    }
+}
+
+/// The graph-node view's highlight set for a selected node: the node itself, all its
+/// ancestors (walked via the parent links from [`graph_node_positions`]), and all its
+/// descendants (walked via `tree`'s own nested `children`, no `SceneElement` lookups needed —
+/// the tree structure already gives parent/child relationships directly).
+pub fn graph_related_nodes(tree: &[HierarchyEntry], selected: HierarchyNode) -> HashSet<HierarchyNode> {
+    let positions = graph_node_positions(tree);
+    let parent_of: HashMap<HierarchyNode, HierarchyNode> = positions
+        .iter()
+        .filter_map(|p| p.parent.map(|parent| (p.node, parent)))
+        .collect();
+
+    let mut related = HashSet::new();
+    related.insert(selected);
+
+    let mut current = selected;
+    while let Some(&parent) = parent_of.get(&current) {
+        related.insert(parent);
+        current = parent;
+    }
+
+    if let Some(entry) = find_hierarchy_entry(tree, selected) {
+        collect_entry_descendants(entry, &mut related);
+    }
+
+    related
 }
 
 #[derive(Clone, Debug, Default)]
@@ -243,6 +390,8 @@ fn build_creation_ranks(doc: &Document) -> CreationRanks {
 
 fn creation_rank(ranks: &CreationRanks, node: HierarchyNode) -> usize {
     match node {
+        // Always the sole tree root; rank is irrelevant since it has no siblings.
+        HierarchyNode::Document => 0,
         HierarchyNode::ConstructionPlane(i) => *ranks.planes.get(&i).unwrap_or(&i),
         HierarchyNode::Sketch(i) => *ranks.sketches.get(&i).unwrap_or(&i),
         HierarchyNode::Rect(i) => *ranks.rects.get(&i).unwrap_or(&i),
@@ -255,6 +404,10 @@ fn creation_rank(ranks: &CreationRanks, node: HierarchyNode) -> usize {
 }
 
 /// Build the hierarchy tree for the current view context.
+///
+/// Returns a single-element vec: the synthetic [`HierarchyNode::Document`] root, with every
+/// former top-level item (root construction planes, orphaned extrusions, orphaned bodies)
+/// nested as its children (#87).
 pub fn build_hierarchy(
     doc: &Document,
     sketch_session: Option<SketchSession>,
@@ -297,7 +450,10 @@ pub fn build_hierarchy(
             });
         }
     }
-    roots
+    vec![HierarchyEntry {
+        node: HierarchyNode::Document,
+        children: roots,
+    }]
 }
 
 /// Flat element list: parents always above descendants; newer elements after older ones when possible.
@@ -401,6 +557,9 @@ fn parent_element(doc: &Document, element: SceneElement) -> Option<SceneElement>
                 .first()
                 .map(|&ei| SceneElement::Extrusion(ei))
         }),
+        // A face's own edge isn't a hierarchy-pane node in its own right (it's a constraint
+        // reference, not an independently listed element) — no parent to nest under.
+        SceneElement::FaceEdge(_) => None,
     }
 }
 
@@ -412,13 +571,17 @@ fn point_parent_element(doc: &Document, point: ConstraintPoint) -> Option<SceneE
             .map(|_| SceneElement::Line(line)),
         ConstraintPoint::RectCorner { rect, .. } => Some(SceneElement::Rect(rect)),
         ConstraintPoint::CircleCenter(circle) => Some(SceneElement::Circle(circle)),
+        // A face's own vertex nests under the extrusion that produced its face.
+        ConstraintPoint::FaceVertex { face, .. } => {
+            face.extrusion_index().map(SceneElement::Extrusion)
+        }
     }
 }
 
 fn collect_ancestors(doc: &Document, element: SceneElement, out: &mut HashSet<SceneElement>) {
     let mut current = element;
     while let Some(parent) = parent_element(doc, current) {
-        out.insert(parent);
+        out.insert(parent.clone());
         current = parent;
     }
 }
@@ -501,18 +664,19 @@ fn collect_descendants(doc: &Document, element: SceneElement, out: &mut HashSet<
         | SceneElement::RectEdge(_, _)
         | SceneElement::Constraint(_)
         | SceneElement::Point(_)
-        | SceneElement::Body(_) => {}
+        | SceneElement::Body(_)
+        | SceneElement::FaceEdge(_) => {}
     }
 }
 
-fn selection_anchor(element: SceneElement) -> SceneElement {
+fn selection_anchor(element: &SceneElement) -> SceneElement {
     match element {
-        SceneElement::RectEdge(index, _) => SceneElement::Rect(index),
-        other => other,
+        SceneElement::RectEdge(index, _) => SceneElement::Rect(*index),
+        other => other.clone(),
     }
 }
 
-fn distance_target_touches_element(target: DistanceTarget, element: SceneElement) -> bool {
+fn distance_target_touches_element(target: &DistanceTarget, element: &SceneElement) -> bool {
     match (target, element) {
         (DistanceTarget::LineLength(i), SceneElement::Line(j)) => i == j,
         (DistanceTarget::RectWidth(r) | DistanceTarget::RectHeight(r), SceneElement::Rect(i)) => {
@@ -546,7 +710,7 @@ fn distance_target_touches_element(target: DistanceTarget, element: SceneElement
     }
 }
 
-fn constraint_line_touches_element(line: ConstraintLine, element: SceneElement) -> bool {
+fn constraint_line_touches_element(line: &ConstraintLine, element: &SceneElement) -> bool {
     match (line, element) {
         (ConstraintLine::Line(i), SceneElement::Line(j)) => i == j,
         (
@@ -561,11 +725,16 @@ fn constraint_line_touches_element(line: ConstraintLine, element: SceneElement) 
             ConstraintLine::RectEdge { rect, .. },
             SceneElement::Point(ConstraintPoint::RectCorner { rect: r, .. }),
         ) => rect == r,
+        (ConstraintLine::FaceEdge { face, index }, SceneElement::Point(ConstraintPoint::FaceVertex {
+            face: f,
+            index: i,
+        })) => face == f && (*index == *i || (*index + 1) == *i),
+        (ConstraintLine::FaceEdge { .. }, _) => false,
         _ => false,
     }
 }
 
-fn constraint_point_touches_element(point: ConstraintPoint, element: SceneElement) -> bool {
+fn constraint_point_touches_element(point: &ConstraintPoint, element: &SceneElement) -> bool {
     match (point, element) {
         (p, SceneElement::Point(q)) => p == q,
         (ConstraintPoint::LineEndpoint { line, .. }, SceneElement::Line(i)) => line == i,
@@ -576,16 +745,16 @@ fn constraint_point_touches_element(point: ConstraintPoint, element: SceneElemen
     }
 }
 
-fn constraint_entity_touches_element(entity: ConstraintEntity, element: SceneElement) -> bool {
+fn constraint_entity_touches_element(entity: &ConstraintEntity, element: &SceneElement) -> bool {
     match entity {
         ConstraintEntity::Point(point) => constraint_point_touches_element(point, element),
         ConstraintEntity::Line(line) => constraint_line_touches_element(line, element),
-        ConstraintEntity::Circle(circle) => element == SceneElement::Circle(circle),
+        ConstraintEntity::Circle(circle) => *element == SceneElement::Circle(*circle),
         ConstraintEntity::Origin => false,
     }
 }
 
-fn constraint_kind_touches_element(kind: ConstraintKind, element: SceneElement) -> bool {
+fn constraint_kind_touches_element(kind: &ConstraintKind, element: &SceneElement) -> bool {
     match kind {
         ConstraintKind::Distance { target } => distance_target_touches_element(target, element),
         ConstraintKind::Parallel { line_a, line_b }
@@ -621,7 +790,7 @@ fn constraints_for_element(doc: &Document, element: SceneElement) -> Vec<usize> 
         .iter()
         .enumerate()
         .filter_map(|(index, constraint)| {
-            constraint_kind_touches_element(constraint.kind, element).then_some(index)
+            constraint_kind_touches_element(&constraint.kind, &element).then_some(index)
         })
         .collect()
 }
@@ -633,9 +802,10 @@ pub fn selection_related_constraints(
 ) -> HashSet<usize> {
     let mut related = HashSet::new();
     for element in selection.iter() {
-        let anchor = selection_anchor(element);
+        let anchor = selection_anchor(&element);
+        let anchor_differs = anchor != element;
         related.extend(constraints_for_element(doc, anchor));
-        if anchor != element {
+        if anchor_differs {
             related.extend(constraints_for_element(doc, element));
         }
     }
@@ -649,9 +819,9 @@ pub fn selection_context_elements(
 ) -> HashSet<SceneElement> {
     let mut context = HashSet::new();
     for element in selection.iter() {
-        let anchor = selection_anchor(element);
-        context.insert(anchor);
-        collect_ancestors(doc, anchor, &mut context);
+        let anchor = selection_anchor(&element);
+        context.insert(anchor.clone());
+        collect_ancestors(doc, anchor.clone(), &mut context);
         collect_descendants(doc, anchor, &mut context);
     }
     for index in selection_related_constraints(doc, selection) {
@@ -679,9 +849,9 @@ const UNSTABLE_TEXT: Color32 = Color32::from_rgb(255, 180, 60);
 /// Accent for rows whose dimension uses the focused variable.
 const USES_VARIABLE_TEXT: Color32 = Color32::from_rgb(120, 215, 230);
 
-fn row_is_selected(element: SceneElement, selection: &SceneSelection) -> bool {
-    selection.is_selected(element)
-        || matches!(element, SceneElement::Rect(index) if selection.has_rect_edge_selected(index))
+fn row_is_selected(element: &SceneElement, selection: &SceneSelection) -> bool {
+    selection.is_selected(element.clone())
+        || matches!(element, SceneElement::Rect(index) if selection.has_rect_edge_selected(*index))
 }
 
 /// Only dim the list when a selected element is actually shown in it.
@@ -691,10 +861,10 @@ fn selection_styles_visible_list(elements: &[HierarchyNode], selection: &SceneSe
     }
     let list_elements: HashSet<SceneElement> = elements
         .iter()
-        .map(|node| scene_element_for_node(*node))
+        .filter_map(|node| scene_element_for_node(*node))
         .collect();
     selection.iter().any(|element| {
-        let anchor = selection_anchor(element);
+        let anchor = selection_anchor(&element);
         list_elements.contains(&anchor)
     })
 }
@@ -708,7 +878,7 @@ fn row_style(
     health: &DocumentHealth,
     highlight_elements: &HashSet<SceneElement>,
 ) -> RowStyle {
-    match health.element_status(element) {
+    match health.element_status(element.clone()) {
         HealthStatus::Invalid => return RowStyle::Invalid,
         HealthStatus::Unstable => return RowStyle::Unstable,
         HealthStatus::Healthy => {}
@@ -724,9 +894,9 @@ fn row_style(
     if !style_selection {
         return RowStyle::Normal;
     }
-    if row_is_selected(element, selection) {
+    if row_is_selected(&element, selection) {
         RowStyle::Selected
-    } else if matches!(element, SceneElement::Constraint(index) if related_constraints.contains(&index)) {
+    } else if matches!(&element, SceneElement::Constraint(index) if related_constraints.contains(index)) {
         RowStyle::RelatedConstraint
     } else if context.contains(&element) {
         RowStyle::InContext
@@ -757,8 +927,11 @@ fn icon_tint_for_row_style(style: RowStyle) -> Color32 {
     }
 }
 
-fn icon_for_hierarchy_node(doc: &Document, node: HierarchyNode) -> IconId {
-    match node {
+/// Icon for a hierarchy row, or `None` when no existing icon fits (the synthetic Document
+/// root — nothing in [`IconId`] represents "the whole document", so it renders without one).
+fn icon_for_hierarchy_node(doc: &Document, node: HierarchyNode) -> Option<IconId> {
+    Some(match node {
+        HierarchyNode::Document => return None,
         HierarchyNode::ConstructionPlane(_) => IconId::Plane,
         HierarchyNode::Sketch(_) => IconId::Sketch,
         HierarchyNode::Rect(_) => IconId::Rectangle,
@@ -767,11 +940,11 @@ fn icon_for_hierarchy_node(doc: &Document, node: HierarchyNode) -> IconId {
         HierarchyNode::Constraint(index) => doc
             .constraints
             .get(index)
-            .map(|constraint| icon_for_constraint_kind(constraint.kind))
+            .map(|constraint| icon_for_constraint_kind(&constraint.kind))
             .unwrap_or(IconId::Constraint),
         HierarchyNode::Extrusion(_) => IconId::Extrude,
         HierarchyNode::Body(_) => IconId::Body,
-    }
+    })
 }
 
 /// Primary double-click on a row label (fallback when [`egui::Response::double_clicked`] misses).
@@ -859,10 +1032,33 @@ fn build_sketch_entry(
             if line.deleted || line.sketch != sketch {
                 continue;
             }
-            children.push(HierarchyEntry {
+            let entry = HierarchyEntry {
                 node: HierarchyNode::Line(li),
                 children: vec![],
-            });
+            };
+            // A chamfer/fillet bridging line (#76) nests under the (lower-index) trimmed line
+            // it came from, rather than sitting as an ordinary sibling. Since `chamfer_fillet_
+            // parent` is always a lower line index, and `doc.lines` is iterated in index order,
+            // the parent's entry is always already in `children` by the time we get here. If
+            // the parent is gone (tombstoned) or otherwise not found — same graceful-orphan
+            // handling as elsewhere in this file — fall back to a top-level sibling instead of
+            // dropping the bridging line from the tree.
+            if let Some(parent) = line.chamfer_fillet_parent {
+                let alive_parent = doc
+                    .lines
+                    .get(parent)
+                    .is_some_and(|p| !p.deleted && p.sketch == sketch);
+                if alive_parent {
+                    if let Some(parent_entry) = children
+                        .iter_mut()
+                        .find(|e| e.node == HierarchyNode::Line(parent))
+                    {
+                        parent_entry.children.push(entry);
+                        continue;
+                    }
+                }
+            }
+            children.push(entry);
         }
         for (ci, circle) in doc.circles.iter().enumerate() {
             if circle.deleted || circle.sketch != sketch {
@@ -962,11 +1158,8 @@ pub fn node_label(doc: &Document, node: HierarchyNode) -> String {
     names::node_label(doc, node)
 }
 
-pub fn scene_element_for_node(node: HierarchyNode) -> SceneElement {
-    SceneElement::from(node)
-}
-
 /// Draw the elements list in a side panel.
+#[allow(clippy::too_many_arguments)]
 pub fn show_pane(
     ui: &mut egui::Ui,
     doc: &Document,
@@ -974,6 +1167,7 @@ pub fn show_pane(
     visibility: &mut ElementVisibility,
     selection: &SceneSelection,
     health: &DocumentHealth,
+    view_mode: &mut HierarchyViewMode,
     on_edit_sketch: &mut impl FnMut(SketchId),
     on_edit_plane: &mut impl FnMut(usize),
     on_edit_extrusion: &mut impl FnMut(usize),
@@ -983,43 +1177,106 @@ pub fn show_pane(
     on_click_element: &mut impl FnMut(SceneElement, bool),
     highlight_elements: &HashSet<SceneElement>,
 ) {
-    ui.heading(PANE_TITLE);
+    ui.horizontal(|ui| {
+        ui.heading(PANE_TITLE);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for (mode, icon, tooltip) in [
+                (HierarchyViewMode::Graph, IconId::ViewGraph, "Graph-node view"),
+                (HierarchyViewMode::Tree, IconId::ViewTree, "Tree view"),
+                (HierarchyViewMode::List, IconId::ViewList, "List view"),
+            ] {
+                if selectable_icon_button(ui, icon, *view_mode == mode, tooltip).clicked() {
+                    *view_mode = mode;
+                }
+            }
+        });
+    });
     ui.separator();
 
     let context = selection_context_elements(doc, selection);
     let related_constraints = selection_related_constraints(doc, selection);
-    let elements = build_element_list(doc, sketch_session);
-    let style_selection = selection_styles_visible_list(&elements, selection);
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        for node in elements {
-            show_row(
+    match view_mode {
+        HierarchyViewMode::List => {
+            let elements = build_element_list(doc, sketch_session);
+            let style_selection = selection_styles_visible_list(&elements, selection);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for node in elements {
+                    show_row(
+                        ui,
+                        doc,
+                        node,
+                        1,
+                        visibility,
+                        selection,
+                        health,
+                        &context,
+                        &related_constraints,
+                        style_selection,
+                        on_edit_sketch,
+                        on_edit_plane,
+                        on_edit_extrusion,
+                        on_export_body,
+                        on_export_body_step,
+                        on_toggle_visibility,
+                        on_click_element,
+                        highlight_elements,
+                    );
+                }
+            });
+        }
+        HierarchyViewMode::Tree => {
+            let tree = build_hierarchy(doc, sketch_session);
+            let flat_elements = build_element_list(doc, sketch_session);
+            let style_selection = selection_styles_visible_list(&flat_elements, selection);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                show_tree_entries(
+                    ui,
+                    doc,
+                    &tree,
+                    0,
+                    visibility,
+                    selection,
+                    health,
+                    &context,
+                    &related_constraints,
+                    style_selection,
+                    on_edit_sketch,
+                    on_edit_plane,
+                    on_edit_extrusion,
+                    on_export_body,
+                    on_export_body_step,
+                    on_toggle_visibility,
+                    on_click_element,
+                    highlight_elements,
+                );
+            });
+        }
+        HierarchyViewMode::Graph => {
+            let tree = build_hierarchy(doc, sketch_session);
+            show_graph_view(
                 ui,
                 doc,
-                node,
-                visibility,
+                &tree,
                 selection,
                 health,
                 &context,
                 &related_constraints,
-                style_selection,
-                on_edit_sketch,
-                on_edit_plane,
-                on_edit_extrusion,
-                on_export_body,
-                on_export_body_step,
-                on_toggle_visibility,
                 on_click_element,
                 highlight_elements,
             );
         }
-    });
+    }
 }
 
-fn show_row(
+/// Recursively render `entries` (and their nested children) at increasing indent, per #34's
+/// Tree view — depth 0 is the synthetic Document root, depth 1 its direct children, etc.
+#[allow(clippy::too_many_arguments)]
+fn show_tree_entries(
     ui: &mut egui::Ui,
     doc: &Document,
-    node: HierarchyNode,
+    entries: &[HierarchyEntry],
+    depth: usize,
     visibility: &mut ElementVisibility,
     selection: &SceneSelection,
     health: &DocumentHealth,
@@ -1035,13 +1292,250 @@ fn show_row(
     on_click_element: &mut impl FnMut(SceneElement, bool),
     highlight_elements: &HashSet<SceneElement>,
 ) {
-    let element = scene_element_for_node(node);
-    if !element_alive(doc, element) {
+    for entry in entries {
+        show_row(
+            ui,
+            doc,
+            entry.node,
+            depth,
+            visibility,
+            selection,
+            health,
+            context,
+            related_constraints,
+            style_selection,
+            on_edit_sketch,
+            on_edit_plane,
+            on_edit_extrusion,
+            on_export_body,
+            on_export_body_step,
+            on_toggle_visibility,
+            on_click_element,
+            highlight_elements,
+        );
+        show_tree_entries(
+            ui,
+            doc,
+            &entry.children,
+            depth + 1,
+            visibility,
+            selection,
+            health,
+            context,
+            related_constraints,
+            style_selection,
+            on_edit_sketch,
+            on_edit_plane,
+            on_edit_extrusion,
+            on_export_body,
+            on_export_body_step,
+            on_toggle_visibility,
+            on_click_element,
+            highlight_elements,
+        );
+    }
+}
+
+/// Accent stroke for graph-view edges/nodes among the selected node's ancestors and
+/// descendants. Row styling has no direct line-drawing equivalent to reuse, so this is a
+/// dedicated bold accent, distinct from the node fill colors (which do reuse
+/// [`icon_tint_for_row_style`] for consistency with the List/Tree views).
+const GRAPH_RELATED_EDGE: Color32 = Color32::from_rgb(120, 200, 255);
+
+/// Render the graph-node view: a 2D node-link diagram laid out by [`graph_node_positions`]
+/// (column = depth, row = position within that column), constrained to the pane's width and
+/// scrollable vertically (#34).
+#[allow(clippy::too_many_arguments)]
+fn show_graph_view(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    tree: &[HierarchyEntry],
+    selection: &SceneSelection,
+    health: &DocumentHealth,
+    context: &HashSet<SceneElement>,
+    related_constraints: &HashSet<usize>,
+    on_click_element: &mut impl FnMut(SceneElement, bool),
+    highlight_elements: &HashSet<SceneElement>,
+) {
+    let positions = graph_node_positions(tree);
+    if positions.is_empty() {
         return;
     }
-    let visible = visibility.effective_visible(doc, element);
+
+    let max_depth = positions.iter().map(|p| p.depth).max().unwrap_or(0);
+    let max_row = positions.iter().map(|p| p.row).max().unwrap_or(0);
+    const COLUMN_MIN: f32 = 90.0;
+    const ROW_HEIGHT: f32 = 40.0;
+    const NODE_RADIUS: f32 = 9.0;
+
+    // Nodes matching the current selection, plus their tree ancestors/descendants (#34): the
+    // set of related nodes whose edges/fills get the bold accent.
+    let mut related_nodes: HashSet<HierarchyNode> = HashSet::new();
+    for position in &positions {
+        if let Some(element) = scene_element_for_node(position.node) {
+            if row_is_selected(&element, selection) {
+                related_nodes.extend(graph_related_nodes(tree, position.node));
+            }
+        }
+    }
+    // Only dim unrelated nodes once something is actually selected — same convention as
+    // `selection_styles_visible_list` uses for the List/Tree rows.
+    let style_selection = !selection.is_empty();
+
+    let available_width = ui.available_width().max(COLUMN_MIN);
+    let column_width = (available_width / (max_depth as f32 + 1.0)).max(COLUMN_MIN);
+    let content_width = column_width * (max_depth as f32 + 1.0);
+    let content_height = (max_row as f32 + 1.0) * ROW_HEIGHT + ROW_HEIGHT;
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let (rect, _response) =
+                ui.allocate_exact_size(egui::vec2(content_width, content_height), egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+
+            let pos_of = |p: &GraphNodePosition| -> egui::Pos2 {
+                egui::pos2(
+                    rect.left() + (p.column as f32 + 0.5) * column_width,
+                    rect.top() + (p.row as f32 + 0.5) * ROW_HEIGHT + ROW_HEIGHT * 0.5,
+                )
+            };
+            let by_node: HashMap<HierarchyNode, &GraphNodePosition> =
+                positions.iter().map(|p| (p.node, p)).collect();
+
+            // Edges first, so node dots paint over the line endpoints.
+            for position in &positions {
+                let Some(parent) = position.parent else { continue };
+                let Some(parent_position) = by_node.get(&parent) else { continue };
+                let highlighted =
+                    related_nodes.contains(&position.node) && related_nodes.contains(&parent);
+                let stroke = if highlighted {
+                    egui::Stroke::new(2.5, GRAPH_RELATED_EDGE)
+                } else {
+                    egui::Stroke::new(1.0, Color32::from_gray(110))
+                };
+                painter.line_segment([pos_of(parent_position), pos_of(position)], stroke);
+            }
+
+            for position in &positions {
+                let center = pos_of(position);
+                let element = scene_element_for_node(position.node);
+                let style = element.clone().map(|el| {
+                    row_style(
+                        el,
+                        selection,
+                        context,
+                        related_constraints,
+                        style_selection,
+                        health,
+                        highlight_elements,
+                    )
+                });
+                let selected = style == Some(RowStyle::Selected);
+                let related = related_nodes.contains(&position.node);
+                let fill = if selected {
+                    Color32::WHITE
+                } else if related {
+                    GRAPH_RELATED_EDGE
+                } else {
+                    style.map(icon_tint_for_row_style).unwrap_or(Color32::from_gray(170))
+                };
+
+                let node_rect =
+                    egui::Rect::from_center_size(center, egui::Vec2::splat(NODE_RADIUS * 2.0));
+                let id = ui.id().with(("hierarchy_graph_node", position.node));
+                let response = ui.interact(node_rect, id, egui::Sense::click());
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if let Some(element) = element {
+                    let response = response.on_hover_text(node_label(doc, position.node));
+                    if response.clicked() {
+                        let additive = ui.input(|i| additive_click_modifiers(&i.modifiers));
+                        on_click_element(element, additive);
+                    }
+                }
+
+                painter.circle_filled(center, NODE_RADIUS, fill);
+                painter.circle_stroke(center, NODE_RADIUS, egui::Stroke::new(1.0, Color32::from_gray(30)));
+
+                let label = node_label(doc, position.node);
+                let max_label_width = (column_width - NODE_RADIUS * 2.0 - 10.0).max(20.0);
+                let truncated = truncate_label(&label, max_label_width, &painter);
+                painter.text(
+                    center + egui::vec2(NODE_RADIUS + 4.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    truncated,
+                    egui::FontId::default(),
+                    if selected || related { Color32::WHITE } else { Color32::from_gray(200) },
+                );
+            }
+        });
+}
+
+/// Truncate `label` (with an ellipsis) so it fits within `max_width` pixels at the default
+/// font — graph-node labels must stay inside their column (#34).
+fn truncate_label(label: &str, max_width: f32, painter: &egui::Painter) -> String {
+    let font_id = egui::FontId::default();
+    let galley_width =
+        |s: &str| -> f32 { painter.layout_no_wrap(s.to_string(), font_id.clone(), Color32::WHITE).size().x };
+    if galley_width(label) <= max_width {
+        return label.to_string();
+    }
+    let mut truncated = String::new();
+    for ch in label.chars() {
+        let candidate = format!("{truncated}{ch}…");
+        if galley_width(&candidate) > max_width {
+            break;
+        }
+        truncated.push(ch);
+    }
+    format!("{truncated}…")
+}
+
+fn show_row(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    node: HierarchyNode,
+    depth: usize,
+    visibility: &mut ElementVisibility,
+    selection: &SceneSelection,
+    health: &DocumentHealth,
+    context: &HashSet<SceneElement>,
+    related_constraints: &HashSet<usize>,
+    style_selection: bool,
+    on_edit_sketch: &mut impl FnMut(SketchId),
+    on_edit_plane: &mut impl FnMut(usize),
+    on_edit_extrusion: &mut impl FnMut(usize),
+    on_export_body: &mut impl FnMut(usize),
+    on_export_body_step: &mut impl FnMut(usize),
+    on_toggle_visibility: &mut impl FnMut(SceneElement, bool),
+    on_click_element: &mut impl FnMut(SceneElement, bool),
+    highlight_elements: &HashSet<SceneElement>,
+) {
+    // The synthetic Document root has no SceneElement — it isn't selectable, hideable, or
+    // otherwise dispatched through the scene graph — so it gets a minimal, always-shown row
+    // and returns before any of the SceneElement-keyed lookups below. Every other row is
+    // indented `depth` levels (List always passes 1, matching #87's original single level;
+    // Tree passes the node's real depth in the nested hierarchy, #34).
+    if matches!(node, HierarchyNode::Document) {
+        ui.horizontal(|ui| {
+            if let Some(icon) = icon_for_hierarchy_node(doc, node) {
+                ui.add(egui::Image::new(sized_texture(ui.ctx(), icon)));
+            }
+            ui.label(RichText::new(node_label(doc, node)).strong());
+        });
+        return;
+    }
+
+    let element = scene_element_for_node(node)
+        .expect("non-Document HierarchyNode always maps to a SceneElement");
+    if !element_alive(doc, element.clone()) {
+        return;
+    }
+    let visible = visibility.effective_visible(doc, element.clone());
     let style = row_style(
-        element,
+        element.clone(),
         selection,
         context,
         related_constraints,
@@ -1051,6 +1545,7 @@ fn show_row(
     );
 
     ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 18.0);
         if icon_button(
             ui,
             icon_for_visibility(visible),
@@ -1058,14 +1553,16 @@ fn show_row(
         )
         .clicked()
         {
-            let next = visibility.toggle(element);
-            on_toggle_visibility(element, next);
+            let next = visibility.toggle(element.clone());
+            on_toggle_visibility(element.clone(), next);
         }
 
-        let icon = icon_for_hierarchy_node(doc, node);
-        ui.add(
-            egui::Image::new(sized_texture(ui.ctx(), icon)).tint(icon_tint_for_row_style(style)),
-        );
+        if let Some(icon) = icon_for_hierarchy_node(doc, node) {
+            ui.add(
+                egui::Image::new(sized_texture(ui.ctx(), icon))
+                    .tint(icon_tint_for_row_style(style)),
+            );
+        }
 
         let label = node_label(doc, node);
         let response = ui.selectable_label(
@@ -1073,6 +1570,7 @@ fn show_row(
             styled_label(&label, style),
         );
         match node {
+            HierarchyNode::Document => unreachable!("handled by the early return above"),
             HierarchyNode::Sketch(sketch) => {
                 let additive = ui.input(|i| additive_click_modifiers(&i.modifiers));
                 match sketch_row_action(
@@ -1167,6 +1665,74 @@ mod tests {
     }
 
     #[test]
+    fn default_document_hierarchy_has_single_document_root() {
+        let doc = Document::default();
+        let tree = build_hierarchy(&doc, None);
+        assert_eq!(tree.len(), 1, "hierarchy should have exactly one root: {tree:?}");
+        assert_eq!(tree[0].node, HierarchyNode::Document);
+        // The default document's lone construction plane nests under Document rather than
+        // sitting as a second root (#87).
+        assert_eq!(
+            tree[0].children.iter().map(|c| c.node).collect::<Vec<_>>(),
+            vec![HierarchyNode::ConstructionPlane(0)]
+        );
+
+        let list = build_element_list(&doc, None);
+        assert_eq!(
+            list,
+            vec![HierarchyNode::Document, HierarchyNode::ConstructionPlane(0)]
+        );
+    }
+
+    #[test]
+    fn root_level_items_nest_under_document_root() {
+        use crate::document_lifecycle::tombstone_element;
+
+        let mut doc = Document::default();
+        // A second root-level construction plane (#87: root planes nest under Document,
+        // not as separate roots).
+        doc.construction_planes.push(default_xy_plane());
+        doc.shape_order.push(ShapeKind::ConstructionPlane);
+
+        // An orphaned extrusion: its sketch is tombstoned (unreachable), but the extrusion
+        // itself is not cascaded away, so it must still surface — as a Document child, not
+        // a top-level root.
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.extrusions.push(crate::model::Extrusion {
+            sketch,
+            faces: Vec::new(),
+            distance: 5.0,
+            target: None,
+            expression: String::new(),
+            name: None,
+            deleted: false,
+            edge_treatments: Vec::new(),
+        });
+        assert!(tombstone_element(&mut doc, SceneElement::Sketch(sketch)));
+        assert!(!sketch_alive(&doc, sketch));
+
+        // An orphaned body (STL import, no source extrusion, #70) also nests under Document.
+        doc.imported_meshes.push(crate::model::ImportedMesh {
+            triangles: vec![[glam::Vec3::ZERO, glam::Vec3::X, glam::Vec3::Y]],
+            source_name: "part".to_string(),
+        });
+        doc.bodies.push(crate::model::Body {
+            source: crate::model::BodySource::Imported(0),
+            name: None,
+            deleted: false,
+        });
+
+        let tree = build_hierarchy(&doc, None);
+        assert_eq!(tree.len(), 1, "hierarchy should have exactly one root: {tree:?}");
+        assert_eq!(tree[0].node, HierarchyNode::Document);
+        let children: Vec<HierarchyNode> = tree[0].children.iter().map(|c| c.node).collect();
+        assert!(children.contains(&HierarchyNode::ConstructionPlane(0)));
+        assert!(children.contains(&HierarchyNode::ConstructionPlane(1)));
+        assert!(children.contains(&HierarchyNode::Extrusion(0)));
+        assert!(children.contains(&HierarchyNode::Body(0)));
+    }
+
+    #[test]
     fn imported_mesh_body_surfaces_at_top_level() {
         let mut doc = Document::default();
         doc.imported_meshes.push(crate::model::ImportedMesh {
@@ -1200,6 +1766,7 @@ mod tests {
         doc.shape_order.push(ShapeKind::ConstructionPlane);
 
         let expected = vec![
+            HierarchyNode::Document,
             HierarchyNode::ConstructionPlane(0),
             HierarchyNode::ConstructionPlane(1),
             HierarchyNode::ConstructionPlane(2),
@@ -1233,24 +1800,25 @@ mod tests {
 
         assert_eq!(
             icon_for_hierarchy_node(&doc, HierarchyNode::ConstructionPlane(0)),
-            IconId::Plane
+            Some(IconId::Plane)
         );
         assert_eq!(
             icon_for_hierarchy_node(&doc, HierarchyNode::Sketch(0)),
-            IconId::Sketch
+            Some(IconId::Sketch)
         );
         assert_eq!(
             icon_for_hierarchy_node(&doc, HierarchyNode::Rect(0)),
-            IconId::Rectangle
+            Some(IconId::Rectangle)
         );
         assert_eq!(
             icon_for_hierarchy_node(&doc, HierarchyNode::Line(0)),
-            IconId::Line
+            Some(IconId::Line)
         );
         assert_eq!(
             icon_for_hierarchy_node(&doc, HierarchyNode::Constraint(0)),
-            IconId::Parallel
+            Some(IconId::Parallel)
         );
+        assert_eq!(icon_for_hierarchy_node(&doc, HierarchyNode::Document), None);
     }
 
     #[test]
@@ -1287,10 +1855,11 @@ mod tests {
     fn main_view_lists_planes_and_sketches_only() {
         let doc = doc_with_plane_sketches();
         let list = build_element_list(&doc, None);
-        assert_eq!(list.len(), 3);
-        assert_eq!(list[0], HierarchyNode::ConstructionPlane(0));
-        assert_eq!(list[1], HierarchyNode::Sketch(0));
-        assert_eq!(list[2], HierarchyNode::Sketch(1));
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[0], HierarchyNode::Document);
+        assert_eq!(list[1], HierarchyNode::ConstructionPlane(0));
+        assert_eq!(list[2], HierarchyNode::Sketch(0));
+        assert_eq!(list[3], HierarchyNode::Sketch(1));
     }
 
     #[test]
@@ -1300,6 +1869,7 @@ mod tests {
         assert_eq!(
             list,
             vec![
+                HierarchyNode::Document,
                 HierarchyNode::ConstructionPlane(0),
                 HierarchyNode::Sketch(0),
                 HierarchyNode::Sketch(1),
@@ -1311,6 +1881,7 @@ mod tests {
         assert_eq!(
             list,
             vec![
+                HierarchyNode::Document,
                 HierarchyNode::ConstructionPlane(0),
                 HierarchyNode::Sketch(0),
                 HierarchyNode::Sketch(1),
@@ -1350,6 +1921,7 @@ mod tests {
         assert_eq!(
             list,
             vec![
+                HierarchyNode::Document,
                 HierarchyNode::ConstructionPlane(0),
                 HierarchyNode::Sketch(0),
                 HierarchyNode::Circle(0),
@@ -1371,6 +1943,7 @@ mod tests {
         assert_eq!(
             list,
             vec![
+                HierarchyNode::Document,
                 HierarchyNode::ConstructionPlane(0),
                 HierarchyNode::Sketch(0),
                 HierarchyNode::Rect(0),
@@ -1394,6 +1967,7 @@ mod tests {
             expression: String::new(),
             name: None,
             deleted: false,
+            edge_treatments: Vec::new(),
         });
         doc.bodies.push(crate::model::Body {
             source: crate::model::BodySource::Extrusion(0),
@@ -1442,11 +2016,105 @@ mod tests {
         assert_eq!(
             list,
             vec![
+                HierarchyNode::Document,
                 HierarchyNode::ConstructionPlane(0),
                 HierarchyNode::Sketch(0),
                 HierarchyNode::ConstructionPlane(1),
             ]
         );
+    }
+
+    /// Recursively finds `node`'s entry anywhere in the tree (entries aren't just roots — e.g.
+    /// a sketch nests under its construction-plane root).
+    fn find_entry(entries: &[HierarchyEntry], node: HierarchyNode) -> Option<&HierarchyEntry> {
+        for entry in entries {
+            if entry.node == node {
+                return Some(entry);
+            }
+            if let Some(found) = find_entry(&entry.children, node) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn chamfer_fillet_bridge_line_nests_under_lower_index_trimmed_line() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 10.0, 0.0, 10.0, 10.0));
+        let mut bridge = Line::from_local_endpoints(sketch, 7.0, 0.0, 10.0, 3.0);
+        bridge.chamfer_fillet_parent = Some(0);
+        doc.lines.push(bridge);
+        doc.shape_order.extend([ShapeKind::Line, ShapeKind::Line, ShapeKind::Line]);
+
+        let tree = build_hierarchy(&doc, Some(SketchSession { sketch }));
+        let sketch_entry = find_entry(&tree, HierarchyNode::Sketch(sketch)).expect("sketch entry");
+        // The bridge (line 2) is *not* a top-level sibling of the sketch's lines...
+        assert!(!sketch_entry
+            .children
+            .iter()
+            .any(|c| c.node == HierarchyNode::Line(2)));
+        // ...it nests under line 0 (the lower-index trimmed line, #76).
+        let line0_entry = sketch_entry
+            .children
+            .iter()
+            .find(|c| c.node == HierarchyNode::Line(0))
+            .expect("line 0 entry");
+        assert_eq!(line0_entry.children, vec![HierarchyEntry {
+            node: HierarchyNode::Line(2),
+            children: vec![],
+        }]);
+
+        // The flat list keeps line 0 before its nested bridge, and still includes line 1.
+        let list = build_element_list(&doc, Some(SketchSession { sketch }));
+        let l0 = list.iter().position(|n| *n == HierarchyNode::Line(0)).unwrap();
+        let l1 = list.iter().position(|n| *n == HierarchyNode::Line(1));
+        let l2 = list.iter().position(|n| *n == HierarchyNode::Line(2)).unwrap();
+        assert!(l0 < l2, "parent line must come before the nested bridge");
+        assert!(l1.is_some(), "the other trimmed line must still be listed");
+    }
+
+    #[test]
+    fn chamfer_fillet_bridge_line_falls_back_to_top_level_when_parent_is_gone() {
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let mut bridge = Line::from_local_endpoints(sketch, 7.0, 0.0, 10.0, 3.0);
+        // Points at a parent index that doesn't exist (e.g. the parent line was later removed
+        // by undo) — must degrade gracefully to a top-level row, not panic or vanish.
+        bridge.chamfer_fillet_parent = Some(99);
+        doc.lines.push(bridge);
+        doc.shape_order.extend([ShapeKind::Line, ShapeKind::Line]);
+
+        let tree = build_hierarchy(&doc, Some(SketchSession { sketch }));
+        let sketch_entry = find_entry(&tree, HierarchyNode::Sketch(sketch)).expect("sketch entry");
+        assert!(sketch_entry
+            .children
+            .iter()
+            .any(|c| c.node == HierarchyNode::Line(1)));
+
+        // Also degrades gracefully when the recorded parent line exists but is tombstoned.
+        let mut doc2 = Document::default();
+        let sketch2 = doc2.add_sketch(FaceId::ConstructionPlane(0));
+        doc2.lines
+            .push(Line::from_local_endpoints(sketch2, 0.0, 0.0, 10.0, 0.0));
+        doc2.lines[0].deleted = true;
+        let mut bridge2 = Line::from_local_endpoints(sketch2, 7.0, 0.0, 10.0, 3.0);
+        bridge2.chamfer_fillet_parent = Some(0);
+        doc2.lines.push(bridge2);
+        doc2.shape_order.extend([ShapeKind::Line, ShapeKind::Line]);
+        let tree2 = build_hierarchy(&doc2, Some(SketchSession { sketch: sketch2 }));
+        let sketch_entry2 =
+            find_entry(&tree2, HierarchyNode::Sketch(sketch2)).expect("sketch entry");
+        assert!(sketch_entry2
+            .children
+            .iter()
+            .any(|c| c.node == HierarchyNode::Line(1)));
     }
 
     #[test]
@@ -1781,5 +2449,125 @@ mod tests {
     #[test]
     fn pane_title_is_elements() {
         assert_eq!(PANE_TITLE, "Elements");
+    }
+
+    /// A plane, a sketch with a rect, and an extrusion (owning a body) built from it — the
+    /// small fixture #34's Graph-view layout/highlight tests exercise, built with the sketch
+    /// under an active session so its rect shows up in the tree (see `build_sketch_entry`:
+    /// plain sketch geometry is only listed while that sketch is being edited).
+    fn doc_with_plane_sketch_rect_and_extrusion() -> (Document, SketchId) {
+        use crate::model::{Body, BodySource, ExtrudeFace, Extrusion};
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
+        doc.extrusions.push(Extrusion {
+            sketch,
+            faces: vec![ExtrudeFace::Rect(0)],
+            distance: 5.0,
+            target: None,
+            expression: String::new(),
+            name: None,
+            deleted: false,
+            edge_treatments: Vec::new(),
+        });
+        doc.bodies.push(Body {
+            source: BodySource::Extrusion(0),
+            name: None,
+            deleted: false,
+        });
+        (doc, sketch)
+    }
+
+    #[test]
+    fn graph_layout_assigns_column_by_depth_and_row_by_visit_order() {
+        let (doc, sketch) = doc_with_plane_sketch_rect_and_extrusion();
+        let tree = build_hierarchy(&doc, Some(SketchSession { sketch }));
+        let positions = graph_node_positions(&tree);
+
+        let find = |node: HierarchyNode| {
+            positions
+                .iter()
+                .find(|p| p.node == node)
+                .unwrap_or_else(|| panic!("missing position for {node:?}: {positions:?}"))
+        };
+
+        assert_eq!(positions.len(), 6, "{positions:?}");
+
+        let root = find(HierarchyNode::Document);
+        assert_eq!((root.depth, root.column, root.row, root.parent), (0, 0, 0, None));
+
+        let plane = find(HierarchyNode::ConstructionPlane(0));
+        assert_eq!(
+            (plane.depth, plane.column, plane.row, plane.parent),
+            (1, 1, 0, Some(HierarchyNode::Document))
+        );
+
+        let sketch_pos = find(HierarchyNode::Sketch(0));
+        assert_eq!(
+            (sketch_pos.depth, sketch_pos.column, sketch_pos.row, sketch_pos.parent),
+            (2, 2, 0, Some(HierarchyNode::ConstructionPlane(0)))
+        );
+
+        // Rect and Extrusion are siblings under Sketch(0), so they share a column (depth 3)
+        // but get distinct, visit-order rows.
+        let rect = find(HierarchyNode::Rect(0));
+        let extrusion = find(HierarchyNode::Extrusion(0));
+        assert_eq!((rect.depth, rect.column, rect.parent), (3, 3, Some(HierarchyNode::Sketch(0))));
+        assert_eq!(
+            (extrusion.depth, extrusion.column, extrusion.parent),
+            (3, 3, Some(HierarchyNode::Sketch(0)))
+        );
+        assert_ne!(rect.row, extrusion.row, "siblings in the same column need distinct rows");
+
+        let body = find(HierarchyNode::Body(0));
+        assert_eq!(
+            (body.depth, body.column, body.row, body.parent),
+            (4, 4, 0, Some(HierarchyNode::Extrusion(0)))
+        );
+    }
+
+    #[test]
+    fn graph_highlight_includes_ancestors_and_descendants_but_not_siblings() {
+        let (doc, sketch) = doc_with_plane_sketch_rect_and_extrusion();
+        let tree = build_hierarchy(&doc, Some(SketchSession { sketch }));
+
+        // Selecting the leaf Rect(0) highlights its ancestor chain up to the root, but not
+        // its sibling Extrusion(0) (or Extrusion's own descendant Body(0)).
+        let related = graph_related_nodes(&tree, HierarchyNode::Rect(0));
+        assert_eq!(
+            related,
+            HashSet::from([
+                HierarchyNode::Rect(0),
+                HierarchyNode::Sketch(0),
+                HierarchyNode::ConstructionPlane(0),
+                HierarchyNode::Document,
+            ])
+        );
+
+        // Selecting an internal node (Sketch(0)) highlights the full subtree under it, plus
+        // its own ancestors.
+        let related = graph_related_nodes(&tree, HierarchyNode::Sketch(0));
+        assert_eq!(
+            related,
+            HashSet::from([
+                HierarchyNode::Sketch(0),
+                HierarchyNode::ConstructionPlane(0),
+                HierarchyNode::Document,
+                HierarchyNode::Rect(0),
+                HierarchyNode::Extrusion(0),
+                HierarchyNode::Body(0),
+            ])
+        );
+
+        // The root has no ancestors, only its whole subtree.
+        let related = graph_related_nodes(&tree, HierarchyNode::Document);
+        assert_eq!(related.len(), 6, "{related:?}");
+    }
+
+    #[test]
+    fn hierarchy_view_mode_defaults_to_list() {
+        assert_eq!(HierarchyViewMode::default(), HierarchyViewMode::List);
     }
 }

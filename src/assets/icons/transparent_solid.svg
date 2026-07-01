@@ -1,5 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <!-- isometric cube, translucent fill: the far edges show through the body -->
-  <polygon points="16,4 28,10 28,22 16,28 4,22 4,10" fill="currentColor" fill-opacity="0.32" />
+  <!-- isometric cube, translucent fill (opacity matches the real renderer's
+       TRANSPARENT_SOLID_OPACITY): bumped up from a faint 0.32 so it reads as a clearly hazy
+       filled cube rather than looking like plain wireframe.svg at a glance (#80) -->
+  <polygon points="16,4 28,10 28,22 16,28 4,22 4,10" fill="currentColor" fill-opacity="0.45" />
   <path d="M28 10 L16 16 L4 10 M16 16 L16 28" />
 </svg>

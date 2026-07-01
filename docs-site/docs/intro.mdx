@@ -1,0 +1,62 @@
+---
+sidebar_position: 1
+title: Overview
+---
+
+import VersionBadge from '@site/src/components/VersionBadge';
+
+# BearCAD
+
+<VersionBadge /> — this badge tracks the `version` in the workspace root
+[`Cargo.toml`](https://github.com/iffy/BearCAD/blob/master/Cargo.toml) (see
+the note at the bottom of this page for why).
+
+BearCAD is a local-first, parametric CAD application: an [egui](https://github.com/emilk/egui)/`eframe`
+desktop GUI with a `wgpu`-accelerated 3D viewport, driven by a shared action layer that also
+powers a Lua scripting API. Everything achievable in the GUI is achievable from a script, and
+vice versa.
+
+These docs are split into two sections:
+
+- **[Tools & Navigation](/tools)** — what each toolbar tool does, how sketching and dimensioning
+  work, and how to move around the 3D viewport (orbit/pan/zoom, the view-cube HUD, sketch mode).
+- **[Scripting](/scripting)** — the Lua API: the declarative `bearcad.*` modeling namespace, the
+  `bearcad.ui.*` simulated-interaction namespace, and how to run a script from the command line.
+
+## Quick start
+
+```sh
+cargo run
+```
+
+Pick a face with the **Sketch** tool (or start on the default ground plane), then draw with
+**Rectangle**, **Line**, or **Circle**. Type dimensions while drawing, **Tab** cycles fields,
+**Enter** commits. **Right-drag** orbits the camera; **Shift+right-drag** pans; the mouse wheel
+zooms. See [Tools & Navigation](/tools) for the full tool-by-tool reference.
+
+To drive the app from a script instead:
+
+```sh
+cargo run -- --script examples/rectangle.lua --exit
+```
+
+See [Scripting](/scripting) for the full API.
+
+## Where this content comes from
+
+This documentation is grounded directly in the project's authoritative behavior spec,
+[`SPEC.md`](https://github.com/iffy/BearCAD/blob/master/SPEC.md), plus the keyboard-shortcut
+source of truth (`src/shortcuts.rs`), the toolbar icon list (`src/icons.rs`), and realistic
+usage examples mined from the Lua test suite (`src/lua_script.rs`) and `examples/*.lua`. If the
+app's behavior changes, these docs should be updated alongside `SPEC.md` in the same change (see
+this repo's spec-sync convention).
+
+:::note Version scope decision
+The version badge above reads `Cargo.toml`'s `[package].version`, not "the version at the top of
+`CHANGELOG.md`". As of this writing `CHANGELOG.md` is empty — this project accumulates
+per-change snippets under `changes/*.md` via the `changer` CLI, but nothing has run `changer
+bump`/`changer release` yet to consolidate them into a versioned `CHANGELOG.md`. Once real
+releases start landing there, this badge (and the footer copyright line) should switch to
+reading `CHANGELOG.md`'s top entry instead — see the comment in `docusaurus.config.js`. This is a
+deliberate first-draft scope cut, not an oversight.
+:::

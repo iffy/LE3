@@ -1,0 +1,1 @@
+Optional statically-linked OpenCASCADE (OCCT) geometry kernel behind the off-by-default `occt` feature (#86): OCCT git submodule, scripts/build-occt.sh, a thin C++ FFI shim (cpp/) behind a safe `kernel` Rust module, box-volume pilot round-trip, a Help > Licenses menu item, THIRD_PARTY_LICENSES.md, and README build/relink instructions.

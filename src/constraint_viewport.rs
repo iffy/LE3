@@ -50,22 +50,15 @@ pub struct ConstraintIconHit {
 
 pub fn constraint_line_world_endpoints(
     doc: &Document,
+    sketch: SketchId,
     line: ConstraintLine,
 ) -> Option<(Vec3, Vec3)> {
-    let sketch = constraint_line_sketch(doc, line)?;
-    let ((u0, v0), (u1, v1)) = line_uv_endpoints(doc, line).ok()?;
+    let ((u0, v0), (u1, v1)) = line_uv_endpoints(doc, sketch, line).ok()?;
     let frame = sketch_geometry_frame(doc, sketch)?;
     Some((
         local_to_world(&frame, u0, v0),
         local_to_world(&frame, u1, v1),
     ))
-}
-
-fn constraint_line_sketch(doc: &Document, line: ConstraintLine) -> Option<SketchId> {
-    match line {
-        ConstraintLine::Line(index) => doc.lines.get(index).map(|l| l.sketch),
-        ConstraintLine::RectEdge { rect, .. } => doc.rects.get(rect).map(|r| r.sketch),
-    }
 }
 
 fn midpoint(a: Vec3, b: Vec3) -> Vec3 {
@@ -80,7 +73,7 @@ fn entity_world_position(
     match entity {
         ConstraintEntity::Point(point) => point_world_position(doc, point),
         ConstraintEntity::Line(line) => {
-            let (a, b) = constraint_line_world_endpoints(doc, line)?;
+            let (a, b) = constraint_line_world_endpoints(doc, sketch, line)?;
             Some(midpoint(a, b))
         }
         ConstraintEntity::Circle(circle) => {
@@ -98,15 +91,16 @@ fn build_graphic(doc: &Document, index: usize) -> Option<ConstraintViewportGraph
         return None;
     }
     let constraint = doc.constraints.get(index)?;
-    let icon = icon_for_constraint_kind(constraint.kind);
+    let icon = icon_for_constraint_kind(&constraint.kind);
+    let sketch = constraint.sketch;
 
-    match constraint.kind {
+    match constraint.kind.clone() {
         ConstraintKind::Distance { .. } => None,
         ConstraintKind::Parallel { line_a, line_b }
         | ConstraintKind::Perpendicular { line_a, line_b }
         | ConstraintKind::Equal { line_a, line_b } => {
-            let (a0, a1) = constraint_line_world_endpoints(doc, line_a)?;
-            let (b0, b1) = constraint_line_world_endpoints(doc, line_b)?;
+            let (a0, a1) = constraint_line_world_endpoints(doc, sketch, line_a)?;
+            let (b0, b1) = constraint_line_world_endpoints(doc, sketch, line_b)?;
             let ma = midpoint(a0, a1);
             let mb = midpoint(b0, b1);
             Some(ConstraintViewportGraphic {
@@ -121,8 +115,8 @@ fn build_graphic(doc: &Document, index: usize) -> Option<ConstraintViewportGraph
             })
         }
         ConstraintKind::Coincident { a, b } => {
-            let pa = entity_world_position(doc, a, constraint.sketch)?;
-            let pb = entity_world_position(doc, b, constraint.sketch)?;
+            let pa = entity_world_position(doc, a, sketch)?;
+            let pb = entity_world_position(doc, b, sketch)?;
             Some(ConstraintViewportGraphic {
                 constraint_index: index,
                 connectors: if (pa - pb).length_squared() > 1e-6 {
@@ -142,7 +136,7 @@ fn build_graphic(doc: &Document, index: usize) -> Option<ConstraintViewportGraph
         }
         ConstraintKind::Midpoint { point, line } => {
             let pw = point_world_position(doc, point)?;
-            let (la, lb) = constraint_line_world_endpoints(doc, line)?;
+            let (la, lb) = constraint_line_world_endpoints(doc, sketch, line)?;
             let lm = midpoint(la, lb);
             Some(ConstraintViewportGraphic {
                 constraint_index: index,
@@ -156,7 +150,7 @@ fn build_graphic(doc: &Document, index: usize) -> Option<ConstraintViewportGraph
             })
         }
         ConstraintKind::Horizontal { line } | ConstraintKind::Vertical { line } => {
-            let (a, b) = constraint_line_world_endpoints(doc, line)?;
+            let (a, b) = constraint_line_world_endpoints(doc, sketch, line)?;
             Some(ConstraintViewportGraphic {
                 constraint_index: index,
                 connectors: vec![],

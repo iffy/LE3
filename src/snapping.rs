@@ -9,7 +9,7 @@ use crate::model::{
 };
 
 /// What a snapped point latched onto, and the constraint to add if it is left there.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SnapTarget {
     /// Coincident with another vertex.
     Vertex(ConstraintPoint),
@@ -23,10 +23,15 @@ pub enum SnapTarget {
     /// edge's line but beyond its endpoints. Pinned with a point-on-line coincidence, just like
     /// [`SnapTarget::OnLine`], so the point stays collinear with the edge.
     OnLineExtension(ConstraintLine),
+    /// The infinite line normal to `line`, through its midpoint (inference snapping: only
+    /// reachable after first touching that line's midpoint — see `AppState`'s remembered anchor,
+    /// mirroring `OnLineExtension`'s vertex-touch mechanic for #21). Committing this snap invents
+    /// a construction line to carry the constraint (see `crate::actions::add_snap_constraint`).
+    NormalAtMidpoint(ConstraintLine),
 }
 
 /// A resolved snap: where to place the point and what it latched onto.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Snap {
     pub uv: (f32, f32),
     pub target: SnapTarget,
@@ -53,7 +58,7 @@ pub fn find_snap(
         if exclude.contains(&point) {
             continue;
         }
-        let Ok((u, v)) = point_uv(doc, point) else {
+        let Ok((u, v)) = point_uv(doc, sketch, point.clone()) else {
             continue;
         };
         let d2 = dist_sq(query, (u, v));
@@ -87,7 +92,7 @@ pub fn find_snap(
 
     let excluded_lines: Vec<ConstraintLine> = exclude
         .iter()
-        .flat_map(|point| owning_lines(*point))
+        .flat_map(|point| owning_lines(point))
         .collect();
 
     // Nearest line midpoint (next priority).
@@ -97,7 +102,7 @@ pub fn find_snap(
         if excluded_lines.contains(&line) {
             continue;
         }
-        let Ok(((x0, y0), (x1, y1))) = line_uv_endpoints(doc, line) else {
+        let Ok(((x0, y0), (x1, y1))) = line_uv_endpoints(doc, sketch, line.clone()) else {
             continue;
         };
         let mid = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
@@ -107,7 +112,7 @@ pub fn find_snap(
                 dm,
                 Snap {
                     uv: mid,
-                    target: SnapTarget::Midpoint(line),
+                    target: SnapTarget::Midpoint(line.clone()),
                 },
             ));
         }
@@ -132,6 +137,10 @@ pub fn find_snap(
 }
 
 /// The constraint that pins `point` to `target` when a snapped point is left in place.
+///
+/// [`SnapTarget::NormalAtMidpoint`] has no single `ConstraintKind` that fits this signature — it
+/// needs to invent a construction line first — so it is special-cased before this function is
+/// called (see `crate::actions::AppState::add_snap_constraint`) and must never reach here.
 pub fn snap_constraint_kind(point: ConstraintPoint, target: SnapTarget) -> ConstraintKind {
     match target {
         SnapTarget::Vertex(other) => ConstraintKind::Coincident {
@@ -147,6 +156,9 @@ pub fn snap_constraint_kind(point: ConstraintPoint, target: SnapTarget) -> Const
             a: ConstraintEntity::Point(point),
             b: ConstraintEntity::Line(line),
         },
+        SnapTarget::NormalAtMidpoint(_) => unreachable!(
+            "NormalAtMidpoint is handled by add_normal_at_midpoint_constraint, not snap_constraint_kind"
+        ),
     }
 }
 
@@ -159,10 +171,10 @@ pub fn snap_constraint_already_present(
     let kind = snap_constraint_kind(point, target);
     doc.constraints
         .iter()
-        .any(|c| !c.deleted && constraint_equivalent(c.kind, kind))
+        .any(|c| !c.deleted && constraint_equivalent(&c.kind, &kind))
 }
 
-fn constraint_equivalent(a: ConstraintKind, b: ConstraintKind) -> bool {
+fn constraint_equivalent(a: &ConstraintKind, b: &ConstraintKind) -> bool {
     match (a, b) {
         (
             ConstraintKind::Coincident { a: a1, b: b1 },
@@ -176,7 +188,7 @@ fn constraint_equivalent(a: ConstraintKind, b: ConstraintKind) -> bool {
     }
 }
 
-fn entity_eq(a: ConstraintEntity, b: ConstraintEntity) -> bool {
+fn entity_eq(a: &ConstraintEntity, b: &ConstraintEntity) -> bool {
     match (a, b) {
         (ConstraintEntity::Point(p), ConstraintEntity::Point(q)) => p == q,
         (ConstraintEntity::Line(l), ConstraintEntity::Line(m)) => l == m,
@@ -186,9 +198,9 @@ fn entity_eq(a: ConstraintEntity, b: ConstraintEntity) -> bool {
 }
 
 /// Lines/edges owned by a vertex (so dragging it never snaps to its own geometry).
-fn owning_lines(point: ConstraintPoint) -> Vec<ConstraintLine> {
+fn owning_lines(point: &ConstraintPoint) -> Vec<ConstraintLine> {
     match point {
-        ConstraintPoint::LineEndpoint { line, .. } => vec![ConstraintLine::Line(line)],
+        ConstraintPoint::LineEndpoint { line, .. } => vec![ConstraintLine::Line(*line)],
         ConstraintPoint::RectCorner { rect, .. } => [
             RectEdge::Bottom,
             RectEdge::Right,
@@ -196,9 +208,11 @@ fn owning_lines(point: ConstraintPoint) -> Vec<ConstraintLine> {
             RectEdge::Left,
         ]
         .into_iter()
-        .map(|edge| ConstraintLine::RectEdge { rect, edge })
+        .map(|edge| ConstraintLine::RectEdge { rect: *rect, edge })
         .collect(),
-        ConstraintPoint::CircleCenter(_) => Vec::new(),
+        // Fixed by the body's own geometry, so it's never the dragged endpoint of anything —
+        // there's nothing to exclude on its behalf.
+        ConstraintPoint::CircleCenter(_) | ConstraintPoint::FaceVertex { .. } => Vec::new(),
     }
 }
 
@@ -339,6 +353,7 @@ fn project_onto_infinite_line(
 /// `OnLine`). `exclude` drops anchors owned by points being dragged. Sketch units throughout.
 pub fn find_extension_snap(
     doc: &Document,
+    sketch: SketchId,
     anchors: &[ConstraintLine],
     query: (f32, f32),
     perp_tol: f32,
@@ -350,15 +365,16 @@ pub fn find_extension_snap(
     let perp_tol_sq = perp_tol * perp_tol;
     let excluded_lines: Vec<ConstraintLine> = exclude
         .iter()
-        .flat_map(|point| owning_lines(*point))
+        .flat_map(|point| owning_lines(point))
         .collect();
 
     let mut best: Option<(f32, Snap)> = None;
-    for &line in anchors {
+    for line in anchors {
+        let line = line.clone();
         if excluded_lines.contains(&line) {
             continue;
         }
-        let Ok(((x0, y0), (x1, y1))) = line_uv_endpoints(doc, line) else {
+        let Ok(((x0, y0), (x1, y1))) = line_uv_endpoints(doc, sketch, line.clone()) else {
             continue;
         };
         let Some((foot, t)) = project_onto_infinite_line(query, (x0, y0), (x1, y1)) else {
@@ -384,7 +400,48 @@ pub fn find_extension_snap(
 
 /// Edges incident to a vertex — its extension guides when the cursor hovers it (see #21).
 pub fn vertex_extension_anchors(point: ConstraintPoint) -> Vec<ConstraintLine> {
-    owning_lines(point)
+    owning_lines(&point)
+}
+
+/// Inference snap onto the infinite line perpendicular to `anchor`, through its midpoint —
+/// reachable only once `anchor` has been "touched" (see #41). Unlike `find_extension_snap`,
+/// there's no segment to exclude a middle region from: the whole perpendicular line is fair
+/// game, since it doesn't coincide with `anchor` itself.
+pub fn find_normal_at_midpoint_snap(
+    doc: &Document,
+    sketch: SketchId,
+    anchor: Option<ConstraintLine>,
+    query: (f32, f32),
+    perp_tol: f32,
+    exclude: &[ConstraintPoint],
+) -> Option<Snap> {
+    let anchor = anchor?;
+    if perp_tol <= 0.0 {
+        return None;
+    }
+    let excluded_lines: Vec<ConstraintLine> = exclude
+        .iter()
+        .flat_map(|point| owning_lines(point))
+        .collect();
+    if excluded_lines.contains(&anchor) {
+        return None;
+    }
+    let Ok(((x0, y0), (x1, y1))) = line_uv_endpoints(doc, sketch, anchor.clone()) else {
+        return None;
+    };
+    let mid = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let perp_b = (mid.0 - dy, mid.1 + dx);
+    let (foot, _t) = project_onto_infinite_line(query, mid, perp_b)?;
+    let d2 = dist_sq(query, foot);
+    if d2 <= perp_tol * perp_tol {
+        Some(Snap {
+            uv: foot,
+            target: SnapTarget::NormalAtMidpoint(anchor),
+        })
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -519,7 +576,7 @@ mod tests {
         doc.lines
             .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
         let anchors = vec![ConstraintLine::Line(0)];
-        let snap = find_extension_snap(&doc, &anchors, (15.0, 0.2), 1.0, &[]).unwrap();
+        let snap = find_extension_snap(&doc, sketch, &anchors, (15.0, 0.2), 1.0, &[]).unwrap();
         assert_eq!(snap.target, SnapTarget::OnLineExtension(ConstraintLine::Line(0)));
         // Snapped onto the line (v=0) at the queried u.
         assert!((snap.uv.0 - 15.0).abs() < EPS && snap.uv.1.abs() < EPS);
@@ -541,7 +598,7 @@ mod tests {
             .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
         let anchors = vec![ConstraintLine::Line(0)];
         // Query is within the segment span — handled by `find_snap`'s OnLine, not extension.
-        assert!(find_extension_snap(&doc, &anchors, (5.0, 0.2), 1.0, &[]).is_none());
+        assert!(find_extension_snap(&doc, sketch, &anchors, (5.0, 0.2), 1.0, &[]).is_none());
     }
 
     #[test]
@@ -551,7 +608,7 @@ mod tests {
             .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
         let anchors = vec![ConstraintLine::Line(0)];
         // Far above the extension line: outside perpendicular tolerance.
-        assert!(find_extension_snap(&doc, &anchors, (15.0, 5.0), 1.0, &[]).is_none());
+        assert!(find_extension_snap(&doc, sketch, &anchors, (15.0, 5.0), 1.0, &[]).is_none());
     }
 
     #[test]
@@ -563,7 +620,7 @@ mod tests {
         let corner = ConstraintPoint::RectCorner { rect: 0, corner: 1 };
         let anchors = vertex_extension_anchors(corner);
         // A point directly below the right edge (x=10) snaps onto that edge's extension.
-        let snap = find_extension_snap(&doc, &anchors, (10.2, -4.0), 1.0, &[]).unwrap();
+        let snap = find_extension_snap(&doc, sketch, &anchors, (10.2, -4.0), 1.0, &[]).unwrap();
         assert_eq!(
             snap.target,
             SnapTarget::OnLineExtension(ConstraintLine::RectEdge {
@@ -584,6 +641,62 @@ mod tests {
             line: 0,
             end: LineEnd::End,
         };
-        assert!(find_extension_snap(&doc, &anchors, (15.0, 0.2), 1.0, &[dragged]).is_none());
+        assert!(find_extension_snap(&doc, sketch, &anchors, (15.0, 0.2), 1.0, &[dragged]).is_none());
+    }
+
+    #[test]
+    fn normal_at_midpoint_snaps_onto_perpendicular_line() {
+        let (mut doc, sketch) = sketch_doc();
+        // Horizontal segment (0,0)-(10,0); midpoint (5,0). The perpendicular through the
+        // midpoint is the vertical line u=5.
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let anchor = Some(ConstraintLine::Line(0));
+        let snap = find_normal_at_midpoint_snap(&doc, sketch, anchor, (5.2, 4.0), 1.0, &[]).unwrap();
+        assert_eq!(
+            snap.target,
+            SnapTarget::NormalAtMidpoint(ConstraintLine::Line(0))
+        );
+        assert!((snap.uv.0 - 5.0).abs() < EPS && (snap.uv.1 - 4.0).abs() < EPS);
+    }
+
+    #[test]
+    fn normal_at_midpoint_rejects_no_anchor() {
+        let (doc, _sketch) = sketch_doc();
+        assert!(find_normal_at_midpoint_snap(&doc, _sketch, None, (5.0, 4.0), 1.0, &[]).is_none());
+    }
+
+    #[test]
+    fn normal_at_midpoint_rejects_far_perpendicular_distance() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let anchor = Some(ConstraintLine::Line(0));
+        // Far from the perpendicular line u=5.
+        assert!(find_normal_at_midpoint_snap(&doc, sketch, anchor, (15.0, 4.0), 1.0, &[]).is_none());
+    }
+
+    #[test]
+    fn normal_at_midpoint_excludes_anchors_own_line() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let anchor = Some(ConstraintLine::Line(0));
+        let dragged = ConstraintPoint::LineEndpoint {
+            line: 0,
+            end: LineEnd::End,
+        };
+        assert!(
+            find_normal_at_midpoint_snap(&doc, sketch, anchor, (5.2, 4.0), 1.0, &[dragged]).is_none()
+        );
+    }
+
+    #[test]
+    fn normal_at_midpoint_rejects_zero_tolerance() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines
+            .push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let anchor = Some(ConstraintLine::Line(0));
+        assert!(find_normal_at_midpoint_snap(&doc, sketch, anchor, (5.0, 0.0), 0.0, &[]).is_none());
     }
 }

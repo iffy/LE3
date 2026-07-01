@@ -473,9 +473,10 @@ pub fn sketch_from_pick_target(doc: &Document, kind: PickTargetKind) -> Option<S
             }
         }),
         PickTargetKind::Point(point) => point_sketch(doc, point),
-        PickTargetKind::PlaneEdge { .. } | PickTargetKind::GlobalAxis(_) | PickTargetKind::Ground(_) => {
-            None
-        }
+        PickTargetKind::PlaneEdge { .. }
+        | PickTargetKind::BodyEdge { .. }
+        | PickTargetKind::GlobalAxis(_)
+        | PickTargetKind::Ground(_) => None,
     }
 }
 
@@ -484,6 +485,9 @@ pub fn point_sketch(doc: &Document, point: ConstraintPoint) -> Option<SketchId> 
         ConstraintPoint::LineEndpoint { line, .. } => doc.lines.get(line).map(|l| l.sketch),
         ConstraintPoint::RectCorner { rect, .. } => doc.rects.get(rect).map(|r| r.sketch),
         ConstraintPoint::CircleCenter(circle) => doc.circles.get(circle).map(|c| c.sketch),
+        // A face's own vertex has no owning sketch of its own — it's referenced *from*
+        // whichever sketch a constraint projects it into, not owned by one.
+        ConstraintPoint::FaceVertex { .. } => None,
     }
 }
 
@@ -899,6 +903,15 @@ pub enum PickTargetKind {
         a: Vec3,
         b: Vec3,
     },
+    /// One feature edge of a 3D body's solid mesh (#31) — a mesh boundary or crease between
+    /// two non-coplanar triangles, the same edges `ShadingMode::Wireframe` draws, extracted via
+    /// `solid_mesh_unique_edges`. Works for any body (extrusion-sourced or STL/STEP-imported),
+    /// since it's derived from the triangle mesh rather than an analytic profile.
+    BodyEdge {
+        body: usize,
+        a: Vec3,
+        b: Vec3,
+    },
     GlobalAxis(GlobalAxis),
     Rect(Rect),
     ConstructionPlane(usize),
@@ -942,8 +955,10 @@ pub fn resolve_pick_target(
     };
 
     if let Some((kind, dist)) = nearest_sketch_point(screen, project, doc) {
-        let origin = match kind {
-            PickTargetKind::Point(point) => point_world_position(doc, point).unwrap_or(Vec3::ZERO),
+        let origin = match &kind {
+            PickTargetKind::Point(point) => {
+                point_world_position(doc, point.clone()).unwrap_or(Vec3::ZERO)
+            }
             _ => Vec3::ZERO,
         };
         consider(PickTarget {
@@ -959,6 +974,19 @@ pub fn resolve_pick_target(
     }
 
     if let Some((kind, a, b, label, dist)) = nearest_sketch_edge(screen, project, doc) {
+        consider(PickTarget {
+            kind,
+            reference: PlaneReference::Axis {
+                origin: segment_midpoint(a, b),
+                direction: segment_direction(a, b),
+                label,
+            },
+            distance_px: dist,
+            priority: 0,
+        });
+    }
+
+    if let Some((kind, a, b, label, dist)) = nearest_body_edge(screen, project, doc) {
         consider(PickTarget {
             kind,
             reference: PlaneReference::Axis {
@@ -1064,7 +1092,7 @@ impl PickTarget {
 /// Map a viewport pick to a scene-tree selection target, when selectable.
 pub fn scene_element_from_pick(kind: &PickTargetKind) -> Option<SceneElement> {
     match kind {
-        PickTargetKind::Point(point) => Some(SceneElement::Point(*point)),
+        PickTargetKind::Point(point) => Some(SceneElement::Point(point.clone())),
         PickTargetKind::Line(index) => Some(SceneElement::Line(*index)),
         PickTargetKind::Circle(index) => Some(SceneElement::Circle(*index)),
         PickTargetKind::ShapeEdge {
@@ -1107,6 +1135,9 @@ pub fn draw_pick_highlight(
             draw_segment_highlight(painter, project, a, b, color);
         }
         PickTargetKind::PlaneEdge { a, b } => {
+            draw_segment_highlight(painter, project, a, b, color);
+        }
+        PickTargetKind::BodyEdge { a, b, .. } => {
             draw_segment_highlight(painter, project, a, b, color);
         }
         PickTargetKind::GlobalAxis(axis) => {
@@ -1372,6 +1403,10 @@ pub fn point_world_position(doc: &Document, point: ConstraintPoint) -> Option<Ve
             let entity = doc.circles.get(circle)?;
             circle_world_center(doc, entity)
         }
+        // Already a world-space point (#26/#27) — no sketch frame to project through.
+        ConstraintPoint::FaceVertex { face, index } => {
+            crate::extrude::face_boundary_loop_world(doc, &face)?.get(index).copied()
+        }
     }
 }
 
@@ -1385,7 +1420,7 @@ pub fn nearest_sketch_point_in_sketch(
     let mut best: Option<(ConstraintPoint, f32)> = None;
 
     let mut consider = |point: ConstraintPoint, world: Vec3| {
-        if point_sketch(doc, point) != Some(sketch) {
+        if point_sketch(doc, point.clone()) != Some(sketch) {
             return;
         }
         let Some(sp) = project(world) else {
@@ -1445,6 +1480,33 @@ pub fn nearest_sketch_point_in_sketch(
         }
     }
 
+    // A sketch open directly on a body's own extrusion cap/side face (#26/#27) can also
+    // constrain to that face's own boundary vertices. `point_sketch` can't recognize these
+    // (a `FaceVertex` has no owning sketch, unlike sketch-native entities above), so they're
+    // considered directly rather than through the shared `consider` closure's sketch filter.
+    // Scoped to the *active sketch's own face* only, per the issue — not arbitrary other faces.
+    if let Some(face) = doc.sketch_face(sketch) {
+        if matches!(face, FaceId::ExtrudeCap { .. } | FaceId::ExtrudeSide { .. }) {
+            if let Some(loop_) = crate::extrude::face_boundary_loop_world(doc, &face) {
+                for (index, world) in loop_.into_iter().enumerate() {
+                    let Some(sp) = project(world) else {
+                        continue;
+                    };
+                    let dist = (screen - sp).length();
+                    if dist <= POINT_PICK_RADIUS_PX && best.as_ref().is_none_or(|(_, d)| dist < *d) {
+                        best = Some((
+                            ConstraintPoint::FaceVertex {
+                                face: face.clone(),
+                                index,
+                            },
+                            dist,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     best
 }
 
@@ -1492,6 +1554,28 @@ pub fn nearest_sketch_line_in_sketch(
                 a,
                 b,
             );
+        }
+    }
+
+    // Edges of the sketch's own body face (#26/#27), scoped exactly like the vertex loop in
+    // `nearest_sketch_point_in_sketch` above. Vertices win over edges via the existing caller
+    // precedence: callers already check `nearest_sketch_point_in_sketch` first and skip this
+    // function on a hit (see e.g. `handle_vertex_drag`/`handle_line_drag` in main.rs).
+    if let Some(face) = doc.sketch_face(sketch) {
+        if matches!(face, FaceId::ExtrudeCap { .. } | FaceId::ExtrudeSide { .. }) {
+            if let Some(loop_) = crate::extrude::face_boundary_loop_world(doc, &face) {
+                let n = loop_.len();
+                for index in 0..n {
+                    consider(
+                        ConstraintLine::FaceEdge {
+                            face: face.clone(),
+                            index,
+                        },
+                        loop_[index],
+                        loop_[(index + 1) % n],
+                    );
+                }
+            }
         }
     }
 
@@ -1632,6 +1716,60 @@ fn nearest_sketch_edge(
         }
     }
 
+    best
+}
+
+/// Nearest feature edge of any 3D body's solid mesh (#31) — lets a construction plane be
+/// referenced from any edge on any shape, not just 2D sketch geometry.
+fn nearest_body_edge(
+    screen: egui::Pos2,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    doc: &Document,
+) -> Option<(PickTargetKind, Vec3, Vec3, String, f32)> {
+    let mut best: Option<(PickTargetKind, Vec3, Vec3, String, f32)> = None;
+
+    let mut consider = |kind: PickTargetKind, a: Vec3, b: Vec3| {
+        let Some(dist) = segment_pick_distance(screen, project, a, b) else {
+            return;
+        };
+        if best.as_ref().is_none_or(|(_, _, _, _, d)| dist < *d) {
+            best = Some((kind, a, b, "Body edge".to_string(), dist));
+        }
+    };
+
+    for (bi, body) in doc.bodies.iter().enumerate() {
+        if body.deleted {
+            continue;
+        }
+        let Some(solid) = crate::extrude::body_solid_mesh(doc, bi) else {
+            continue;
+        };
+        for (a, b) in crate::gpu_viewport::solid_mesh_unique_edges(&solid) {
+            consider(PickTargetKind::BodyEdge { body: bi, a, b }, a, b);
+        }
+    }
+
+    best
+}
+
+/// Nearest currently-treatable analytic extrusion edge (#77): the chamfer/fillet tool's own
+/// picking path when no sketch is open, used instead of the generic [`nearest_body_edge`]
+/// (mesh-feature-edge) picking above since it needs the structured `ExtrusionEdgeRef`, not just
+/// two raw points — see `crate::extrude::treatable_edges`.
+pub fn nearest_treatable_edge(
+    screen: egui::Pos2,
+    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    doc: &Document,
+) -> Option<(usize, crate::model::ExtrusionEdgeRef, Vec3, Vec3, f32)> {
+    let mut best: Option<(usize, crate::model::ExtrusionEdgeRef, Vec3, Vec3, f32)> = None;
+    for (extrusion, edge, a, b) in crate::extrude::treatable_edges(doc) {
+        let Some(dist) = segment_pick_distance(screen, project, a, b) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(_, _, _, _, d)| dist < *d) {
+            best = Some((extrusion, edge, a, b, dist));
+        }
+    }
     best
 }
 
@@ -1949,6 +2087,105 @@ mod tests {
         let reference = resolve_pick_target(Pos2::new(50.0, 2.0), &project, Some(Vec3::ZERO), &doc)
             .map(|t| t.reference);
         assert!(matches!(reference, Some(PlaneReference::Axis { .. })));
+    }
+
+    #[test]
+    fn body_edge_picked_as_axis_reference() {
+        // #31: any edge on any 3D body (not just 2D sketch geometry) can anchor a plane.
+        use crate::actions::{Action, AppState, Tool};
+        use crate::model::{ExtrudeFace, FaceId};
+
+        let mut state = AppState::default();
+        state.apply(Action::BeginSketch {
+            face: FaceId::ConstructionPlane(0),
+            viewport: None,
+        });
+        state.creating_rect = Some(crate::actions::CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["10".into(), "5".into()],
+            focused: 0,
+            last_mouse: Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [true, true],
+            pending_focus: false,
+            construction: false,
+        });
+        state.apply(Action::CommitRectangle);
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
+        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
+        state.apply(Action::CommitExtrusion);
+        assert_eq!(state.doc.bodies.len(), 1);
+
+        // A vertical side edge runs from (0,0,0) to (0,0,7) at the rect's origin corner.
+        // Flatten screen-space as (x, y - z) so this edge isn't degenerate on screen.
+        let project = |w: Vec3| Some(Pos2::new(w.x, w.y - w.z));
+        let target = resolve_pick_target(Pos2::new(0.0, -3.5), &project, None, &state.doc);
+        assert!(
+            matches!(
+                target.as_ref().map(|t| &t.kind),
+                Some(PickTargetKind::BodyEdge { body: 0, .. })
+            ),
+            "expected a BodyEdge pick, got {target:?}"
+        );
+        assert!(matches!(
+            target.map(|t| t.reference),
+            Some(PlaneReference::Axis { .. })
+        ));
+    }
+
+    #[test]
+    fn nearest_treatable_edge_finds_a_vertical_side_edge() {
+        // #77: the chamfer/fillet tool's own picking path (used when no sketch is open),
+        // resolving straight to the structured `ExtrusionEdgeRef` rather than raw points.
+        use crate::actions::{Action, AppState, Tool};
+        use crate::model::{ExtrudeFace, ExtrusionEdgeRef, FaceId};
+
+        let mut state = AppState::default();
+        state.apply(Action::BeginSketch { face: FaceId::ConstructionPlane(0), viewport: None });
+        state.creating_rect = Some(crate::actions::CreatingRect {
+            origin: Vec3::ZERO,
+            texts: ["10".into(), "5".into()],
+            focused: 0,
+            last_mouse: Vec3::new(10.0, 5.0, 0.0),
+            user_edited: [true, true],
+            pending_focus: false,
+            construction: false,
+        });
+        state.apply(Action::CommitRectangle);
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
+        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
+        state.apply(Action::CommitExtrusion);
+        assert_eq!(state.doc.extrusions.len(), 1);
+
+        // Same vertical edge as `body_edge_picked_as_axis_reference`: (0,0,0) to (0,0,7).
+        let project = |w: Vec3| Some(Pos2::new(w.x, w.y - w.z));
+        let hit = nearest_treatable_edge(Pos2::new(0.0, -3.5), &project, &state.doc);
+        let (extrusion, edge, _, _, _) = hit.expect("expected a treatable edge under the cursor");
+        assert_eq!(extrusion, 0);
+        assert!(matches!(edge, ExtrusionEdgeRef::Vertical { face: 0, .. }));
+
+        // Nowhere near any edge: no hit.
+        assert!(nearest_treatable_edge(Pos2::new(500.0, 500.0), &project, &state.doc).is_none());
+    }
+
+    #[test]
+    fn nearest_treatable_edge_ignores_circle_profiles() {
+        use crate::actions::{Action, AppState, Tool};
+        use crate::model::{Circle, ExtrudeFace, FaceId};
+
+        let mut state = AppState::default();
+        state.apply(Action::BeginSketch { face: FaceId::ConstructionPlane(0), viewport: None });
+        let sketch = state.sketch_session.unwrap().sketch;
+        state.doc.circles.push(Circle::from_local_center_radius(sketch, 0.0, 0.0, 5.0, 0.0));
+        state.doc.shape_order.push(crate::model::ShapeKind::Circle);
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Circle(0) });
+        state.apply(Action::SetExtrudeDistance { distance: 6.0 });
+        state.apply(Action::CommitExtrusion);
+
+        let project = |w: Vec3| Some(Pos2::new(w.x, w.y));
+        assert!(nearest_treatable_edge(Pos2::new(5.0, 0.0), &project, &state.doc).is_none());
     }
 
     #[test]

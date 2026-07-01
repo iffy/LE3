@@ -118,6 +118,10 @@ pub enum ShadingMode {
     Solid,
     /// Opaque fill plus an edge overlay that stays visible through the body.
     SolidWireframe,
+    /// Opaque fill with ambient + diffuse + specular (Blinn-Phong) lighting instead of the
+    /// flat/Lambert-ish shading `Solid` uses — a matte/satin "painted object" look (#83). No
+    /// materials/textures yet; every body uses the same fixed gloss.
+    Realistic,
 }
 
 impl Default for ShadingMode {
@@ -127,11 +131,12 @@ impl Default for ShadingMode {
 }
 
 /// All shading modes, in the order they should list in the HUD popup.
-pub const SHADING_MODES: [ShadingMode; 4] = [
+pub const SHADING_MODES: [ShadingMode; 5] = [
     ShadingMode::Wireframe,
     ShadingMode::TransparentSolid,
     ShadingMode::Solid,
     ShadingMode::SolidWireframe,
+    ShadingMode::Realistic,
 ];
 
 impl ShadingMode {
@@ -143,6 +148,7 @@ impl ShadingMode {
             "solid_wireframe" | "solid+wireframe" | "shaded_wireframe" => {
                 Some(Self::SolidWireframe)
             }
+            "realistic" | "matte" | "satin" => Some(Self::Realistic),
             _ => None,
         }
     }
@@ -153,6 +159,7 @@ impl ShadingMode {
             Self::TransparentSolid => "transparent",
             Self::Solid => "solid",
             Self::SolidWireframe => "solid_wireframe",
+            Self::Realistic => "realistic",
         }
     }
 }

@@ -33,9 +33,11 @@ mod gpu_view_cube;
 mod gpu_viewport;
 mod hierarchy;
 mod icons;
+mod kernel;
 mod names;
 mod parameters;
 mod polygon;
+mod polygon_boolean;
 
 mod model;
 mod native_menu;
@@ -56,9 +58,9 @@ mod vertex_drag;
 mod view_cube;
 
 use actions::{
-    angle_gizmo_constraint_for_edit, constraint_is_angle, constraint_is_circle_diameter, Action,
-    AppState, CreatingCircle, CreatingConstructionPlane, CreatingExtrusion, CreatingLine,
-    CreatingRect, CreatingVertexTreatment,
+    angle_gizmo_constraint_for_edit, chained_curve_handles, constraint_is_angle,
+    constraint_is_circle_diameter, Action, AppState, CreatingCircle, CreatingConstructionPlane,
+    CreatingEdgeTreatment, CreatingExtrusion, CreatingLine, CreatingRect, CreatingVertexTreatment,
     DimEditTarget, DimLabelTarget, Pane, RectAxis, SketchSession, Tool,
     DEFAULT_VERTEX_TREATMENT_AMOUNT,
 };
@@ -121,10 +123,7 @@ use expression_input::{
     length_expression_field_errors, show_expression_error_tooltips_above, INVALID_BG,
     INVALID_BORDER, INVALID_TEXT,
 };
-use value::{
-    computed_length_in_doc, format_diameter_display, format_length_display,
-    shows_computed_length_in_doc,
-};
+use value::{computed_length_in_doc, shows_computed_length_in_doc};
 
 /// macOS maximize must run after eframe shows the window (post-first-paint).
 fn uses_deferred_launch_maximize() -> bool {
@@ -317,6 +316,14 @@ struct VertexTreatmentGizmoDrag {
     start_amount: f32,
 }
 
+/// The 3D analogue of [`VertexTreatmentGizmoDrag`] (#77): same click-to-grab, follow-the-cursor
+/// push/pull gizmo, just anchored on an extrusion's analytic edge instead of a sketch vertex.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EdgeTreatmentGizmoDrag {
+    start_screen: egui::Pos2,
+    start_amount: f32,
+}
+
 struct VertexDrag {
     point: ConstraintPoint,
 }
@@ -328,10 +335,15 @@ struct BezierHandleDrag {
     near_start: bool,
 }
 
-/// What the viewport's right-click context menu should offer (#54).
+/// What the viewport's right-click context menu should offer (#54/#75).
+#[derive(Clone)]
 enum ViewportContextMenu {
     ConvertVertexToBezier(ConstraintPoint),
     StraightenLine(usize),
+    /// Right-clicked directly on a bezier handle: same underlying action as `StraightenLine`
+    /// (there's no independent per-handle state to remove — see `selected_bezier_handle`), but
+    /// worded as "delete" since that's what the user clicked on (#75).
+    DeleteBezierHandle(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -362,6 +374,9 @@ struct App {
     angle_gizmo_drag: Option<AngleGizmoDrag>,
     vertex_drag: Option<VertexDrag>,
     bezier_handle_drag: Option<BezierHandleDrag>,
+    /// Bezier handle selected by a plain click (persists past the click, unlike
+    /// `bezier_handle_drag`), so Delete/Backspace can remove it (#75). `(line, near_start)`.
+    selected_bezier_handle: Option<(usize, bool)>,
     /// What the viewport's right-click context menu should offer, resolved from whatever was
     /// under the cursor when it was opened (remembered across frames since the menu content
     /// closure may run on a later frame than the click itself).
@@ -370,9 +385,16 @@ struct App {
     /// Object the extrude gizmo is currently snapped to (applied on release).
     pending_extrude_target: Option<model::ExtrudeTarget>,
     vertex_treatment_gizmo_drag: Option<VertexTreatmentGizmoDrag>,
+    /// Push/pull gizmo drag state for the 3D edge chamfer/fillet tool (#77); parallel to
+    /// `vertex_treatment_gizmo_drag`.
+    edge_treatment_gizmo_drag: Option<EdgeTreatmentGizmoDrag>,
     launch_maximize_frames_remaining: u8,
     gpu_viewport: bool,
     gpu_view_cube: bool,
+    /// Elements pane layout (List/Tree/Graph, #34) — an ephemeral view preference, not
+    /// document data, so it lives here alongside `selected_bezier_handle` rather than on
+    /// `AppState`.
+    hierarchy_view_mode: hierarchy::HierarchyViewMode,
 }
 
 impl App {
@@ -422,12 +444,15 @@ impl App {
             extrude_gizmo_drag: None,
             pending_extrude_target: None,
             vertex_treatment_gizmo_drag: None,
+            edge_treatment_gizmo_drag: None,
             vertex_drag: None,
             bezier_handle_drag: None,
+            selected_bezier_handle: None,
             viewport_context_menu: None,
             launch_maximize_frames_remaining: initial_launch_maximize_frames(),
             gpu_viewport: gpu_viewport::install(cc),
             gpu_view_cube: gpu_view_cube::install(cc),
+            hierarchy_view_mode: hierarchy::HierarchyViewMode::default(),
         }
     }
 
@@ -600,8 +625,16 @@ impl App {
                 MenuCommand::ExportSessionCommands => self.export_session_commands(),
                 MenuCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 MenuCommand::About => {
-                    self.state.status =
-                        "BearCAD — on-device parametric CAD (prototype)".to_string();
+                    self.state.status = format!(
+                        "BearCAD — on-device parametric CAD (prototype) • {}",
+                        kernel::selftest()
+                    );
+                }
+                MenuCommand::Licenses => {
+                    self.state.status = match open_licenses_document() {
+                        Ok(()) => "Opened licenses document in your browser".to_string(),
+                        Err(err) => format!("Could not open licenses document: {err}"),
+                    };
                 }
                 MenuCommand::InstallCli => {
                     self.state.status = match cli_install::run_install() {
@@ -761,17 +794,38 @@ impl App {
                 self.state.apply(Action::ToggleConstruction);
             }
 
+            // `T` is also the mnemonic for the Tangent geometric constraint (Tool::Constraint,
+            // handled separately below), so curve-mode/tangent-constraint shortcuts are scoped
+            // to everywhere else — while drawing/selected with the line tool, or a sketch
+            // vertex selection in Select tool (#73).
+            if self.state.tool != Tool::Constraint {
+                if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+                    self.state.apply(Action::ToggleCurveMode);
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::T)) {
+                    self.state.apply(Action::ToggleTangentConstraint);
+                }
+            }
+
             if ctx.input(|i| i.key_pressed(egui::Key::N)) {
                 self.state.apply(Action::FocusElementName);
             }
 
-            if self.state.creating_rect.is_none()
+            let delete_pressed = ctx.input(|i| i.key_pressed(egui::Key::Delete))
+                || ctx.input(|i| i.key_pressed(egui::Key::Backspace));
+            if delete_pressed && self.selected_bezier_handle.is_some() {
+                // #75: deleting a selected bezier handle straightens its line — there's no
+                // independent per-handle state to remove (a curve is either both handles or
+                // neither, see `Line::bezier`).
+                if let Some((line, _)) = self.selected_bezier_handle.take() {
+                    self.state.apply(Action::StraightenLine { line });
+                }
+            } else if self.state.creating_rect.is_none()
                 && self.state.creating_line.is_none()
                 && self.state.creating_circle.is_none()
                 && self.state.creating_plane.is_none()
                 && !self.state.scene_selection.is_empty()
-                && (ctx.input(|i| i.key_pressed(egui::Key::Delete))
-                    || ctx.input(|i| i.key_pressed(egui::Key::Backspace)))
+                && delete_pressed
             {
                 self.state.apply(Action::DeleteSelection);
             }
@@ -846,6 +900,9 @@ impl App {
         ui: &egui::Ui,
         project: &impl Fn(Vec3) -> Option<egui::Pos2>,
         pointer_screen: Option<egui::Pos2>,
+        cam: &camera::Camera,
+        viewport: egui::Rect,
+        vp: &glam::Mat4,
     ) {
         let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
 
@@ -939,7 +996,15 @@ impl App {
         // Click toggles the face under the cursor (highlighted via the GPU hover).
         if primary_pressed {
             if let Some(pp) = pointer_screen {
-                if let Some(face) = pick_extrude_face(pp, project, &self.state.doc, self.state.cam.eye()) {
+                if let Some(face) = pick_extrude_face(
+                    pp,
+                    project,
+                    &self.state.doc,
+                    self.state.cam.eye(),
+                    cam,
+                    viewport,
+                    vp,
+                ) {
                     self.state.apply(Action::ToggleExtrudeFace { face });
                 }
             }
@@ -1064,7 +1129,7 @@ impl App {
             .state
             .creating_vertex_treatment
             .as_ref()
-            .and_then(|cvt| vertex_treatment_anchor(&self.state.doc, session.sketch, cvt.point));
+            .and_then(|cvt| vertex_treatment_anchor(&self.state.doc, session.sketch, cvt.point.clone()));
 
         let following = self.vertex_treatment_gizmo_drag.is_some();
         let mut gizmo_active = false;
@@ -1108,7 +1173,11 @@ impl App {
                     if let Some(cvt) = self.state.creating_vertex_treatment.as_mut() {
                         cvt.amount_live = new_amount;
                         if !cvt.user_edited {
-                            cvt.text = crate::value::format_length_display(new_amount);
+                            let unit = crate::model::effective_length_unit(
+                                &self.state.doc,
+                                session.sketch,
+                            );
+                            cvt.text = crate::value::format_length_display_in(new_amount, unit);
                         }
                     }
                 }
@@ -1138,13 +1207,18 @@ impl App {
                 if let Some((point, _)) =
                     nearest_sketch_point_in_sketch(pp, project, &self.state.doc, session.sketch)
                 {
-                    if vertex_incident_line_count(&self.state.doc, session.sketch, point) == 2 {
+                    if vertex_incident_line_count(&self.state.doc, session.sketch, point.clone()) == 2 {
+                        let unit = crate::model::effective_length_unit(
+                            &self.state.doc,
+                            session.sketch,
+                        );
                         self.state.creating_vertex_treatment = Some(CreatingVertexTreatment {
                             point,
                             kind,
                             amount_live: DEFAULT_VERTEX_TREATMENT_AMOUNT,
-                            text: crate::value::format_length_display(
+                            text: crate::value::format_length_display_in(
                                 DEFAULT_VERTEX_TREATMENT_AMOUNT,
+                                unit,
                             ),
                             user_edited: false,
                             pending_focus: true,
@@ -1170,7 +1244,7 @@ impl App {
                 return;
             };
             let Some((origin, normal)) =
-                vertex_treatment_anchor(&self.state.doc, session.sketch, cvt.point)
+                vertex_treatment_anchor(&self.state.doc, session.sketch, cvt.point.clone())
             else {
                 return;
             };
@@ -1250,6 +1324,224 @@ impl App {
                 self.state.apply(Action::CommitVertexTreatment {
                     point: cvt.point,
                     kind: cvt.kind,
+                    amount,
+                });
+            }
+        }
+    }
+
+    /// 3D edge chamfer/fillet tool interaction (#77): click an extrusion's analytic edge
+    /// (vertical or side/cap — see `ExtrusionEdgeRef`) to start, then drag the gizmo or type an
+    /// amount. Mirrors [`Self::handle_vertex_treatment_tool`] closely; active precisely when
+    /// that one isn't (no sketch open), since the Chamfer/Fillet tool is shared between the 2D
+    /// sketch-vertex case and this 3D solid-edge case.
+    fn handle_edge_treatment_tool(
+        &mut self,
+        ui: &egui::Ui,
+        project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+        pointer_screen: Option<egui::Pos2>,
+    ) {
+        if self.state.sketch_session.is_some() {
+            self.state.creating_edge_treatment = None;
+            self.edge_treatment_gizmo_drag = None;
+            return;
+        }
+        let kind = match self.state.tool {
+            Tool::Chamfer => VertexTreatmentKind::Chamfer,
+            Tool::Fillet => VertexTreatmentKind::Fillet,
+            _ => return,
+        };
+        let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+
+        // If the in-progress treatment went away (committed or cancelled), stop following.
+        if self.state.creating_edge_treatment.is_none() {
+            self.edge_treatment_gizmo_drag = None;
+        }
+
+        let anchor = self.state.creating_edge_treatment.as_ref().and_then(|cet| {
+            crate::extrude::extrusion_edge_anchor(&self.state.doc, cet.extrusion, cet.edge)
+        });
+
+        let following = self.edge_treatment_gizmo_drag.is_some();
+        let mut gizmo_active = false;
+        if let Some((origin, normal)) = anchor {
+            let amount = self
+                .state
+                .creating_edge_treatment
+                .as_ref()
+                .map(|cet| cet.evaluated_amount(&self.state.doc))
+                .unwrap_or(0.0);
+            let handle_offset = construction::gizmo_display_offset(amount);
+            let hovered = pointer_screen.is_some_and(|pp| {
+                construction::offset_gizmo_hit(pp, project, origin, normal, handle_offset)
+            });
+            if !following && primary_pressed && hovered {
+                if let Some(pp) = pointer_screen {
+                    self.edge_treatment_gizmo_drag = Some(EdgeTreatmentGizmoDrag {
+                        start_screen: pp,
+                        start_amount: amount,
+                    });
+                    if let Some(cet) = self.state.creating_edge_treatment.as_mut() {
+                        cet.user_edited = false;
+                    }
+                    ui.ctx().memory_mut(|m| {
+                        m.surrender_focus(egui::Id::new(EDGE_TREATMENT_AMOUNT_FIELD_ID))
+                    });
+                }
+            }
+            if let Some(drag) = self.edge_treatment_gizmo_drag {
+                gizmo_active = true;
+                if let Some(pp) = pointer_screen {
+                    let new_amount = construction::offset_from_normal_drag(
+                        origin,
+                        normal,
+                        project,
+                        drag.start_amount,
+                        drag.start_screen,
+                        pp,
+                    )
+                    .max(0.0);
+                    if let Some(cet) = self.state.creating_edge_treatment.as_mut() {
+                        cet.amount_live = new_amount;
+                        if !cet.user_edited {
+                            cet.text = crate::value::format_length_display(new_amount);
+                        }
+                    }
+                }
+            }
+        }
+
+        // A click while following commits the treatment.
+        if following && primary_pressed {
+            if let Some(cet) = self.state.creating_edge_treatment.take() {
+                let amount = cet.evaluated_amount(&self.state.doc);
+                self.state.apply(Action::CommitEdgeTreatment {
+                    extrusion: cet.extrusion,
+                    edge: cet.edge,
+                    kind: cet.kind,
+                    amount,
+                });
+            }
+            self.edge_treatment_gizmo_drag = None;
+            return;
+        }
+        if gizmo_active {
+            return;
+        }
+
+        // Click a treatable analytic edge (vertical or side/cap) to begin.
+        if primary_pressed && self.state.creating_edge_treatment.is_none() {
+            if let Some(pp) = pointer_screen {
+                if let Some((extrusion, edge, _, _, _)) =
+                    construction::nearest_treatable_edge(pp, project, &self.state.doc)
+                {
+                    self.state.creating_edge_treatment = Some(CreatingEdgeTreatment {
+                        extrusion,
+                        edge,
+                        kind,
+                        amount_live: DEFAULT_VERTEX_TREATMENT_AMOUNT,
+                        text: crate::value::format_length_display(
+                            DEFAULT_VERTEX_TREATMENT_AMOUNT,
+                        ),
+                        user_edited: false,
+                        pending_focus: true,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Floating amount field for the in-progress 3D edge chamfer/fillet (Enter commits).
+    /// Mirrors [`Self::show_vertex_treatment_amount_input`].
+    fn show_edge_treatment_amount_input(
+        &mut self,
+        ui: &egui::Ui,
+        project: &impl Fn(Vec3) -> Option<egui::Pos2>,
+    ) {
+        let pos = {
+            let Some(cet) = self.state.creating_edge_treatment.as_ref() else {
+                return;
+            };
+            let Some((origin, normal)) =
+                crate::extrude::extrusion_edge_anchor(&self.state.doc, cet.extrusion, cet.edge)
+            else {
+                return;
+            };
+            let handle_offset =
+                construction::gizmo_display_offset(cet.evaluated_amount(&self.state.doc));
+            project(construction::offset_handle(origin, normal, handle_offset))
+                .map(|p| p + egui::vec2(14.0, -12.0))
+        };
+        let Some(pos) = pos else {
+            return;
+        };
+        let ctx = ui.ctx();
+        let id = egui::Id::new(EDGE_TREATMENT_AMOUNT_FIELD_ID);
+        let mut commit = false;
+
+        if !ctx.memory(|m| m.has_focus(id)) && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            commit = true;
+        }
+
+        if !ctx.memory(|m| m.has_focus(id)) {
+            let typed: String = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            let typed: String = typed
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if !typed.is_empty() {
+                if let Some(cet) = self.state.creating_edge_treatment.as_mut() {
+                    cet.text = typed;
+                    cet.user_edited = true;
+                    cet.pending_focus = true;
+                }
+            }
+        }
+        if let Some(cet) = self.state.creating_edge_treatment.as_mut() {
+            let label = match cet.kind {
+                VertexTreatmentKind::Chamfer => "mm",
+                VertexTreatmentKind::Fillet => "mm r",
+            };
+            let want_focus = cet.pending_focus;
+            egui::Area::new(egui::Id::new("edge_treatment_amount_area"))
+                .fixed_pos(pos)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut cet.text)
+                                .id(id)
+                                .desired_width(64.0),
+                        );
+                        if resp.changed() {
+                            cet.user_edited = true;
+                        }
+                        if want_focus {
+                            resp.request_focus();
+                            cet.pending_focus = false;
+                        }
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            commit = true;
+                        }
+                        ui.label(label);
+                    });
+                });
+        }
+        if commit {
+            if let Some(cet) = self.state.creating_edge_treatment.take() {
+                let amount = cet.evaluated_amount(&self.state.doc);
+                self.state.apply(Action::CommitEdgeTreatment {
+                    extrusion: cet.extrusion,
+                    edge: cet.edge,
+                    kind: cet.kind,
                     amount,
                 });
             }
@@ -1392,29 +1684,23 @@ impl eframe::App for App {
                 }
                 if icons::selectable_icon_button(
                     ui,
-                    icons::IconId::Dimension,
-                    self.state.tool == Tool::Dimension,
-                    shortcuts::compact_label(
-                        "Dimension",
-                        shortcuts::tool_shortcut(Tool::Dimension),
-                    ),
+                    icons::IconId::Fillet,
+                    self.state.tool == Tool::Fillet,
+                    shortcuts::compact_label("Fillet", shortcuts::tool_shortcut(Tool::Fillet)),
                 )
                 .clicked()
                 {
-                    self.state.apply(Action::SetTool(Tool::Dimension));
+                    self.state.apply(Action::SetTool(Tool::Fillet));
                 }
                 if icons::selectable_icon_button(
                     ui,
-                    icons::IconId::Constraint,
-                    self.state.tool == Tool::Constraint,
-                    shortcuts::compact_label(
-                        "Constraint",
-                        shortcuts::tool_shortcut(Tool::Constraint),
-                    ),
+                    icons::IconId::Chamfer,
+                    self.state.tool == Tool::Chamfer,
+                    shortcuts::compact_label("Chamfer", shortcuts::tool_shortcut(Tool::Chamfer)),
                 )
                 .clicked()
                 {
-                    self.state.apply(Action::SetTool(Tool::Constraint));
+                    self.state.apply(Action::SetTool(Tool::Chamfer));
                 }
                 if icons::selectable_icon_button(
                     ui,
@@ -1441,23 +1727,29 @@ impl eframe::App for App {
                 }
                 if icons::selectable_icon_button(
                     ui,
-                    icons::IconId::Chamfer,
-                    self.state.tool == Tool::Chamfer,
-                    shortcuts::compact_label("Chamfer", shortcuts::tool_shortcut(Tool::Chamfer)),
+                    icons::IconId::Dimension,
+                    self.state.tool == Tool::Dimension,
+                    shortcuts::compact_label(
+                        "Dimension",
+                        shortcuts::tool_shortcut(Tool::Dimension),
+                    ),
                 )
                 .clicked()
                 {
-                    self.state.apply(Action::SetTool(Tool::Chamfer));
+                    self.state.apply(Action::SetTool(Tool::Dimension));
                 }
                 if icons::selectable_icon_button(
                     ui,
-                    icons::IconId::Fillet,
-                    self.state.tool == Tool::Fillet,
-                    shortcuts::compact_label("Fillet", shortcuts::tool_shortcut(Tool::Fillet)),
+                    icons::IconId::Constraint,
+                    self.state.tool == Tool::Constraint,
+                    shortcuts::compact_label(
+                        "Constraint",
+                        shortcuts::tool_shortcut(Tool::Constraint),
+                    ),
                 )
                 .clicked()
                 {
-                    self.state.apply(Action::SetTool(Tool::Fillet));
+                    self.state.apply(Action::SetTool(Tool::Constraint));
                 }
                 if let Some(session) = self.state.sketch_session {
                     ui.separator();
@@ -1543,6 +1835,7 @@ impl eframe::App for App {
                         &mut self.state.element_visibility,
                         &self.state.scene_selection,
                         &self.state.document_health,
+                        &mut self.hierarchy_view_mode,
                         &mut queue_edit_sketch,
                         &mut queue_edit_plane,
                         &mut queue_edit_extrusion,
@@ -1594,6 +1887,8 @@ impl eframe::App for App {
                 draw_rect_construction: self.state.rect_draw_construction_mode(),
                 draw_line_construction: self.state.line_draw_construction_mode(),
                 draw_circle_construction: self.state.circle_draw_construction_mode(),
+                draw_line_curve_mode: self.state.line_curve_mode(),
+                draw_line_tangent_constraint: self.state.line_tangent_constraint(),
                 in_sketch: self.state.sketch_session.is_some(),
                 snapping_enabled: self.state.snapping_enabled,
                 extrude_merge_candidate: self
@@ -1610,6 +1905,8 @@ impl eframe::App for App {
             let content = context::context_pane_content(&context_input);
             context::sync_name_draft(&mut self.state.context_pane, &self.state.doc, &content);
             let mut construction_change: Option<bool> = None;
+            let mut curve_mode_change: Option<bool> = None;
+            let mut tangent_constraint_change: Option<bool> = None;
             let mut name_commit: Option<(SceneElement, String)> = None;
             let mut constraint_apply: Option<crate::geometric_constraints::GeometricConstraintType> =
                 None;
@@ -1630,6 +1927,12 @@ impl eframe::App for App {
                         &self.state.document_health,
                         &self.state.scene_selection,
                         &mut |element, name| name_commit = Some((element, name)),
+                        &mut |curve_mode| {
+                            curve_mode_change = Some(curve_mode);
+                        },
+                        &mut |tangent_constraint| {
+                            tangent_constraint_change = Some(tangent_constraint);
+                        },
                         &mut |construction| {
                             construction_change = Some(construction);
                         },
@@ -1652,6 +1955,12 @@ impl eframe::App for App {
             if let Some(construction) = construction_change {
                 self.state
                     .apply(Action::ApplyConstruction { construction });
+            }
+            if let Some(curve_mode) = curve_mode_change {
+                self.state.apply(Action::ApplyCurveMode { curve_mode });
+            }
+            if let Some(tangent_constraint) = tangent_constraint_change {
+                self.state.apply(Action::ApplyTangentConstraint { tangent_constraint });
             }
             if let Some(mode) = extrude_body_mode_change {
                 self.state.apply(Action::SetExtrudeBodyMode { mode });
@@ -1700,6 +2009,35 @@ fn next_plane_focus_dim(focused: PlaneDim) -> PlaneDim {
     }
 }
 
+/// URL of the in-repo third-party open-source licenses document (#86). Opened by
+/// Help ▸ Licenses.
+const LICENSES_DOC_URL: &str =
+    "https://github.com/iffy/BearCAD/blob/master/THIRD_PARTY_LICENSES.md";
+
+/// Open the third-party licenses document in the user's default browser, without
+/// pulling in a URL-opening crate.
+fn open_licenses_document() -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(LICENSES_DOC_URL);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", LICENSES_DOC_URL]);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(LICENSES_DOC_URL);
+        c
+    };
+    cmd.spawn().map(|_| ())
+}
+
 /// Colours used in the viewport.
 mod col {
     use egui::Color32;
@@ -1713,6 +2051,9 @@ mod col {
     /// Shared stroke color for all solid sketch shape edges (lines, rect edges, circles).
     pub const RECT_LINE: Color32 = Color32::from_rgb(120, 170, 240);
     pub const PREVIEW: Color32 = Color32::from_rgb(240, 200, 120);
+    /// Viewport border while a sketch is open (#74) — an unmissable mode indicator distinct
+    /// from every other viewport accent color in this palette.
+    pub const SKETCH_MODE_BORDER: Color32 = Color32::from_rgb(255, 140, 30);
     /// Pivot shown while right-dragging to orbit the camera.
     pub const ORBIT_PIVOT: Color32 = Color32::from_rgb(255, 105, 180);
     /// Drop line from the orbit pivot to the ground plane.
@@ -1737,6 +2078,8 @@ mod col {
 
 const GRID_EXTENT: f32 = gpu_viewport::GRID_EXTENT;
 const GRID_STEP: f32 = gpu_viewport::GRID_STEP;
+/// Width of the sketch-mode viewport border (#74).
+const SKETCH_MODE_BORDER_WIDTH: f32 = 3.0;
 
 /// Screen-space height of a floating dimension input (frame + text field).
 const DIM_INPUT_HEIGHT: f32 = 26.0;
@@ -1943,10 +2286,12 @@ fn build_viewport_scene_input<'a>(
     creating_circle: Option<&CreatingCircle>,
     creating_plane: Option<&CreatingConstructionPlane>,
     creating_extrusion: Option<&CreatingExtrusion>,
+    creating_edge_treatment: Option<&CreatingEdgeTreatment>,
     pending_extrude_target: Option<model::ExtrudeTarget>,
     plane_gizmo: Option<gpu_viewport::ViewportPlaneGizmo>,
     extrude_gizmo: Option<gpu_viewport::ViewportExtrudeGizmo>,
     vertex_treatment_gizmo: Option<gpu_viewport::ViewportExtrudeGizmo>,
+    vertex_treatment_preview: Option<Vec<Vec3>>,
     hover_highlight: Option<gpu_viewport::ViewportHoverHighlight>,
     dimension_labels: &'a [gpu_viewport::ViewportDimLabel],
     dim_label_view: Option<PlanarLabelView>,
@@ -1974,6 +2319,23 @@ fn build_viewport_scene_input<'a>(
         let (u1, v1) = world_to_local(&frame, end);
         let mut preview = Line::from_local_endpoints(session.sketch, u0, v0, u1, v1);
         preview.construction = cl.construction;
+        // #73: live-preview this in-progress segment's own curve — smoothed against the
+        // previous chained segment (tangent-constraint on) or an independent corner handle
+        // (off). The very first segment of a fresh chain has no previous segment to derive a
+        // tangent from, so it stays straight until a third point makes the joint meaningful.
+        if let Some(prev_idx) = cl.chained_from {
+            if let Some(prev_far) = doc.lines.get(prev_idx).map(|l| (l.x0, l.y0)) {
+                let (_, line_bezier) = chained_curve_handles(
+                    prev_far,
+                    cl.chained_from_bezier,
+                    (u0, v0),
+                    (u1, v1),
+                    cl.curve_mode,
+                    cl.tangent_constraint,
+                );
+                preview.bezier = line_bezier;
+            }
+        }
         Some(preview)
     });
     let preview_circle = creating_circle.and_then(|cc| {
@@ -2011,22 +2373,44 @@ fn build_viewport_scene_input<'a>(
     let active_sketch_face = sketch_session.and_then(|session| doc.sketch_face(session.sketch));
     let active_sketch_face = active_sketch_face.filter(|face| !matches!(face, FaceId::ConstructionPlane(_)));
 
-    let editing_extrusion = creating_extrusion.and_then(|ce| ce.edit_index);
+    // The in-progress 3D edge chamfer/fillet (#77) also drives a ghost-preview solid, reusing
+    // the exact same `preview_extrusion`/`editing_extrusion` mechanism as the extrude tool: a
+    // full clone of the target extrusion with the live treatment spliced in (never touching
+    // `doc` until commit), rendered translucent while the committed body is hidden. The two
+    // cases are mutually exclusive (one needs a sketch open, the other needs it closed), so
+    // there's no ambiguity about which one is "active".
+    let editing_extrusion = creating_extrusion
+        .and_then(|ce| ce.edit_index)
+        .or_else(|| creating_edge_treatment.map(|cet| cet.extrusion));
 
-    let preview_extrusion = creating_extrusion.and_then(|ce| {
-        (!ce.faces.is_empty()).then(|| model::Extrusion {
-            sketch: ce.sketch,
-            faces: ce.faces.clone(),
-            distance: ce.evaluated_distance(doc),
-            // While dragging the gizmo, the target is only known live (not yet committed
-            // onto `ce`) — fall back to it so the ghost preview actually shows the slanted
-            // shape it will land in, instead of a generic blind extrude (#63).
-            target: ce.target.clone().or(pending_extrude_target),
-            expression: String::new(),
-            name: None,
-            deleted: false,
+    let preview_extrusion = creating_extrusion
+        .and_then(|ce| {
+            (!ce.faces.is_empty()).then(|| model::Extrusion {
+                sketch: ce.sketch,
+                faces: ce.faces.clone(),
+                distance: ce.evaluated_distance(doc),
+                // While dragging the gizmo, the target is only known live (not yet committed
+                // onto `ce`) — fall back to it so the ghost preview actually shows the slanted
+                // shape it will land in, instead of a generic blind extrude (#63).
+                target: ce.target.clone().or(pending_extrude_target),
+                expression: String::new(),
+                name: None,
+                deleted: false,
+                edge_treatments: Vec::new(),
+            })
         })
-    });
+        .or_else(|| {
+            let cet = creating_edge_treatment?;
+            let amount = cet.evaluated_amount(doc);
+            if amount <= 0.0 {
+                return None;
+            }
+            crate::extrude::extrusion_with_edge_treatment(
+                doc,
+                cet.extrusion,
+                model::EdgeTreatment { edge: cet.edge, kind: cet.kind, amount },
+            )
+        });
 
     gpu_viewport::ViewportSceneInput {
         doc,
@@ -2061,6 +2445,8 @@ fn build_viewport_scene_input<'a>(
         plane_gizmo,
         extrude_gizmo,
         vertex_treatment_gizmo,
+        vertex_treatment_preview: vertex_treatment_preview
+            .map(|points| gpu_viewport::VertexTreatmentPreviewGeom { points }),
         hover_highlight,
         hover_color: construction::PICK_HOVER_RGBA,
         document_health,
@@ -2370,6 +2756,7 @@ fn show_sketch_dimension_field(
     id: egui::Id,
     text: &mut String,
     doc: &mut model::Document,
+    sketch: Option<model::SketchId>,
     is_focus_target: bool,
     pending_focus: &mut bool,
     user_edited: bool,
@@ -2419,13 +2806,21 @@ fn show_sketch_dimension_field(
     let computed = if has_errors {
         None
     } else if angle {
+        let unit = match sketch {
+            Some(s) => crate::model::effective_angle_unit(doc, s),
+            None => doc.default_angle_unit,
+        };
         crate::value::computed_angle_in_doc(text, doc)
             .filter(|_| show_computed_row)
-            .map(crate::value::format_angle_display)
+            .map(|v| crate::value::format_angle_display_in(v, unit))
     } else {
+        let unit = match sketch {
+            Some(s) => crate::model::effective_length_unit(doc, s),
+            None => doc.default_length_unit,
+        };
         computed_length_in_doc(text, doc)
             .filter(|_| show_computed_row)
-            .map(format_length_display)
+            .map(|v| crate::value::format_length_display_in(v, unit))
     };
     let text_width = dim_input_text_width(text);
 
@@ -2798,7 +3193,7 @@ fn build_committed_dim_layouts(
         .enumerate()
         .filter(|(_, c)| c.sketch == session.sketch)
     {
-        let ConstraintKind::Distance { target } = constraint.kind else {
+        let ConstraintKind::Distance { target } = constraint.kind.clone() else {
             continue;
         };
         if matches!(target, DistanceTarget::CircleDiameter(_)) {
@@ -2836,7 +3231,12 @@ fn build_committed_dim_layouts(
             }
         };
         let label = constraint_evaluated_length(doc, index)
-            .map(format_length_display)
+            .map(|v| {
+                crate::value::format_length_display_in(
+                    v,
+                    crate::model::effective_length_unit(doc, session.sketch),
+                )
+            })
             .unwrap_or_else(|| "?".to_string());
         push_committed_dim_layout(
             &mut layouts,
@@ -2860,7 +3260,7 @@ fn build_committed_dim_layouts(
     {
         let ConstraintKind::Distance {
             target: DistanceTarget::CircleDiameter(i),
-        } = constraint.kind
+        } = constraint.kind.clone()
         else {
             continue;
         };
@@ -2871,7 +3271,12 @@ fn build_committed_dim_layouts(
             continue;
         };
         let label = constraint_evaluated_length(doc, index)
-            .map(format_diameter_display)
+            .map(|v| {
+                crate::value::format_diameter_display_in(
+                    v,
+                    crate::model::effective_length_unit(doc, session.sketch),
+                )
+            })
             .unwrap_or_else(|| "?".to_string());
         push_circle_diameter_dim_layout(
             &mut layouts,
@@ -2897,12 +3302,17 @@ fn build_committed_dim_layouts(
             line_a,
             line_b,
             rotation_sign,
-        } = constraint.kind
+        } = constraint.kind.clone()
         else {
             continue;
         };
         let label = constraint_evaluated_angle(doc, index)
-            .map(crate::value::format_angle_display)
+            .map(|v| {
+                crate::value::format_angle_display_in(
+                    v,
+                    crate::model::effective_angle_unit(doc, session.sketch),
+                )
+            })
             .unwrap_or_else(|| "?".to_string());
         push_arc_dim_layout(
             &mut layouts,
@@ -3041,7 +3451,10 @@ fn draw_extrude_height_dimension<Project>(
     let Some(geom) = project_linear_dimension_geom(&world_geom, project) else {
         return;
     };
-    let label = crate::value::format_length_display(distance.abs());
+    let label = crate::value::format_length_display_in(
+        distance.abs(),
+        crate::model::effective_length_unit(doc, ce.sketch),
+    );
     draw_linear_dimension::<fn(Vec3) -> Option<egui::Pos2>>(
         painter,
         &geom,
@@ -3158,21 +3571,51 @@ fn handle_committed_dim_label_double_click(
     true
 }
 
-/// The extrude-able face (rectangle/circle) under the cursor, if any.
+/// The extrude-able face (rectangle/circle) under the cursor, if any. When the picked shape
+/// overlaps exactly one other raw shape in its sketch (#16/#62), resolves the click to the
+/// right atomic boolean region (their intersection, or one minus the other) instead of the
+/// whole picked shape — see `extrude::overlapping_partner`/`resolve_boolean_click`. Any other
+/// case (no overlap, ambiguous 3+-way overlap, or the click landing outside both loops) falls
+/// back to today's whole-shape picking.
 fn pick_extrude_face(
     pp: egui::Pos2,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
     doc: &model::Document,
     eye: Vec3,
+    cam: &camera::Camera,
+    viewport: egui::Rect,
+    vp: &glam::Mat4,
 ) -> Option<model::ExtrudeFace> {
-    match pick_sketch_face(pp, project, doc, eye)? {
-        FaceId::Rect(i) => Some(model::ExtrudeFace::Rect(i)),
-        FaceId::Circle(i) => Some(model::ExtrudeFace::Circle(i)),
-        FaceId::Polygon(lines) => Some(model::ExtrudeFace::Polygon(lines)),
+    let base = match pick_sketch_face(pp, project, doc, eye)? {
+        FaceId::Rect(i) => model::ExtrudeFace::Rect(i),
+        FaceId::Circle(i) => model::ExtrudeFace::Circle(i),
+        FaceId::Polygon(lines) => model::ExtrudeFace::Polygon(lines),
         FaceId::ConstructionPlane(_) | FaceId::ExtrudeCap { .. } | FaceId::ExtrudeSide { .. } => {
-            None
+            return None;
         }
+    };
+    if let Some(resolved) = resolve_boolean_extrude_face(doc, &base, pp, cam, viewport, vp) {
+        return Some(resolved);
     }
+    Some(base)
+}
+
+/// If `face`'s sketch has exactly one other shape overlapping it, and `pp` (in screen space)
+/// lands within their combined footprint, the atomic boolean region the click landed in.
+fn resolve_boolean_extrude_face(
+    doc: &model::Document,
+    face: &model::ExtrudeFace,
+    pp: egui::Pos2,
+    cam: &camera::Camera,
+    viewport: egui::Rect,
+    vp: &glam::Mat4,
+) -> Option<model::ExtrudeFace> {
+    let sketch = actions::extrude_face_sketch(doc, face)?;
+    let other = extrude::overlapping_partner(doc, sketch, face)?;
+    let frame = sketch_geometry_frame(doc, sketch)?;
+    let world = cam.ray_plane_hit(pp, viewport, vp, frame.origin, frame.normal)?;
+    let point = world_to_local(&frame, world);
+    extrude::resolve_boolean_click(doc, sketch, face, &other, point)
 }
 
 fn extrude_face_id(face: model::ExtrudeFace) -> FaceId {
@@ -3192,6 +3635,9 @@ const EXTRUDE_DISTANCE_FIELD_ID: &str = "extrude_distance_input";
 /// egui id of the floating chamfer/fillet amount text field.
 const VERTEX_TREATMENT_AMOUNT_FIELD_ID: &str = "vertex_treatment_amount_input";
 
+/// egui id of the floating 3D edge chamfer/fillet amount text field (#77).
+const EDGE_TREATMENT_AMOUNT_FIELD_ID: &str = "edge_treatment_amount_input";
+
 /// World-space origin (the vertex) and normal (inward bisector of the two adjoining lines,
 /// pointing into the corner so pulling the gizmo away from the vertex increases the amount)
 /// for the chamfer/fillet gizmo, given the picked vertex. `None` if the vertex no longer joins
@@ -3202,17 +3648,8 @@ fn vertex_treatment_anchor(
     point: ConstraintPoint,
 ) -> Option<(Vec3, Vec3)> {
     let frame = sketch_geometry_frame(doc, sketch)?;
-    let [(line1, end1), (line2, end2)] = vertex_drag::incident_two_lines(doc, sketch, point)?;
-    let l1 = doc.lines.get(line1)?;
-    let (v, a) = match end1 {
-        model::LineEnd::Start => ((l1.x0, l1.y0), (l1.x1, l1.y1)),
-        model::LineEnd::End => ((l1.x1, l1.y1), (l1.x0, l1.y0)),
-    };
-    let l2 = doc.lines.get(line2)?;
-    let b = match end2 {
-        model::LineEnd::Start => (l2.x1, l2.y1),
-        model::LineEnd::End => (l2.x0, l2.y0),
-    };
+    let corner = vertex_drag::treatment_corner(doc, sketch, point)?;
+    let (v, a, b) = (corner.v, corner.a, corner.b);
     let dist_va = ((a.0 - v.0).powi(2) + (a.1 - v.1).powi(2)).sqrt();
     let dist_vb = ((b.0 - v.0).powi(2) + (b.1 - v.1).powi(2)).sqrt();
     if dist_va < 1e-6 || dist_vb < 1e-6 {
@@ -3228,6 +3665,41 @@ fn vertex_treatment_anchor(
     }
     let origin = face::local_to_world(&frame, v.0, v.1);
     Some((origin, normal))
+}
+
+/// World-space preview polyline for the in-progress chamfer/fillet, recomputed every frame from
+/// the *live* gizmo amount so dragging the handle visibly resizes the cut/round before commit
+/// (#76). Traces the treated corner end to end: the first line's far endpoint, the truncated
+/// point, the bridge (straight for a chamfer, sampled from the fillet's bezier — reuses
+/// [`Line::sample_local`] so the preview matches the actual bridge geometry
+/// [`Action::CommitVertexTreatment`] will create), the other truncated point, and the second
+/// line's far endpoint. `None` while the corner can't be treated (e.g. the live amount is zero,
+/// or the vertex no longer joins exactly two lines) — callers should just skip drawing.
+fn vertex_treatment_preview_points(
+    doc: &model::Document,
+    sketch: model::SketchId,
+    cvt: &CreatingVertexTreatment,
+) -> Option<Vec<Vec3>> {
+    let frame = sketch_geometry_frame(doc, sketch)?;
+    let corner = vertex_drag::treatment_corner(doc, sketch, cvt.point.clone())?;
+    let amount = cvt.evaluated_amount(doc);
+    let geom = model::vertex_treatment_geometry(corner.v, corner.a, corner.b, cvt.kind, amount)?;
+
+    let mut bridge =
+        Line::from_local_endpoints(sketch, geom.p1.0, geom.p1.1, geom.p2.0, geom.p2.1);
+    bridge.bezier = geom.bezier;
+
+    let mut local_points = Vec::with_capacity(model::BEZIER_SEGMENTS + 3);
+    local_points.push(corner.a);
+    local_points.extend(bridge.sample_local(model::BEZIER_SEGMENTS));
+    local_points.push(corner.b);
+
+    Some(
+        local_points
+            .into_iter()
+            .map(|(u, v)| face::local_to_world(&frame, u, v))
+            .collect(),
+    )
 }
 
 /// Where the extrude gizmo handle is drawn along the normal: the actual extrude
@@ -3252,7 +3724,7 @@ fn pick_extrude_target(
     // Nearest vertex.
     let mut best: Option<(f32, ExtrudeTarget)> = None;
     for vertex in snapping::all_sketch_vertices(doc) {
-        if let Some(world) = extrude::constraint_point_world(doc, vertex) {
+        if let Some(world) = extrude::constraint_point_world(doc, vertex.clone()) {
             if let Some(sp) = project(world) {
                 let d = (sp - pp).length();
                 if d <= VERTEX_RADIUS_PX && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
@@ -3293,17 +3765,21 @@ fn snap_radius_uv(
 }
 
 /// World position and target of the active snap (dragged vertex or line end), for the marker.
-fn active_snap(state: &AppState, frame: &face::SketchFrame) -> Option<(Vec3, snapping::SnapTarget)> {
-    if let Some((point, target)) = state.active_snap {
-        let (u, v) = crate::geometric_constraints::point_uv(&state.doc, point).ok()?;
+fn active_snap(
+    state: &AppState,
+    sketch: SketchId,
+    frame: &face::SketchFrame,
+) -> Option<(Vec3, snapping::SnapTarget)> {
+    if let Some((point, target)) = state.active_snap.clone() {
+        let (u, v) = crate::geometric_constraints::point_uv(&state.doc, sketch, point).ok()?;
         return Some((face::local_to_world(frame, u, v), target));
     }
-    if let Some(target) = state.line_end_snap {
+    if let Some(target) = state.line_end_snap.clone() {
         if let Some(cl) = &state.creating_line {
             return Some((cl.end_point(frame, &state.doc), target));
         }
     }
-    if let Some(target) = state.rect_opposite_snap {
+    if let Some(target) = state.rect_opposite_snap.clone() {
         if let Some(cr) = &state.creating_rect {
             return Some((cr.end_point(frame, &state.doc), target));
         }
@@ -3319,6 +3795,7 @@ fn snap_icon(target: snapping::SnapTarget) -> icons::IconId {
         | snapping::SnapTarget::Origin
         | snapping::SnapTarget::OnLine(_)
         | snapping::SnapTarget::OnLineExtension(_) => icons::IconId::Coincident,
+        snapping::SnapTarget::NormalAtMidpoint(_) => icons::IconId::Perpendicular,
     }
 }
 
@@ -3346,9 +3823,31 @@ fn snap_ground_point(
     // No direct snap: fall back to the extension guides of the last-hovered vertex (#21),
     // letting the point latch onto the infinite extension of those edges.
     if !state.extension_anchors.is_empty() {
-        if let Some(snap) =
-            snapping::find_extension_snap(&state.doc, &state.extension_anchors, (u, v), radius, exclude)
-        {
+        if let Some(snap) = snapping::find_extension_snap(
+            &state.doc,
+            session.sketch,
+            &state.extension_anchors,
+            (u, v),
+            radius,
+            exclude,
+        ) {
+            return (
+                face::local_to_world(frame, snap.uv.0, snap.uv.1),
+                Some(snap.target),
+            );
+        }
+    }
+    // Still nothing: fall back to the normal-through-midpoint guide of the last-touched
+    // midpoint (#41), letting the point latch onto that infinite perpendicular line.
+    if state.normal_inference_anchor.is_some() {
+        if let Some(snap) = snapping::find_normal_at_midpoint_snap(
+            &state.doc,
+            session.sketch,
+            state.normal_inference_anchor.clone(),
+            (u, v),
+            radius,
+            exclude,
+        ) {
             return (
                 face::local_to_world(frame, snap.uv.0, snap.uv.1),
                 Some(snap.target),
@@ -3358,12 +3857,19 @@ fn snap_ground_point(
     (world, None)
 }
 
-/// Update the active extension-snap guides (#21) from the latest snap result: hovering a real
-/// vertex makes its incident edges the extension anchors; other snaps leave the guides in place
-/// so the user can pull away from the vertex and still snap to its edges' extensions.
+/// Update the active inference-snap guides from the latest snap result: hovering a real vertex
+/// makes its incident edges the extension anchors (#21); hovering a line's midpoint makes that
+/// line the normal-at-midpoint anchor (#41). Other snaps leave both guides in place so the user
+/// can pull away from the touched vertex/midpoint and still snap to its guide line.
 fn update_extension_anchors(state: &mut AppState, snap_target: Option<snapping::SnapTarget>) {
-    if let Some(snapping::SnapTarget::Vertex(point)) = snap_target {
-        state.extension_anchors = snapping::vertex_extension_anchors(point);
+    match snap_target {
+        Some(snapping::SnapTarget::Vertex(point)) => {
+            state.extension_anchors = snapping::vertex_extension_anchors(point);
+        }
+        Some(snapping::SnapTarget::Midpoint(line)) => {
+            state.normal_inference_anchor = Some(line);
+        }
+        _ => {}
     }
 }
 
@@ -3413,7 +3919,7 @@ fn handle_vertex_drag(
                         let exclude = vertex_drag::coincident_group(
                             &state.doc,
                             session.sketch,
-                            active.point,
+                            active.point.clone(),
                         );
                         if let Some(snap) = snapping::find_snap(
                             &state.doc,
@@ -3424,11 +3930,11 @@ fn handle_vertex_drag(
                         ) {
                             u = snap.uv.0;
                             v = snap.uv.1;
-                            state.active_snap = Some((active.point, snap.target));
+                            state.active_snap = Some((active.point.clone(), snap.target));
                         }
                     }
                     let _ = state.apply(Action::DragVertex {
-                        point: active.point,
+                        point: active.point.clone(),
                         u,
                         v,
                     });
@@ -3444,13 +3950,13 @@ fn handle_vertex_drag(
             if let Some((point, _)) =
                 nearest_sketch_point_in_sketch(pp, project, &state.doc, session.sketch)
             {
-                let element = vertex_drag::scene_element_for_point(point);
+                let element = vertex_drag::scene_element_for_point(point.clone());
                 if document_health::require_element_editable(&state.document_health, element)
                     .is_err()
                 {
                     return false;
                 }
-                *drag = Some(VertexDrag { point });
+                *drag = Some(VertexDrag { point: point.clone() });
                 state.apply(Action::ClickSceneElement {
                     element: SceneElement::Point(point),
                     additive: ui.input(|i| additive_click_modifiers(&i.modifiers)),
@@ -3517,8 +4023,8 @@ fn handle_line_drag(
             if let Some((target, _)) =
                 nearest_sketch_line_in_sketch(pp, project, &state.doc, session.sketch)
             {
-                let element = vertex_drag::scene_element_for_line(target);
-                if document_health::require_element_editable(&state.document_health, element)
+                let element = vertex_drag::scene_element_for_line(target.clone());
+                if document_health::require_element_editable(&state.document_health, element.clone())
                     .is_err()
                 {
                     return false;
@@ -4147,6 +4653,11 @@ impl App {
                     &project,
                     pointer_screen,
                 );
+                if let Some(active) = &self.bezier_handle_drag {
+                    // Persists past this frame (unlike `bezier_handle_drag`, which clears on
+                    // release) so a plain click — not just a drag — selects the handle (#75).
+                    self.selected_bezier_handle = Some((active.line, active.near_start));
+                }
                 if !bezier_handle_dragging {
                     line_dragging = handle_line_drag(
                         ui,
@@ -4213,15 +4724,21 @@ impl App {
             self.bezier_handle_drag.is_some(),
         );
 
-        // Right-click a two-line vertex to offer converting it to a smooth bezier joint, or a
-        // curved line to offer straightening it back out (#54).
+        // Right-click a bezier handle to offer deleting it, a two-line vertex to offer
+        // converting it to a smooth bezier joint, or a curved line to offer straightening it
+        // back out (#54/#75).
         if response.secondary_clicked() {
             self.viewport_context_menu = sketch_session.and_then(|session| {
                 let pp = response.interact_pointer_pos().or(pointer_screen)?;
+                if let Some((line, _)) =
+                    nearest_bezier_handle_in_sketch(pp, &project, &self.state.doc, session.sketch)
+                {
+                    return Some(ViewportContextMenu::DeleteBezierHandle(line));
+                }
                 if let Some((point, _)) =
                     nearest_sketch_point_in_sketch(pp, &project, &self.state.doc, session.sketch)
                 {
-                    if vertex_incident_line_count(&self.state.doc, session.sketch, point) == 2 {
+                    if vertex_incident_line_count(&self.state.doc, session.sketch, point.clone()) == 2 {
                         return Some(ViewportContextMenu::ConvertVertexToBezier(point));
                     }
                 }
@@ -4236,7 +4753,7 @@ impl App {
             });
         }
         if self.viewport_context_menu.is_some() {
-            response.context_menu(|ui| match self.viewport_context_menu {
+            response.context_menu(|ui| match self.viewport_context_menu.clone() {
                 Some(ViewportContextMenu::ConvertVertexToBezier(point)) => {
                     if ui.button("Convert to bezier curve").clicked() {
                         self.state.apply(Action::ConvertVertexToBezier { point });
@@ -4247,6 +4764,14 @@ impl App {
                 Some(ViewportContextMenu::StraightenLine(line)) => {
                     if ui.button("Straighten curve").clicked() {
                         self.state.apply(Action::StraightenLine { line });
+                        self.viewport_context_menu = None;
+                        ui.close_menu();
+                    }
+                }
+                Some(ViewportContextMenu::DeleteBezierHandle(line)) => {
+                    if ui.button("Delete handle").clicked() {
+                        self.state.apply(Action::StraightenLine { line });
+                        self.selected_bezier_handle = None;
                         self.viewport_context_menu = None;
                         ui.close_menu();
                     }
@@ -4270,6 +4795,10 @@ impl App {
             if let Some(pp) = pointer_screen {
                 let gp = cam.ground_point(pp, viewport, &vp);
                 if ui.input(|i| i.pointer.primary_pressed()) {
+                    // This whole block only runs when no bezier handle was just grabbed (see
+                    // the gating `&& self.bezier_handle_drag.is_none()` above), so any click
+                    // reaching here selects something else — clear the handle selection (#75).
+                    self.selected_bezier_handle = None;
                     let additive = ui.input(|i| additive_click_modifiers(&i.modifiers));
                     if let Some(index) =
                         pointer_over_constraint_icon(&constraint_icon_hits, pp)
@@ -4356,10 +4885,10 @@ impl App {
                     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
                     let (sgp, snap_target) =
                         snap_ground_point(&self.state, session, &frame, &project, gp, &[]);
-                    update_extension_anchors(&mut self.state, snap_target);
+                    update_extension_anchors(&mut self.state, snap_target.clone());
 
                     if !was_creating && primary_pressed && !over_committed_dim_label {
-                        self.state.rect_origin_snap = snap_target;
+                        self.state.rect_origin_snap = snap_target.clone();
                         self.state.rect_opposite_snap = None;
                         self.state.creating_rect = Some(CreatingRect {
                             origin: sgp,
@@ -4459,7 +4988,7 @@ impl App {
                         // Snap the center; the rim follows the cursor freely.
                         let (center, center_snap) =
                             snap_ground_point(&self.state, session, &frame, &project, gp, &[]);
-                        update_extension_anchors(&mut self.state, center_snap);
+                        update_extension_anchors(&mut self.state, center_snap.clone());
                         self.state.circle_center_snap = center_snap;
                         self.state.creating_circle = Some(CreatingCircle {
                             origin: center,
@@ -4534,16 +5063,14 @@ impl App {
                     let frame = sketch_geometry_frame(&self.state.doc, session.sketch).unwrap();
                     let was_creating = self.state.creating_line.is_some();
                     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
-                    let primary_down = ui.input(|i| i.pointer.primary_down());
-                    let primary_released = ui.input(|i| i.pointer.primary_released());
 
                     // Snap the cursor to nearby geometry (vertices, midpoints, lines).
                     let (sgp, snap_target) =
                         snap_ground_point(&self.state, session, &frame, &project, gp, &[]);
-                    update_extension_anchors(&mut self.state, snap_target);
+                    update_extension_anchors(&mut self.state, snap_target.clone());
 
                     if !was_creating && primary_pressed && !over_committed_dim_label {
-                        self.state.line_start_snap = snap_target;
+                        self.state.line_start_snap = snap_target.clone();
                         self.state.line_end_snap = None;
                         self.state.creating_line = Some(CreatingLine {
                             origin: sgp,
@@ -4552,7 +5079,10 @@ impl App {
                             user_edited: false,
                             pending_focus: true,
                             construction: self.state.draw_construction,
-                            drag_path: Vec::new(),
+                            curve_mode: self.state.draw_curve_mode,
+                            tangent_constraint: self.state.draw_tangent_constraint,
+                            chained_from: None,
+                            chained_from_bezier: None,
                         });
                         self.state.status = "Move mouse • type to lock length • click/Enter commit • Esc cancel"
                             .to_string();
@@ -4575,10 +5105,6 @@ impl App {
                             commit_click = true;
                         } else if !over_input && !over_committed_dim_label {
                             cl.last_mouse = sgp;
-                            if primary_down && cl.drag_path.len() < 512 {
-                                let (u, v) = world_to_local(&frame, sgp);
-                                cl.drag_path.push((u, v));
-                            }
                             // A typed length overrides the free end, so the snap no longer applies.
                             self.state.line_end_snap = if cl.user_edited {
                                 None
@@ -4592,17 +5118,31 @@ impl App {
                             };
                         }
                     }
-                    // A click-drag-release gesture (held since the initial press, with a
-                    // meaningful bulge) commits a curved line instead of waiting for a second
-                    // click; a plain click/tap release just leaves the line awaiting its
-                    // second point as before.
-                    if !commit_click && primary_released {
-                        if let Some(cl) = &self.state.creating_line {
-                            let (ou, ov) = world_to_local(&frame, cl.origin);
-                            let (mu, mv) = world_to_local(&frame, cl.last_mouse);
-                            if model::bezier_from_drag_path((ou, ov), (mu, mv), &cl.drag_path).is_some()
+                    // #73: while curve-mode is on and this segment chains from a previous one,
+                    // live-preview the smoothed (or corner-ized) joint by temporarily bending the
+                    // previous line's end handle toward the live mouse position every frame —
+                    // recomputed fresh each time, so it updates as the mouse moves and is cheap
+                    // to redo. `Action::CommitLine` performs the same computation permanently
+                    // once the point is actually placed.
+                    if let Some(cl) = &self.state.creating_line {
+                        if let Some(prev_idx) = cl.chained_from {
+                            if let Some(prev_far) =
+                                self.state.doc.lines.get(prev_idx).map(|l| (l.x0, l.y0))
                             {
-                                commit_click = true;
+                                let (u0, v0) = world_to_local(&frame, cl.origin);
+                                let end = cl.end_point(&frame, &self.state.doc);
+                                let (u1, v1) = world_to_local(&frame, end);
+                                let (prev_bezier, _) = chained_curve_handles(
+                                    prev_far,
+                                    cl.chained_from_bezier,
+                                    (u0, v0),
+                                    (u1, v1),
+                                    cl.curve_mode,
+                                    cl.tangent_constraint,
+                                );
+                                if let Some(prev) = self.state.doc.lines.get_mut(prev_idx) {
+                                    prev.bezier = prev_bezier;
+                                }
                             }
                         }
                     }
@@ -4614,13 +5154,15 @@ impl App {
         }
 
         if self.state.tool == Tool::Extrude {
-            self.handle_extrude_tool(ui, &project, pointer_screen);
+            self.handle_extrude_tool(ui, &project, pointer_screen, &cam, viewport, &vp);
             self.show_extrude_distance_input(ui, &project);
         }
 
         if matches!(self.state.tool, Tool::Chamfer | Tool::Fillet) {
             self.handle_vertex_treatment_tool(ui, &project, pointer_screen);
             self.show_vertex_treatment_amount_input(ui, &project);
+            self.handle_edge_treatment_tool(ui, &project, pointer_screen);
+            self.show_edge_treatment_amount_input(ui, &project);
         }
 
         if self.state.tool == Tool::Dimension {
@@ -4667,7 +5209,7 @@ impl App {
             }
         }
 
-        if let Some(placing) = self.state.placing_angle_dimension {
+        if let Some(placing) = self.state.placing_angle_dimension.clone() {
             if let Some(session) = self.state.sketch_session {
                 if let Some(frame) = sketch_geometry_frame(&self.state.doc, session.sketch) {
                     if let Some(pp) = pointer_screen {
@@ -4676,8 +5218,8 @@ impl App {
                         {
                             if let Some(sign) = angle_dimension_hover_sign(
                                 &self.state.doc,
-                                placing.line_a,
-                                placing.line_b,
+                                placing.line_a.clone(),
+                                placing.line_b.clone(),
                                 hover_world,
                             ) {
                                 if let Some(p) = self.state.placing_angle_dimension.as_mut() {
@@ -4687,11 +5229,12 @@ impl App {
                         }
                     }
                     // Re-read: the hover update above may have just flipped the sign.
-                    let placing = self.state.placing_angle_dimension.unwrap_or(placing);
+                    let placing = self.state.placing_angle_dimension.clone().unwrap_or(placing);
                     let label = default_angle_expression(
                         &self.state.doc,
-                        placing.line_a,
-                        placing.line_b,
+                        session.sketch,
+                        placing.line_a.clone(),
+                        placing.line_b.clone(),
                         placing.rotation_sign,
                     );
                     draw_angle_dim_for_lines(
@@ -4699,8 +5242,8 @@ impl App {
                         &project,
                         &frame,
                         &self.state.doc,
-                        placing.line_a,
-                        placing.line_b,
+                        placing.line_a.clone(),
+                        placing.line_b.clone(),
                         placing.rotation_sign,
                         None,
                         &label,
@@ -4969,8 +5512,21 @@ impl App {
         if self.state.tool == Tool::Extrude {
             if self.extrude_gizmo_drag.is_none() {
                 hover_highlight = pointer_screen
-                    .and_then(|pp| pick_extrude_face(pp, &project, doc, cam.eye()))
-                    .map(|f| gpu_viewport::ViewportHoverHighlight::SketchFace(extrude_face_id(f)));
+                    .and_then(|pp| pick_extrude_face(pp, &project, doc, cam.eye(), &cam, viewport, &vp))
+                    .and_then(|f| {
+                        // A `Boolean` region has no `FaceId` of its own (see
+                        // `ExtrudeFace::face_id()`'s doc comment) — highlight its exact
+                        // resolved loop instead of falling back to a whole-shape outline, so
+                        // the user can see the intersection/difference area distinctly.
+                        if let model::ExtrudeFace::Boolean { .. } = &f {
+                            let (profile, _) = extrude::face_profile_world(doc, &f)?;
+                            Some(gpu_viewport::ViewportHoverHighlight::BooleanRegion {
+                                world_loop: profile,
+                            })
+                        } else {
+                            Some(gpu_viewport::ViewportHoverHighlight::SketchFace(extrude_face_id(f)))
+                        }
+                    });
             }
             if let Some(ce) = self.state.creating_extrusion.as_ref() {
                 if let Some((origin, normal)) = extrude::faces_anchor(doc, &ce.faces) {
@@ -4991,18 +5547,45 @@ impl App {
             }
         }
         // Chamfer/fillet tool: render the same push/pull gizmo the extrude tool uses, anchored
-        // at the picked vertex and pointing along the inward bisector of its two lines.
+        // at the picked vertex and pointing along the inward bisector of its two lines. Shares
+        // one gizmo slot between the 2D (sketch vertex) and 3D (extrusion edge, #77) cases,
+        // since exactly one of the two can be active at a time (one needs a sketch open, the
+        // other needs it closed).
         let mut vertex_treatment_gizmo = None;
+        let mut vertex_treatment_preview = None;
         if matches!(self.state.tool, Tool::Chamfer | Tool::Fillet) {
             if let (Some(session), Some(cvt)) =
                 (self.state.sketch_session, self.state.creating_vertex_treatment.as_ref())
             {
                 if let Some((origin, normal)) =
-                    vertex_treatment_anchor(doc, session.sketch, cvt.point)
+                    vertex_treatment_anchor(doc, session.sketch, cvt.point.clone())
                 {
                     let handle_offset =
                         construction::gizmo_display_offset(cvt.evaluated_amount(doc));
                     let hovered = self.vertex_treatment_gizmo_drag.is_some()
+                        || pointer_screen.is_some_and(|pp| {
+                            construction::offset_gizmo_hit(pp, &project, origin, normal, handle_offset)
+                        });
+                    vertex_treatment_gizmo = Some(gpu_viewport::ViewportExtrudeGizmo {
+                        origin,
+                        normal,
+                        offset: handle_offset,
+                        color: col::PREVIEW,
+                        hovered,
+                    });
+                }
+                // Live geometry preview of the treated corner (#76): recomputed every frame
+                // from the live gizmo amount, both while first placing the gizmo and while
+                // dragging it.
+                vertex_treatment_preview =
+                    vertex_treatment_preview_points(doc, session.sketch, cvt);
+            } else if let Some(cet) = self.state.creating_edge_treatment.as_ref() {
+                if let Some((origin, normal)) =
+                    crate::extrude::extrusion_edge_anchor(doc, cet.extrusion, cet.edge)
+                {
+                    let handle_offset =
+                        construction::gizmo_display_offset(cet.evaluated_amount(doc));
+                    let hovered = self.edge_treatment_gizmo_drag.is_some()
                         || pointer_screen.is_some_and(|pp| {
                             construction::offset_gizmo_hit(pp, &project, origin, normal, handle_offset)
                         });
@@ -5029,10 +5612,12 @@ impl App {
             self.state.creating_circle.as_ref(),
             self.state.creating_plane.as_ref(),
             self.state.creating_extrusion.as_ref(),
+            self.state.creating_edge_treatment.as_ref(),
             self.pending_extrude_target.clone(),
             plane_gizmo,
             extrude_gizmo,
             vertex_treatment_gizmo,
+            vertex_treatment_preview,
             hover_highlight,
             &gpu_dim_labels,
             planar_label_view,
@@ -5175,7 +5760,8 @@ impl App {
             }
         }
 
-        if sketch_session.is_some() {
+        if let Some(active_session) = sketch_session {
+            let active_sketch = active_session.sketch;
             let mut commit_committed_dim = false;
             if let (Some(layouts), Some(view)) = (&committed_dim_layouts, planar_label_view) {
                 let hovered_angle_gizmo = pointer_screen
@@ -5233,8 +5819,8 @@ impl App {
                                 dim_input_layout_centered_on(layout.label_rect, &edit.text)
                             })
                     } else if let Some(target) = edit.target.distance_target(&self.state.doc) {
-                        distance_target_segment_endpoints(&self.state.doc, target).and_then(
-                            |(a, b)| {
+                        distance_target_segment_endpoints(&self.state.doc, active_sketch, target)
+                            .and_then(|(a, b)| {
                                 project(a).zip(project(b)).map(|(pa, pb)| {
                                     line_dim_layout(pa, pb, &edit.text)
                                 })
@@ -5312,6 +5898,7 @@ impl App {
                                 id,
                                 &mut edit.text,
                                 doc,
+                                Some(active_sketch),
                                 true,
                                 &mut edit.pending_focus,
                                 true,
@@ -5335,7 +5922,7 @@ impl App {
                     }
                     if let Some(target) = edit.target.distance_target(&self.state.doc) {
                         if let Some((a, b)) =
-                            distance_target_segment_endpoints(&self.state.doc, target)
+                            distance_target_segment_endpoints(&self.state.doc, active_sketch, target)
                         {
                             draw_world_segment(
                                 &painter,
@@ -5602,6 +6189,7 @@ impl App {
                             id_w,
                             &mut cr.texts[0],
                             doc,
+                            Some(session.sketch),
                             cr.focused == 0,
                             &mut cr.pending_focus,
                             cr.user_edited[0],
@@ -5627,6 +6215,7 @@ impl App {
                             id_h,
                             &mut cr.texts[1],
                             doc,
+                            Some(session.sketch),
                             cr.focused == 1,
                             &mut cr.pending_focus,
                             cr.user_edited[1],
@@ -5712,6 +6301,7 @@ impl App {
                                 id_len,
                                 &mut cl.text,
                                 doc,
+                                Some(session.sketch),
                                 true,
                                 &mut cl.pending_focus,
                                 cl.user_edited,
@@ -5788,6 +6378,7 @@ impl App {
                                     id_diam,
                                     &mut cc.text,
                                     doc,
+                                    Some(session.sketch),
                                     true,
                                     &mut cc.pending_focus,
                                     cc.user_edited,
@@ -5860,6 +6451,7 @@ impl App {
                             id_offset,
                             &mut cp.offset_text,
                             doc,
+                            None,
                             cp.focused == PlaneDim::Offset,
                             &mut cp.pending_focus,
                             cp.user_edited_offset,
@@ -5887,6 +6479,7 @@ impl App {
                                 id_angle,
                                 &mut cp.angle_text,
                                 doc,
+                                None,
                                 cp.focused == PlaneDim::Angle,
                                 &mut cp.pending_focus,
                                 cp.user_edited_angle,
@@ -5969,7 +6562,7 @@ impl App {
         // where the first point of a line would land if clicked now.
         if let Some(session) = self.state.sketch_session {
             if let Some(frame) = sketch_geometry_frame(&self.state.doc, session.sketch) {
-                let snap = active_snap(&self.state, &frame).or_else(|| {
+                let snap = active_snap(&self.state, session.sketch, &frame).or_else(|| {
                     // Preview where the next click would place a point (the first point of a
                     // line/rectangle, or a circle center), before any geometry exists.
                     let drawing = matches!(
@@ -5995,10 +6588,12 @@ impl App {
                         let color = egui::Color32::from_rgb(120, 215, 230);
                         // Inference guide (#21): a dashed line from the anchor edge through the
                         // snapped point, showing the extension the point is aligned with.
-                        if let snapping::SnapTarget::OnLineExtension(line) = target {
-                            if let Ok(((x0, y0), (x1, y1))) =
-                                geometric_constraints::line_uv_endpoints(&self.state.doc, line)
-                            {
+                        if let snapping::SnapTarget::OnLineExtension(line) = &target {
+                            if let Ok(((x0, y0), (x1, y1))) = geometric_constraints::line_uv_endpoints(
+                                &self.state.doc,
+                                session.sketch,
+                                line.clone(),
+                            ) {
                                 let (su, sv) = world_to_local(&frame, world);
                                 let d0 = (x0 - su).hypot(y0 - sv);
                                 let d1 = (x1 - su).hypot(y1 - sv);
@@ -6007,6 +6602,27 @@ impl App {
                                 if let Some(ap) = project(anchor_world) {
                                     painter.extend(egui::Shape::dashed_line(
                                         &[ap, sp],
+                                        egui::Stroke::new(1.5, color),
+                                        6.0,
+                                        4.0,
+                                    ));
+                                }
+                            }
+                        }
+                        // Normal-at-midpoint guide (#41): a dashed line from the anchor's
+                        // midpoint through the snapped point, showing the perpendicular the
+                        // point is aligned with.
+                        if let snapping::SnapTarget::NormalAtMidpoint(line) = &target {
+                            if let Ok(((x0, y0), (x1, y1))) = geometric_constraints::line_uv_endpoints(
+                                &self.state.doc,
+                                session.sketch,
+                                line.clone(),
+                            ) {
+                                let mid = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+                                let mid_world = face::local_to_world(&frame, mid.0, mid.1);
+                                if let Some(mp) = project(mid_world) {
+                                    painter.extend(egui::Shape::dashed_line(
+                                        &[mp, sp],
                                         egui::Stroke::new(1.5, color),
                                         6.0,
                                         4.0,
@@ -6171,6 +6787,16 @@ impl App {
 
         for result in inline_parameter_field_results {
             apply_dimension_field_feedback(&mut self.state, &result);
+        }
+
+        // #74: an obvious border while a sketch is open, so sketch mode is never mistaken for
+        // ordinary 3D navigation at a glance.
+        if self.state.sketch_session.is_some() {
+            painter.rect_stroke(
+                viewport,
+                0.0,
+                egui::Stroke::new(SKETCH_MODE_BORDER_WIDTH, col::SKETCH_MODE_BORDER),
+            );
         }
     }
 }
@@ -6427,8 +7053,8 @@ fn draw_scene_selection_highlights(
     let base_color = col::DIM_EDGE_HIGHLIGHT;
     let width = 3.0;
     for element in selection.iter() {
-        let color = health_tint_color(base_color, health.element_status(element));
-        let dashed = context::selection_highlight_dashed(doc, element) == Some(true);
+        let color = health_tint_color(base_color, health.element_status(element.clone()));
+        let dashed = context::selection_highlight_dashed(doc, element.clone()) == Some(true);
         match element {
             SceneElement::Line(index) => {
                 if !line_alive(doc, index) {
@@ -6819,6 +7445,7 @@ mod tests {
         build_viewport_scene_input, clip_segment_to_rect, col, initial_launch_maximize_frames,
         native_options, should_commit_sketch_on_click, should_select_all_rect_value,
         side_panel_resize_active, tick_launch_maximize, uses_deferred_launch_maximize,
+        vertex_treatment_preview_points, ConstraintPoint, Line,
         MACOS_LAUNCH_MAXIMIZE_DELAY_FRAMES, GRID_EXTENT, ORBIT_PIVOT_GROUND_RADIUS,
         ORBIT_PIVOT_RADIUS,
     };
@@ -6875,7 +7502,9 @@ mod tests {
             None,
             None,
             state.creating_extrusion.as_ref(),
+            None,
             pending.clone(),
+            None,
             None,
             None,
             None,
@@ -6891,8 +7520,168 @@ mod tests {
         );
     }
 
+    /// #77: while dragging the 3D edge chamfer/fillet gizmo, the live amount should drive a
+    /// ghost-preview solid via the same `preview_extrusion`/`editing_extrusion` mechanism the
+    /// extrude tool uses — the real body is suppressed (`editing_extrusion`) while the ghost
+    /// (a clone of the extrusion with the live treatment spliced in) is shown instead. Mirrors
+    /// `extrude_preview_uses_pending_target_before_commit`.
+    #[test]
+    fn edge_treatment_preview_shows_the_live_amount_and_suppresses_the_real_body() {
+        use crate::actions::{Action, AppState, CreatingEdgeTreatment, Tool};
+        use crate::model::{ExtrudeFace, ExtrusionEdgeRef};
+
+        use crate::model::VertexTreatmentKind;
+
+        let mut state = AppState::default();
+        state.apply(Action::BeginSketch {
+            face: crate::model::FaceId::ConstructionPlane(0),
+            viewport: None,
+        });
+        let sketch = state.sketch_session.unwrap().sketch;
+        state
+            .doc
+            .rects
+            .push(crate::model::Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
+        state.doc.shape_order.push(crate::model::ShapeKind::Rect);
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(0) });
+        state.apply(Action::SetExtrudeDistance { distance: 5.0 });
+        state.apply(Action::CommitExtrusion);
+        assert_eq!(state.doc.extrusions[0].edge_treatments.len(), 0);
+
+        let edge = ExtrusionEdgeRef::Vertical { face: 0, edge: 0 };
+        state.creating_edge_treatment = Some(CreatingEdgeTreatment {
+            extrusion: 0,
+            edge,
+            kind: VertexTreatmentKind::Chamfer,
+            amount_live: 2.0,
+            text: "2".to_string(),
+            user_edited: false,
+            pending_focus: false,
+        });
+
+        let cam = state.cam.clone();
+        let element_visibility = state.element_visibility.clone();
+        let selection = state.scene_selection.clone();
+        let health = state.document_health.clone();
+
+        let scene_input = build_viewport_scene_input(
+            &state.doc,
+            &cam,
+            test_viewport_rect(),
+            None,
+            &element_visibility,
+            &selection,
+            &health,
+            None,
+            None,
+            None,
+            None,
+            None,
+            state.creating_edge_treatment.as_ref(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+        );
+        // The ghost preview carries the live in-progress treatment...
+        let preview = scene_input.preview_extrusion.as_ref().expect("expected a ghost preview");
+        assert_eq!(preview.edge_treatments.len(), 1);
+        assert_eq!(preview.edge_treatments[0].amount, 2.0);
+        assert_eq!(preview.edge_treatments[0].edge, edge);
+        // ...and the real (committed, untreated) body is suppressed while it's shown.
+        assert_eq!(scene_input.editing_extrusion, Some(0));
+        // The document itself is untouched until commit.
+        assert!(state.doc.extrusions[0].edge_treatments.is_empty());
+    }
+
     fn test_viewport_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(960.0, 560.0))
+    }
+
+    /// A two-line right-angle corner (10mm + 10mm legs meeting at (10,0)) in a fresh sketch on
+    /// the default XY plane, joined by a `Coincident` constraint — mirrors the equivalent helper
+    /// in `actions.rs`'s tests (not reusable across modules since it's private there).
+    fn two_coincident_lines_at_a_right_angle(
+        state: &mut crate::actions::AppState,
+    ) -> (crate::model::SketchId, ConstraintPoint) {
+        use crate::actions::Action;
+        use crate::model::{Constraint, ConstraintEntity, ConstraintKind, LineEnd, ShapeKind};
+
+        state.apply(Action::BeginSketch {
+            face: crate::model::FaceId::ConstructionPlane(0),
+            viewport: None,
+        });
+        let sketch = state.sketch_session.unwrap().sketch;
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        state.doc.lines.push(Line::from_local_endpoints(sketch, 10.0, 0.0, 10.0, 10.0));
+        state.doc.shape_order.extend([ShapeKind::Line, ShapeKind::Line]);
+        state.doc.constraints.push(Constraint {
+            sketch,
+            kind: ConstraintKind::Coincident {
+                a: ConstraintEntity::Point(ConstraintPoint::LineEndpoint {
+                    line: 0,
+                    end: LineEnd::End,
+                }),
+                b: ConstraintEntity::Point(ConstraintPoint::LineEndpoint {
+                    line: 1,
+                    end: LineEnd::Start,
+                }),
+            },
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+        let point = ConstraintPoint::LineEndpoint { line: 0, end: LineEnd::End };
+        (sketch, point)
+    }
+
+    #[test]
+    fn vertex_treatment_preview_points_traces_the_treated_corner() {
+        use crate::actions::{AppState, CreatingVertexTreatment};
+        use crate::model::VertexTreatmentKind;
+
+        let mut state = AppState::default();
+        let (sketch, point) = two_coincident_lines_at_a_right_angle(&mut state);
+
+        let cvt = CreatingVertexTreatment {
+            point,
+            kind: VertexTreatmentKind::Chamfer,
+            amount_live: 3.0,
+            text: "3".to_string(),
+            user_edited: false,
+            pending_focus: false,
+        };
+
+        // Straight chamfer: far endpoint -> truncated point -> truncated point -> far endpoint.
+        let points =
+            vertex_treatment_preview_points(&state.doc, sketch, &cvt).expect("preview points");
+        assert_eq!(points.len(), 4);
+        assert!(points[0].abs_diff_eq(Vec3::new(0.0, 0.0, 0.0), 1e-3));
+        assert!(points[1].abs_diff_eq(Vec3::new(7.0, 0.0, 0.0), 1e-3), "{:?}", points[1]);
+        assert!(points[2].abs_diff_eq(Vec3::new(10.0, 3.0, 0.0), 1e-3), "{:?}", points[2]);
+        assert!(points[3].abs_diff_eq(Vec3::new(10.0, 10.0, 0.0), 1e-3));
+
+        // Live-dragging a bigger amount visibly enlarges the cut, with no commit needed.
+        let cvt_bigger = CreatingVertexTreatment { amount_live: 5.0, ..cvt.clone() };
+        let bigger = vertex_treatment_preview_points(&state.doc, sketch, &cvt_bigger).unwrap();
+        assert!(bigger[1].abs_diff_eq(Vec3::new(5.0, 0.0, 0.0), 1e-3), "{:?}", bigger[1]);
+
+        // A fillet's bridge is sampled (curved), not a 2-point straight segment.
+        let cvt_fillet = CreatingVertexTreatment { kind: VertexTreatmentKind::Fillet, ..cvt };
+        let fillet_points =
+            vertex_treatment_preview_points(&state.doc, sketch, &cvt_fillet).unwrap();
+        assert_eq!(fillet_points.len(), 2 + crate::model::BEZIER_SEGMENTS + 1);
+
+        // No preview once the corner can't be treated (amount collapsed to zero).
+        let cvt_zero = CreatingVertexTreatment { amount_live: 0.0, ..cvt_fillet };
+        assert!(vertex_treatment_preview_points(&state.doc, sketch, &cvt_zero).is_none());
     }
 
     #[test]

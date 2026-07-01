@@ -10,7 +10,7 @@ use crate::command_palette::{best_match, commands_for_state, PaletteOutcome};
 use crate::constraints::add_distance_constraint;
 use crate::hierarchy::SceneElement;
 use crate::model::{
-    ConstraintLine, ConstraintPoint, DistanceTarget, FaceId, RectEdge, SketchId,
+    ConstraintLine, ConstraintPoint, DistanceTarget, ExtrudeFace, FaceId, RectEdge, SketchId,
     VertexTreatmentKind,
 };
 use crate::value::{AngleUnit, LengthUnit};
@@ -141,6 +141,16 @@ pub enum Instruction {
         kind: VertexTreatmentKind,
         amount: f32,
     },
+    /// Chamfer or fillet an analytic edge of an extrusion's 3D solid (#77) — a mesh-bevel
+    /// approximation scoped to the vertical and side/cap edges of a `Rect`/`Polygon`-profiled
+    /// extrusion (see `crate::model::ExtrusionEdgeRef`, SPEC §3.4). `amount` is the chamfer
+    /// distance or fillet radius depending on `kind`.
+    EdgeTreatment {
+        extrusion: usize,
+        edge: crate::model::ExtrusionEdgeRef,
+        kind: VertexTreatmentKind,
+        amount: f32,
+    },
     SetLineLength { value: String },
     SetCircleDiameter { value: String },
     BeginEditConstructionPlane { index: usize },
@@ -265,7 +275,7 @@ impl Instruction {
                 )
             }
             Instruction::SetElementVisible { element, visible } => {
-                let target = element_lua_ref(*element);
+                let target = element_lua_ref(element);
                 let verb = match visible {
                     Some(true) => "show",
                     Some(false) => "hide",
@@ -274,7 +284,7 @@ impl Instruction {
                 format!("bearcad.set_visible({target}, {verb:?})")
             }
             Instruction::SelectSceneElement { element, additive } => {
-                let target = element_lua_ref(*element);
+                let target = element_lua_ref(element);
                 if *additive {
                     format!("bearcad.select({target}, {{ additive = true }})")
                 } else {
@@ -285,7 +295,7 @@ impl Instruction {
             Instruction::SetShapeConstruction { element, construction } => {
                 format!(
                     "bearcad.set_construction({}, {})",
-                    element_lua_ref(*element),
+                    element_lua_ref(element),
                     construction
                 )
             }
@@ -296,7 +306,7 @@ impl Instruction {
             Instruction::SetElementName { element, name } => {
                 format!(
                     "bearcad.set_name({}, {name:?})",
-                    element_lua_ref(*element)
+                    element_lua_ref(element)
                 )
             }
             Instruction::FocusElementName => "bearcad.ui.focus_name()".to_string(),
@@ -355,7 +365,7 @@ impl Instruction {
             Instruction::DragVertex { point, u, v } => {
                 format!(
                     "bearcad.ui.drag_vertex({}, {u}, {v})",
-                    constraint_point_lua_ref(*point)
+                    constraint_point_lua_ref(point)
                 )
             }
             Instruction::DragLineSegment {
@@ -366,7 +376,7 @@ impl Instruction {
                 v,
             } => format!(
                 "bearcad.ui.drag_line({}, {anchor_u}, {anchor_v}, {u}, {v})",
-                constraint_line_lua_ref(*target)
+                constraint_line_lua_ref(target)
             ),
             Instruction::VertexTreatment { point, kind, amount } => {
                 let (fname, amount_key) = match kind {
@@ -375,7 +385,17 @@ impl Instruction {
                 };
                 format!(
                     "bearcad.{fname}{{ point = {}, {amount_key} = {amount} }}",
-                    constraint_point_lua_ref(*point)
+                    constraint_point_lua_ref(point)
+                )
+            }
+            Instruction::EdgeTreatment { extrusion, edge, kind, amount } => {
+                let (fname, amount_key) = match kind {
+                    VertexTreatmentKind::Chamfer => ("chamfer_edge", "distance"),
+                    VertexTreatmentKind::Fillet => ("fillet_edge", "radius"),
+                };
+                format!(
+                    "bearcad.{fname}{{ extrusion = {extrusion}, edge = {}, {amount_key} = {amount} }}",
+                    extrusion_edge_lua_ref(*edge)
                 )
             }
             Instruction::SetLineLength { value } => {
@@ -625,6 +645,14 @@ fn element_script_tokens(element: SceneElement) -> ElementScriptTokens {
             edge: None,
             point: None,
         },
+        // Handled directly in `element_lua_ref` before this is reached (a `FaceEdge` doesn't
+        // fit the `kind`/`index`/`edge`/`point` shape the other variants share).
+        SceneElement::FaceEdge(_) => ElementScriptTokens {
+            kind: "face_edge",
+            index: 0,
+            edge: None,
+            point: None,
+        },
     }
 }
 
@@ -727,11 +755,11 @@ pub fn instruction_from_action(action: &Action, doc: &crate::model::Document) ->
         Action::OpenSketch { sketch, .. } => Some(Instruction::OpenSketch { sketch: *sketch }),
         Action::ExitSketch => Some(Instruction::ExitSketch),
         Action::SetElementVisible { element, visible } => Some(Instruction::SetElementVisible {
-            element: *element,
+            element: element.clone(),
             visible: Some(*visible),
         }),
         Action::ToggleElementVisibility(element) => Some(Instruction::SetElementVisible {
-            element: *element,
+            element: element.clone(),
             visible: None,
         }),
         Action::SetHomeView => Some(Instruction::SetHomeView),
@@ -770,7 +798,7 @@ pub fn instruction_from_action(action: &Action, doc: &crate::model::Document) ->
         }),
         Action::ToggleCommandPalette => Some(Instruction::SetCommandPalette { open: None }),
         Action::ClickSceneElement { element, additive } => Some(Instruction::SelectSceneElement {
-            element: *element,
+            element: element.clone(),
             additive: *additive,
         }),
         Action::ClearSceneSelection => Some(Instruction::ClearSceneSelection),
@@ -778,7 +806,7 @@ pub fn instruction_from_action(action: &Action, doc: &crate::model::Document) ->
             element,
             construction,
         } => Some(Instruction::SetShapeConstruction {
-            element: *element,
+            element: element.clone(),
             construction: *construction,
         }),
         Action::ApplyConstruction { construction } => Some(Instruction::ApplyConstruction {
@@ -788,12 +816,12 @@ pub fn instruction_from_action(action: &Action, doc: &crate::model::Document) ->
         Action::AddGeometricConstraint(kind) => Some(Instruction::AddGeometricConstraint(*kind)),
         Action::ApplyConstraintShortcut(key) => Some(Instruction::ApplyConstraintShortcut(*key)),
         Action::DragVertex { point, u, v } => Some(Instruction::DragVertex {
-            point: *point,
+            point: point.clone(),
             u: *u,
             v: *v,
         }),
         Action::CommitElementName { element, name } => Some(Instruction::SetElementName {
-            element: *element,
+            element: element.clone(),
             name: name.clone(),
         }),
         Action::FocusElementName => Some(Instruction::FocusElementName),
@@ -807,7 +835,15 @@ pub fn instruction_from_action(action: &Action, doc: &crate::model::Document) ->
         }),
         Action::CommitVertexTreatment { point, kind, amount } => {
             Some(Instruction::VertexTreatment {
-                point: *point,
+                point: point.clone(),
+                kind: *kind,
+                amount: *amount,
+            })
+        }
+        Action::CommitEdgeTreatment { extrusion, edge, kind, amount } => {
+            Some(Instruction::EdgeTreatment {
+                extrusion: *extrusion,
+                edge: *edge,
                 kind: *kind,
                 amount: *amount,
             })
@@ -844,12 +880,19 @@ fn extrude_face_args(faces: &[crate::model::ExtrudeFace]) -> String {
     let mut rects = Vec::new();
     let mut circles = Vec::new();
     let mut polygon = None;
+    let mut boolean = None;
     for face in faces {
         match face {
             ExtrudeFace::Rect(i) => rects.push(*i),
             ExtrudeFace::Circle(i) => circles.push(*i),
             ExtrudeFace::Polygon(lines) => {
                 polygon.get_or_insert(lines);
+            }
+            // Only the first is kept, same "one non-rect/circle profile per call" limitation
+            // as `polygon` above — the Lua API has no way to extrude more than one alongside
+            // the others in a single call.
+            ExtrudeFace::Boolean { op, a, b } => {
+                boolean.get_or_insert((*op, a.as_ref(), b.as_ref()));
             }
         };
     }
@@ -870,7 +913,47 @@ fn extrude_face_args(faces: &[crate::model::ExtrudeFace]) -> String {
     if let Some(lines) = polygon {
         parts.push(format!("polygon = {{{}}}", index_list(lines)));
     }
+    if let Some((op, a, b)) = boolean {
+        parts.push(format!("boolean = {}", boolean_face_lua_table(op, a, b)));
+    }
     parts.join(", ")
+}
+
+/// Lua table literal for a boolean-combined face's inner fields (#16/#62): `{op = "...",
+/// a = <face spec>, b = <face spec>}`, matching the shape `lua_boolean_face_from_table`
+/// (src/lua_script.rs) parses back.
+fn boolean_face_lua_table(
+    op: crate::model::BooleanOp,
+    a: &crate::model::ExtrudeFace,
+    b: &crate::model::ExtrudeFace,
+) -> String {
+    let op_str = match op {
+        crate::model::BooleanOp::Intersection => "intersection",
+        crate::model::BooleanOp::Difference => "difference",
+    };
+    format!(
+        "{{op = \"{op_str}\", a = {}, b = {}}}",
+        extrude_face_spec_table(a),
+        extrude_face_spec_table(b)
+    )
+}
+
+/// Lua face-spec table for any `ExtrudeFace` (`{rect = i}`, `{circle = i}`,
+/// `{polygon = {..}}`, or a nested `{boolean = {...}}`) — the shape
+/// `lua_extrude_face_from_table` (src/lua_script.rs) parses back into an `ExtrudeFace`.
+fn extrude_face_spec_table(face: &crate::model::ExtrudeFace) -> String {
+    use crate::model::ExtrudeFace;
+    match face {
+        ExtrudeFace::Rect(i) => format!("{{rect = {i}}}"),
+        ExtrudeFace::Circle(i) => format!("{{circle = {i}}}"),
+        ExtrudeFace::Polygon(lines) => {
+            let idx = lines.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+            format!("{{polygon = {{{idx}}}}}")
+        }
+        ExtrudeFace::Boolean { op, a, b } => {
+            format!("{{boolean = {}}}", boolean_face_lua_table(*op, a, b))
+        }
+    }
 }
 
 fn view_script_name(view: StandardView) -> &'static str {
@@ -1031,10 +1114,21 @@ fn geometric_constraint_lua_name(
     geometric_constraint_script_name(kind)
 }
 
-fn element_lua_ref(element: SceneElement) -> String {
-    let tokens = element_script_tokens(element);
+fn element_lua_ref(element: &SceneElement) -> String {
+    // #26/#27: a face's own edge, matching `lua_script::parse_element_table`'s
+    // `{ kind = "face", face = {...}, index = N, edge = true }` shape.
+    if let SceneElement::FaceEdge(line) = element {
+        let ConstraintLine::FaceEdge { face, index } = line else {
+            unreachable!("SceneElement::FaceEdge always wraps ConstraintLine::FaceEdge")
+        };
+        return format!(
+            "{{ kind = \"face\", face = {}, index = {index}, edge = true }}",
+            face_id_lua_ref(face)
+        );
+    }
+    let tokens = element_script_tokens(element.clone());
     if let Some(point) = tokens.point {
-        return format!("{{ kind = \"point\", {} }}", point_lua_fields(point));
+        return format!("{{ kind = \"point\", {} }}", point_lua_fields(&point));
     }
     if let Some(edge) = tokens.edge {
         return format!(
@@ -1045,7 +1139,7 @@ fn element_lua_ref(element: SceneElement) -> String {
     format!("{{ kind = \"{}\", index = {} }}", tokens.kind, tokens.index)
 }
 
-fn point_lua_fields(point: ConstraintPoint) -> String {
+fn point_lua_fields(point: &ConstraintPoint) -> String {
     use crate::model::{ConstraintPoint, LineEnd};
     match point {
         ConstraintPoint::LineEndpoint { line, end } => {
@@ -1062,21 +1156,85 @@ fn point_lua_fields(point: ConstraintPoint) -> String {
         ConstraintPoint::CircleCenter(circle) => {
             format!("kind = \"circle\", index = {circle}")
         }
+        // #26/#27: mirrors `lua_script::parse_constraint_point_table`'s `"face"` shape.
+        ConstraintPoint::FaceVertex { face, index } => {
+            format!("kind = \"face\", face = {}, index = {index}", face_id_lua_ref(face))
+        }
     }
 }
 
-fn constraint_line_lua_ref(line: ConstraintLine) -> String {
+fn constraint_line_lua_ref(line: &ConstraintLine) -> String {
     match line {
         ConstraintLine::Line(index) => format!("{{ kind = \"line\", index = {index} }}"),
         ConstraintLine::RectEdge { rect, edge } => format!(
             "{{ kind = \"rect\", index = {rect}, edge = {:?} }}",
             edge.script_name()
         ),
+        // #26/#27: mirrors `lua_script::parse_constraint_line_table`'s `"face"` shape.
+        ConstraintLine::FaceEdge { face, index } => format!(
+            "{{ kind = \"face\", face = {}, index = {index} }}",
+            face_id_lua_ref(face)
+        ),
     }
 }
 
-fn constraint_point_lua_ref(point: ConstraintPoint) -> String {
+fn constraint_point_lua_ref(point: &ConstraintPoint) -> String {
     format!("{{ {} }}", point_lua_fields(point))
+}
+
+/// Lua table literal for a `FaceId`, matching `lua_script::parse_face_id_table`'s shape.
+/// Cap/side profiles are limited to `rect`/`circle` (same limitation as `face_lua_parts` and
+/// `parse_face_id_table` — a polygon profile isn't a single index, #66).
+fn face_id_lua_ref(face: &FaceId) -> String {
+    match face {
+        FaceId::Rect(i) => format!("{{ kind = \"rect\", index = {i} }}"),
+        FaceId::Circle(i) => format!("{{ kind = \"circle\", index = {i} }}"),
+        FaceId::ConstructionPlane(i) => format!("{{ kind = \"construction_plane\", index = {i} }}"),
+        FaceId::Polygon(lines) => format!(
+            "{{ kind = \"polygon\", index = {} }}",
+            lines.first().copied().unwrap_or(0)
+        ),
+        FaceId::ExtrudeCap { extrusion, profile, top } => format!(
+            "{{ kind = \"extrude_cap\", extrusion = {extrusion}, {}, top = {top} }}",
+            extrude_face_profile_lua_fields(profile)
+        ),
+        FaceId::ExtrudeSide { extrusion, profile, edge } => format!(
+            "{{ kind = \"extrude_side\", extrusion = {extrusion}, {}, edge = {edge} }}",
+            extrude_face_profile_lua_fields(profile)
+        ),
+    }
+}
+
+fn extrude_face_profile_lua_fields(profile: &ExtrudeFace) -> String {
+    match profile {
+        ExtrudeFace::Rect(i) => format!("profile = \"rect\", profile_index = {i}"),
+        ExtrudeFace::Circle(i) => format!("profile = \"circle\", profile_index = {i}"),
+        // Not round-trippable: `parse_face_id_table` only accepts `rect`/`circle` profiles
+        // (same limitation as `face_lua_parts`'s polygon case, #66).
+        ExtrudeFace::Polygon(lines) => format!(
+            "profile = \"polygon\", profile_index = {}",
+            lines.first().copied().unwrap_or(0)
+        ),
+        // Not round-trippable at all (no `parse_face_id_table` support for boolean profiles)
+        // — falls back to `a`'s fields as a best-effort reference, same tradeoff as
+        // `ExtrudeFace::face_id()`'s recursion into `a`.
+        ExtrudeFace::Boolean { a, .. } => extrude_face_profile_lua_fields(a),
+    }
+}
+
+/// Lua table literal for an `ExtrusionEdgeRef`, matching `parse_extrusion_edge_table`'s shape
+/// (#77): `{ kind = "vertical", face = N, edge = N }` or `{ kind = "cap", face = N, edge = N,
+/// top = true/false }`.
+fn extrusion_edge_lua_ref(edge: crate::model::ExtrusionEdgeRef) -> String {
+    use crate::model::ExtrusionEdgeRef;
+    match edge {
+        ExtrusionEdgeRef::Vertical { face, edge } => {
+            format!("{{ kind = \"vertical\", face = {face}, edge = {edge} }}")
+        }
+        ExtrusionEdgeRef::Cap { face, edge, top } => {
+            format!("{{ kind = \"cap\", face = {face}, edge = {edge}, top = {top} }}")
+        }
+    }
 }
 
 fn distance_target_lua_ref(target: &DistanceTarget) -> String {
@@ -1693,6 +1851,10 @@ impl ScriptRunner {
                 state.apply(Action::CommitVertexTreatment { point, kind, amount });
                 StepResult::Continue
             }
+            Instruction::EdgeTreatment { extrusion, edge, kind, amount } => {
+                state.apply(Action::CommitEdgeTreatment { extrusion, edge, kind, amount });
+                StepResult::Continue
+            }
             Instruction::SetElementVisible { element, visible } => {
                 match visible {
                     Some(v) => state.apply(Action::SetElementVisible { element, visible: v }),
@@ -2274,6 +2436,28 @@ mod tests {
     }
 
     #[test]
+    fn set_units_instructions_render_replayable_lua() {
+        let doc_units = Instruction::SetDocumentUnits { length: LengthUnit::In, angle: AngleUnit::Rad };
+        assert_eq!(
+            doc_units.as_lua(),
+            "bearcad.set_units{ length = \"in\", angle = \"rad\" }"
+        );
+
+        let sketch_override = Instruction::SetSketchUnits {
+            sketch: 2,
+            length: Some(LengthUnit::Cm),
+            angle: None,
+        };
+        assert_eq!(
+            sketch_override.as_lua(),
+            "bearcad.set_units{ sketch = 2, length = \"cm\" }"
+        );
+
+        let sketch_inherit = Instruction::SetSketchUnits { sketch: 0, length: None, angle: None };
+        assert_eq!(sketch_inherit.as_lua(), "bearcad.set_units{ sketch = 0 }");
+    }
+
+    #[test]
     fn extrude_instruction_renders_replayable_face_args() {
         use crate::model::ExtrudeFace;
         let single_rect = Instruction::Extrude {
@@ -2383,7 +2567,7 @@ mod tests {
     fn vertex_treatment_instruction_renders_as_the_matching_lua_call() {
         let point = ConstraintPoint::LineEndpoint { line: 0, end: crate::model::LineEnd::End };
         let chamfer = Instruction::VertexTreatment {
-            point,
+            point: point.clone(),
             kind: VertexTreatmentKind::Chamfer,
             amount: 3.0,
         };
@@ -2407,7 +2591,7 @@ mod tests {
         let doc = crate::model::Document::default();
         let point = ConstraintPoint::LineEndpoint { line: 2, end: crate::model::LineEnd::Start };
         let action = Action::CommitVertexTreatment {
-            point,
+            point: point.clone(),
             kind: VertexTreatmentKind::Fillet,
             amount: 4.0,
         };
@@ -2417,6 +2601,55 @@ mod tests {
                 point,
                 kind: VertexTreatmentKind::Fillet,
                 amount: 4.0,
+            })
+        );
+    }
+
+    #[test]
+    fn edge_treatment_instruction_renders_as_the_matching_lua_call() {
+        use crate::model::ExtrusionEdgeRef;
+        let edge = ExtrusionEdgeRef::Vertical { face: 0, edge: 2 };
+        let chamfer = Instruction::EdgeTreatment {
+            extrusion: 1,
+            edge,
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 3.0,
+        };
+        assert_eq!(
+            chamfer.as_lua(),
+            "bearcad.chamfer_edge{ extrusion = 1, edge = { kind = \"vertical\", face = 0, edge = 2 }, distance = 3 }"
+        );
+        let cap_edge = ExtrusionEdgeRef::Cap { face: 1, edge: 3, top: true };
+        let fillet = Instruction::EdgeTreatment {
+            extrusion: 0,
+            edge: cap_edge,
+            kind: VertexTreatmentKind::Fillet,
+            amount: 1.5,
+        };
+        assert_eq!(
+            fillet.as_lua(),
+            "bearcad.fillet_edge{ extrusion = 0, edge = { kind = \"cap\", face = 1, edge = 3, top = true }, radius = 1.5 }"
+        );
+    }
+
+    #[test]
+    fn instruction_from_action_maps_commit_edge_treatment() {
+        use crate::model::ExtrusionEdgeRef;
+        let doc = crate::model::Document::default();
+        let edge = ExtrusionEdgeRef::Cap { face: 0, edge: 1, top: false };
+        let action = Action::CommitEdgeTreatment {
+            extrusion: 2,
+            edge,
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 2.5,
+        };
+        assert_eq!(
+            instruction_from_action(&action, &doc),
+            Some(Instruction::EdgeTreatment {
+                extrusion: 2,
+                edge,
+                kind: VertexTreatmentKind::Chamfer,
+                amount: 2.5,
             })
         );
     }
@@ -2549,7 +2782,10 @@ mod tests {
             user_edited: false,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
         state.apply(crate::actions::Action::CommitLine);
         while !runner.done {
@@ -2945,7 +3181,10 @@ mod tests {
             user_edited: false,
             pending_focus: false,
             construction: false,
-            drag_path: Vec::new(),
+            curve_mode: false,
+            tangent_constraint: true,
+            chained_from: None,
+            chained_from_bezier: None,
         });
 
         while !runner.done {

@@ -1,0 +1,1 @@
+Slanted extrusions (extrude-to-an-angled-face/plane) now also build real OCCT solids via a ruled ThruSections loft between the bottom and top loops (#86), completing the extrusion migration onto the kernel.

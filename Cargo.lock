@@ -429,6 +429,7 @@ name = "bearcad"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cc",
  "eframe",
  "egui",
  "glam",

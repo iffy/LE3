@@ -904,6 +904,7 @@ mod tests {
             expression: String::new(),
             name: Some("Boss".to_string()),
             deleted: false,
+            edge_treatments: Vec::new(),
         });
         doc.shape_order.push(ShapeKind::Extrusion);
         doc.bodies.push(Body {
@@ -1018,6 +1019,37 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_chamfer_fillet_parent_on_a_bridging_line() {
+        // #76: `Line::chamfer_fillet_parent` is a `#[serde(default)]` field on an entity
+        // already persisted generically via `dag_nodes` JSON payloads, so it should round-trip
+        // with no `storage.rs` changes — verify that assumption rather than just trusting it.
+        let dir = std::env::temp_dir();
+        let path = dir.join("bearcad_chamfer_fillet_parent_roundtrip.bearcad");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.shape_order.push(ShapeKind::Line);
+        doc.lines.push(Line::from_local_endpoints(sketch, 10.0, 0.0, 10.0, 10.0));
+        doc.shape_order.push(ShapeKind::Line);
+        let mut bridge = Line::from_local_endpoints(sketch, 7.0, 0.0, 10.0, 3.0);
+        bridge.chamfer_fillet_parent = Some(0);
+        doc.lines.push(bridge);
+        doc.shape_order.push(ShapeKind::Line);
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert_eq!(loaded.lines.len(), 3);
+        assert_eq!(loaded.lines[0].chamfer_fillet_parent, None);
+        assert_eq!(loaded.lines[1].chamfer_fillet_parent, None);
+        assert_eq!(loaded.lines[2].chamfer_fillet_parent, Some(0));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn round_trips_tombstoned_line_with_alive_sibling() {
         use crate::document_lifecycle::tombstone_element;
         use crate::hierarchy::SceneElement;
@@ -1059,6 +1091,75 @@ mod tests {
             health.element_status(SceneElement::Line(1)),
             crate::document_health::HealthStatus::Unstable
         );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn round_trips_document_default_units() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("bearcad_document_units_test.bearcad");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        doc.default_length_unit = LengthUnit::In;
+        doc.default_angle_unit = AngleUnit::Rad;
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert_eq!(loaded.default_length_unit, LengthUnit::In);
+        assert_eq!(loaded.default_angle_unit, AngleUnit::Rad);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn legacy_files_without_unit_meta_keys_fall_back_to_mm_and_deg() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("bearcad_legacy_units_test.bearcad");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        // Save a document, then delete the unit meta keys to simulate a pre-#52 file.
+        let doc = Document::default();
+        save(&path, &doc).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "DELETE FROM meta WHERE key IN (?1, ?2)",
+                rusqlite::params![DEFAULT_LENGTH_UNIT_META_KEY, DEFAULT_ANGLE_UNIT_META_KEY],
+            )
+            .unwrap();
+        }
+
+        let loaded = open(&path).unwrap();
+        assert_eq!(loaded.default_length_unit, LengthUnit::Mm);
+        assert_eq!(loaded.default_angle_unit, AngleUnit::Deg);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn round_trips_sketch_unit_override_and_inherit() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("bearcad_sketch_units_test.bearcad");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let overridden = plane_sketch(&mut doc);
+        doc.sketches[overridden].length_unit = Some(LengthUnit::Cm);
+        doc.sketches[overridden].angle_unit = Some(AngleUnit::Rad);
+        let inheriting = plane_sketch(&mut doc);
+        assert_eq!(doc.sketches[inheriting].length_unit, None);
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert_eq!(loaded.sketches[overridden].length_unit, Some(LengthUnit::Cm));
+        assert_eq!(loaded.sketches[overridden].angle_unit, Some(AngleUnit::Rad));
+        assert_eq!(loaded.sketches[inheriting].length_unit, None);
+        assert_eq!(loaded.sketches[inheriting].angle_unit, None);
 
         std::fs::remove_file(&path).unwrap();
     }

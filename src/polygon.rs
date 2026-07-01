@@ -308,7 +308,8 @@ pub(crate) fn point_in_triangle_2d(
     u >= -1e-4 && v >= -1e-4 && (u + v) <= 1.0 + 1e-4
 }
 
-#[cfg(test)]
+/// Even-odd (ray-casting) point-in-polygon test; winding-independent. Used both by tests and,
+/// at runtime, to resolve which atomic boolean region (#16/#62) a click landed in.
 pub(crate) fn point_in_polygon_2d(p: (f32, f32), vertices: &[(f32, f32)]) -> bool {
     let mut inside = false;
     let n = vertices.len();

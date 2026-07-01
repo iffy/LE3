@@ -33,6 +33,11 @@ pub fn scene_element_for_point(point: ConstraintPoint) -> SceneElement {
         ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(line),
         ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(rect),
         ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(circle),
+        // A face's own vertex tracks the extrusion that produced its face, same convention
+        // as `document_health`/`hierarchy`'s owner mappings for `FaceVertex`/`FaceEdge`.
+        ConstraintPoint::FaceVertex { face, .. } => {
+            SceneElement::Extrusion(face.extrusion_index().unwrap_or(usize::MAX))
+        }
     }
 }
 
@@ -40,12 +45,16 @@ pub fn scene_element_for_line(line: ConstraintLine) -> SceneElement {
     match line {
         ConstraintLine::Line(index) => SceneElement::Line(index),
         ConstraintLine::RectEdge { rect, edge } => SceneElement::RectEdge(rect, edge),
+        // A face's own edge (#26/#27) is itself a first-class selectable/constraint-authoring
+        // target, so it wraps whole like `ConstraintPoint`/`SceneElement::Point` do — not the
+        // extrusion-owner mapping other (dependency-tracking) call sites use.
+        face_edge @ ConstraintLine::FaceEdge { .. } => SceneElement::FaceEdge(face_edge),
     }
 }
 
-pub fn line_drag_seed_points(line: ConstraintLine) -> [ConstraintPoint; 2] {
+pub fn line_drag_seed_points(line: ConstraintLine) -> Vec<ConstraintPoint> {
     match line {
-        ConstraintLine::Line(index) => [
+        ConstraintLine::Line(index) => vec![
             ConstraintPoint::LineEndpoint {
                 line: index,
                 end: LineEnd::Start,
@@ -57,17 +66,19 @@ pub fn line_drag_seed_points(line: ConstraintLine) -> [ConstraintPoint; 2] {
         ],
         ConstraintLine::RectEdge { rect, edge } => {
             let (c0, c1) = edge.corner_indices();
-            [
+            vec![
                 ConstraintPoint::RectCorner { rect, corner: c0 },
                 ConstraintPoint::RectCorner { rect, corner: c1 },
             ]
         }
+        // A face's own edge is fixed (not draggable), so it has no seed points to drag.
+        ConstraintLine::FaceEdge { .. } => Vec::new(),
     }
 }
 
 /// Whether a sketch vertex may be dragged (fully constrained vertices are blocked).
 pub fn can_drag_point(doc: &Document, sketch: SketchId, point: ConstraintPoint) -> bool {
-    if !point_in_sketch(doc, point, sketch) {
+    if !point_in_sketch(doc, point.clone(), sketch) {
         return false;
     }
     if let ConstraintPoint::LineEndpoint { line, .. } = point {
@@ -77,6 +88,10 @@ pub fn can_drag_point(doc: &Document, sketch: SketchId, point: ConstraintPoint) 
     if let ConstraintPoint::RectCorner { rect, .. } = point {
         return !rect_corner_drag_blocked(doc, rect);
     }
+    // A face's own vertex is fixed by the body's geometry, never draggable.
+    if let ConstraintPoint::FaceVertex { .. } = point {
+        return false;
+    }
     true
 }
 
@@ -84,7 +99,7 @@ pub fn can_drag_point(doc: &Document, sketch: SketchId, point: ConstraintPoint) 
 pub fn can_drag_line(doc: &Document, sketch: SketchId, target: ConstraintLine) -> bool {
     match target {
         ConstraintLine::Line(line) => {
-            point_in_sketch(doc, line_drag_seed_points(target)[0], sketch)
+            point_in_sketch(doc, line_drag_seed_points(target)[0].clone(), sketch)
                 && !crate::sketch_solver::sketch_line_vertex_drag_blocked(doc, sketch, line)
                     .unwrap_or(false)
         }
@@ -98,6 +113,8 @@ pub fn can_drag_line(doc: &Document, sketch: SketchId, target: ConstraintLine) -
             }
             !rect_edge_drag_blocked(doc, rect, edge)
         }
+        // Fixed by the body's own geometry, never draggable.
+        ConstraintLine::FaceEdge { .. } => false,
     }
 }
 
@@ -107,8 +124,8 @@ pub fn begin_line_drag_session(
     target: ConstraintLine,
     anchor_uv: (f32, f32),
 ) -> Result<LineDragSession, String> {
-    validate_line_drag_target(doc, sketch, target)?;
-    let initial_positions = collect_line_drag_positions(doc, sketch, target)?;
+    validate_line_drag_target(doc, sketch, target.clone())?;
+    let initial_positions = collect_line_drag_positions(doc, sketch, target.clone())?;
     Ok(LineDragSession {
         target,
         anchor_uv,
@@ -122,7 +139,7 @@ pub fn drag_line(
     session: &LineDragSession,
     current_uv: (f32, f32),
 ) -> Result<(), String> {
-    validate_line_drag_target(doc, sketch, session.target)?;
+    validate_line_drag_target(doc, sketch, session.target.clone())?;
     let mut du = current_uv.0 - session.anchor_uv.0;
     let mut dv = current_uv.1 - session.anchor_uv.1;
     if let ConstraintLine::RectEdge { rect, edge } = session.target {
@@ -142,7 +159,7 @@ pub fn drag_line(
             let Some(line) = coincident_line_for_point(doc, point) else {
                 continue;
             };
-            let Ok(((lx0, ly0), (lx1, ly1))) = line_uv_endpoints(doc, line) else {
+            let Ok(((lx0, ly0), (lx1, ly1))) = line_uv_endpoints(doc, sketch, line) else {
                 continue;
             };
             let (ldx, ldy) = (lx1 - lx0, ly1 - ly0);
@@ -153,38 +170,39 @@ pub fn drag_line(
             }
         }
     }
-    let seeds = line_drag_seed_points(session.target);
+    let seeds = line_drag_seed_points(session.target.clone());
     if let ConstraintLine::RectEdge { .. } = session.target {
-        let [start, end] = seeds;
+        let start = seeds[0].clone();
+        let end = seeds[1].clone();
         let (iu0, iv0) = session.initial_positions[&start];
         let (iu1, iv1) = session.initial_positions[&end];
-        let (u0, v0) = project_drag_uv(doc, start, iu0 + du, iv0 + dv)?;
-        let (u1, v1) = project_drag_uv(doc, end, iu1 + du, iv1 + dv)?;
-        set_line_uv_endpoints(doc, session.target, (u0, v0), (u1, v1))?;
+        let (u0, v0) = project_drag_uv(doc, sketch, start, iu0 + du, iv0 + dv)?;
+        let (u1, v1) = project_drag_uv(doc, sketch, end, iu1 + du, iv1 + dv)?;
+        set_line_uv_endpoints(doc, sketch, session.target.clone(), (u0, v0), (u1, v1))?;
         for (point, (iu, iv)) in &session.initial_positions {
-            if seeds.contains(point) || !point_in_sketch(doc, *point, sketch) {
+            if seeds.contains(point) || !point_in_sketch(doc, point.clone(), sketch) {
                 continue;
             }
-            let (pu, pv) = project_drag_uv(doc, *point, iu + du, iv + dv)?;
-            set_point_uv(doc, *point, pu, pv)?;
+            let (pu, pv) = project_drag_uv(doc, sketch, point.clone(), iu + du, iv + dv)?;
+            set_point_uv(doc, sketch, point.clone(), pu, pv)?;
         }
     } else {
-        translate_line(doc, session.target, du, dv)?;
+        translate_line(doc, sketch, session.target.clone(), du, dv)?;
         for (point, (iu, iv)) in &session.initial_positions {
-            if seeds.contains(point) || !point_in_sketch(doc, *point, sketch) {
+            if seeds.contains(point) || !point_in_sketch(doc, point.clone(), sketch) {
                 continue;
             }
-            set_point_uv(doc, *point, iu + du, iv + dv)?;
+            set_point_uv(doc, sketch, point.clone(), iu + du, iv + dv)?;
         }
     }
     let pins: Vec<(ConstraintPoint, (f32, f32))> = session
         .initial_positions
         .iter()
-        .filter(|(point, _)| point_in_sketch(doc, **point, sketch))
+        .filter(|(point, _)| point_in_sketch(doc, (*point).clone(), sketch))
         .map(|(point, (iu, iv))| {
-            let projected = project_drag_uv(doc, *point, iu + du, iv + dv)
+            let projected = project_drag_uv(doc, sketch, point.clone(), iu + du, iv + dv)
                 .unwrap_or((iu + du, iv + dv));
-            (*point, projected)
+            (point.clone(), projected)
         })
         .collect();
     solve_document_constraints_with_pins(doc, &pins)
@@ -214,6 +232,10 @@ fn validate_line_drag_target(
                 return Err(format!("Rectangle {rect} is not in sketch {sketch}"));
             }
         }
+        // Fixed by the body's own geometry — never a valid line-drag target.
+        ConstraintLine::FaceEdge { index, .. } => {
+            return Err(format!("Face edge {index} cannot be dragged"));
+        }
     }
     Ok(())
 }
@@ -227,12 +249,12 @@ fn collect_line_drag_positions(
     for seed in line_drag_seed_points(target) {
         points.extend(coincident_group(doc, sketch, seed));
     }
-    points.sort_by_key(|point| constraint_point_sort_key(*point));
+    points.sort_by_key(|point| constraint_point_sort_key(point.clone()));
     points.dedup();
 
     let mut initial_positions = HashMap::new();
     for point in points {
-        let uv = point_uv(doc, point)?;
+        let uv = point_uv(doc, sketch, point.clone())?;
         initial_positions.insert(point, uv);
     }
     Ok(initial_positions)
@@ -243,6 +265,7 @@ fn constraint_point_sort_key(point: ConstraintPoint) -> (u8, usize, u8, u8) {
         ConstraintPoint::LineEndpoint { line, end } => (0, line, end as u8, 0),
         ConstraintPoint::RectCorner { rect, corner } => (1, rect, corner, 0),
         ConstraintPoint::CircleCenter(circle) => (2, circle, 0, 0),
+        ConstraintPoint::FaceVertex { index, .. } => (3, index, 0, 0),
     }
 }
 
@@ -255,18 +278,19 @@ pub fn drag_point(
     u: f32,
     v: f32,
 ) -> Result<(), String> {
-    if !point_in_sketch(doc, dragged, sketch) {
+    if !point_in_sketch(doc, dragged.clone(), sketch) {
         return Err("Point is not in the active sketch".to_string());
     }
 
-    let (u, v) = project_drag_uv(doc, dragged, u, v)?;
-    let group = coincident_group(doc, sketch, dragged);
+    let (u, v) = project_drag_uv(doc, sketch, dragged.clone(), u, v)?;
+    let group = coincident_group(doc, sketch, dragged.clone());
     for point in &group {
-        set_point_uv(doc, *point, u, v)?;
+        set_point_uv(doc, sketch, point.clone(), u, v)?;
     }
 
     apply_length_constraints_for_drag(doc, dragged, u, v, &group)?;
-    let pins: Vec<(ConstraintPoint, (f32, f32))> = group.iter().map(|point| (*point, (u, v))).collect();
+    let pins: Vec<(ConstraintPoint, (f32, f32))> =
+        group.iter().map(|point| (point.clone(), (u, v))).collect();
     solve_document_constraints_with_pins(doc, &pins)
 }
 
@@ -325,19 +349,20 @@ fn project_rect_corner_drag(
         .rects
         .get(rect)
         .ok_or_else(|| format!("Rectangle {rect} not found"))?;
+    let sketch = entity.sketch;
     let (locked_w, locked_h) = rect_locked_dimensions(doc, rect);
     let (fixed_u, fixed_v) = rect_corner_axis_locks(entity, corner, locked_w, locked_h);
     let point = ConstraintPoint::RectCorner { rect, corner };
 
     // A corner coincident onto a line must slide along that line, not pull off it (the drag
     // pin would otherwise override and break the coincident constraint). See #42.
-    let (u, v) = match coincident_line_for_point(doc, point) {
-        Some(line) => project_point_onto_line_uv(doc, line, u, v)?,
+    let (u, v) = match coincident_line_for_point(doc, point.clone()) {
+        Some(line) => project_point_onto_line_uv(doc, sketch, line, u, v)?,
         None => (u, v),
     };
 
     let (pu, pv) = if let Some((pu, pv)) =
-        project_point_point_distance_drag(doc, point, u, v, fixed_u, fixed_v)?
+        project_point_point_distance_drag(doc, sketch, point, u, v, fixed_u, fixed_v)?
     {
         (pu, pv)
     } else {
@@ -450,6 +475,7 @@ fn project_onto_distance_circle_with_axis_locks(
 
 fn project_point_point_distance_drag(
     doc: &Document,
+    sketch: SketchId,
     dragged: ConstraintPoint,
     u: f32,
     v: f32,
@@ -468,7 +494,7 @@ fn project_point_point_distance_drag(
                     dir_u,
                     dir_v,
                 },
-        } = constraint.kind
+        } = constraint.kind.clone()
         else {
             continue;
         };
@@ -479,7 +505,7 @@ fn project_point_point_distance_drag(
             continue;
         }
         if dragged == mover {
-            let (au, av) = point_uv(doc, anchor)?;
+            let (au, av) = point_uv(doc, sketch, anchor)?;
             return Ok(Some(project_onto_distance_circle_with_axis_locks(
                 au,
                 av,
@@ -493,7 +519,7 @@ fn project_point_point_distance_drag(
             )));
         }
         if dragged == anchor {
-            let (mu, mv) = point_uv(doc, mover)?;
+            let (mu, mv) = point_uv(doc, sketch, mover)?;
             return Ok(Some(project_onto_distance_circle_with_axis_locks(
                 mu,
                 mv,
@@ -512,6 +538,7 @@ fn project_point_point_distance_drag(
 
 fn project_drag_uv(
     doc: &Document,
+    sketch: SketchId,
     dragged: ConstraintPoint,
     u: f32,
     v: f32,
@@ -519,11 +546,11 @@ fn project_drag_uv(
     // A point pinned to a line's midpoint or onto a line must not be draggable off it; project
     // the cursor onto the constrained position so the drag pin can't break the constraint.
     if !matches!(dragged, ConstraintPoint::RectCorner { .. }) {
-        if let Some((pu, pv)) = project_onto_anchoring_constraint(doc, dragged, u, v)? {
+        if let Some((pu, pv)) = project_onto_anchoring_constraint(doc, sketch, dragged.clone(), u, v)? {
             return Ok((pu, pv));
         }
     }
-    match dragged {
+    match dragged.clone() {
         ConstraintPoint::RectCorner { rect, corner } => {
             return project_rect_corner_drag(doc, rect, corner, u, v);
         }
@@ -535,16 +562,16 @@ fn project_drag_uv(
                 if constraint.deleted {
                     continue;
                 }
-                match constraint.kind {
-                    ConstraintKind::Horizontal { line: constrained } if constrained == line => {
-                        let ((_x0, y0), (_x1, y1)) = line_uv_endpoints(doc, line)?;
+                match &constraint.kind {
+                    ConstraintKind::Horizontal { line: constrained } if *constrained == line => {
+                        let ((_x0, y0), (_x1, y1)) = line_uv_endpoints(doc, sketch, line.clone())?;
                         projected_v = match end {
                             LineEnd::Start => y1,
                             LineEnd::End => y0,
                         };
                     }
-                    ConstraintKind::Vertical { line: constrained } if constrained == line => {
-                        let ((x0, _y0), (x1, _y1)) = line_uv_endpoints(doc, line)?;
+                    ConstraintKind::Vertical { line: constrained } if *constrained == line => {
+                        let ((x0, _y0), (x1, _y1)) = line_uv_endpoints(doc, sketch, line.clone())?;
                         projected_u = match end {
                             LineEnd::Start => x1,
                             LineEnd::End => x0,
@@ -553,14 +580,20 @@ fn project_drag_uv(
                     _ => {}
                 }
             }
-            if let Some((pu, pv)) =
-                project_point_point_distance_drag(doc, dragged, projected_u, projected_v, None, None)?
-            {
+            if let Some((pu, pv)) = project_point_point_distance_drag(
+                doc,
+                sketch,
+                dragged.clone(),
+                projected_u,
+                projected_v,
+                None,
+                None,
+            )? {
                 projected_u = pu;
                 projected_v = pv;
             }
             if let Some((pu, pv)) =
-                project_endpoint_onto_direction(doc, line_index, end, projected_u, projected_v)?
+                project_endpoint_onto_direction(doc, sketch, line_index, end, projected_u, projected_v)?
             {
                 projected_u = pu;
                 projected_v = pv;
@@ -569,7 +602,7 @@ fn project_drag_uv(
         }
         _ => {
             if let Some((pu, pv)) =
-                project_point_point_distance_drag(doc, dragged, u, v, None, None)?
+                project_point_point_distance_drag(doc, sketch, dragged, u, v, None, None)?
             {
                 Ok((pu, pv))
             } else {
@@ -583,6 +616,7 @@ fn project_drag_uv(
 /// (the midpoint, or the perpendicular foot on the line) so the drag can't pull it off.
 fn project_onto_anchoring_constraint(
     doc: &Document,
+    sketch: SketchId,
     dragged: ConstraintPoint,
     u: f32,
     v: f32,
@@ -591,23 +625,23 @@ fn project_onto_anchoring_constraint(
         if constraint.deleted {
             continue;
         }
-        match constraint.kind {
-            ConstraintKind::Midpoint { point, line } if point == dragged => {
-                let ((x0, y0), (x1, y1)) = line_uv_endpoints(doc, line)?;
+        match &constraint.kind {
+            ConstraintKind::Midpoint { point, line } if *point == dragged => {
+                let ((x0, y0), (x1, y1)) = line_uv_endpoints(doc, sketch, line.clone())?;
                 return Ok(Some(((x0 + x1) * 0.5, (y0 + y1) * 0.5)));
             }
             ConstraintKind::Coincident { a, b } => {
                 let line = match (a, b) {
                     (ConstraintEntity::Point(p), ConstraintEntity::Line(l))
                     | (ConstraintEntity::Line(l), ConstraintEntity::Point(p))
-                        if p == dragged =>
+                        if *p == dragged =>
                     {
-                        Some(l)
+                        Some(l.clone())
                     }
                     _ => None,
                 };
                 if let Some(line) = line {
-                    return Ok(Some(project_point_onto_line_uv(doc, line, u, v)?));
+                    return Ok(Some(project_point_onto_line_uv(doc, sketch, line, u, v)?));
                 }
             }
             _ => {}
@@ -622,13 +656,13 @@ fn coincident_line_for_point(doc: &Document, point: ConstraintPoint) -> Option<C
         if constraint.deleted {
             continue;
         }
-        if let ConstraintKind::Coincident { a, b } = constraint.kind {
+        if let ConstraintKind::Coincident { a, b } = &constraint.kind {
             match (a, b) {
                 (ConstraintEntity::Point(p), ConstraintEntity::Line(l))
                 | (ConstraintEntity::Line(l), ConstraintEntity::Point(p))
-                    if p == point =>
+                    if *p == point =>
                 {
-                    return Some(l);
+                    return Some(l.clone());
                 }
                 _ => {}
             }
@@ -640,11 +674,12 @@ fn coincident_line_for_point(doc: &Document, point: ConstraintPoint) -> Option<C
 /// Perpendicular foot of `(u, v)` on the infinite line through `line` (sketch units).
 fn project_point_onto_line_uv(
     doc: &Document,
+    sketch: SketchId,
     line: ConstraintLine,
     u: f32,
     v: f32,
 ) -> Result<(f32, f32), String> {
-    let ((x0, y0), (x1, y1)) = line_uv_endpoints(doc, line)?;
+    let ((x0, y0), (x1, y1)) = line_uv_endpoints(doc, sketch, line)?;
     let dx = x1 - x0;
     let dy = y1 - y0;
     let len_sq = dx * dx + dy * dy;
@@ -659,31 +694,35 @@ fn project_point_onto_line_uv(
 /// (parallel/perpendicular/angle), oriented to match the line's current direction.
 fn constrained_line_direction(doc: &Document, line_index: usize) -> Option<(f32, f32)> {
     let this = ConstraintLine::Line(line_index);
-    let (cur_du, cur_dv) = line_direction_uv(doc, this)?;
+    let sketch = doc.lines.get(line_index)?.sketch;
+    let (cur_du, cur_dv) = line_direction_uv(doc, sketch, this.clone())?;
     for (index, constraint) in doc.constraints.iter().enumerate() {
         if constraint.deleted {
             continue;
         }
-        let candidates: Vec<(f32, f32)> = match constraint.kind {
+        let candidates: Vec<(f32, f32)> = match &constraint.kind {
             ConstraintKind::Parallel { line_a, line_b } => {
-                let Some(reference) = direction_reference(this, line_a, line_b) else {
+                let Some(reference) = direction_reference(this.clone(), line_a.clone(), line_b.clone())
+                else {
                     continue;
                 };
-                let (rdu, rdv) = line_direction_uv(doc, reference)?;
+                let (rdu, rdv) = line_direction_uv(doc, sketch, reference)?;
                 vec![(rdu, rdv), (-rdu, -rdv)]
             }
             ConstraintKind::Perpendicular { line_a, line_b } => {
-                let Some(reference) = direction_reference(this, line_a, line_b) else {
+                let Some(reference) = direction_reference(this.clone(), line_a.clone(), line_b.clone())
+                else {
                     continue;
                 };
-                let (rdu, rdv) = line_direction_uv(doc, reference)?;
+                let (rdu, rdv) = line_direction_uv(doc, sketch, reference)?;
                 vec![(-rdv, rdu), (rdv, -rdu)]
             }
             ConstraintKind::Angle { line_a, line_b, .. } => {
-                let Some(reference) = direction_reference(this, line_a, line_b) else {
+                let Some(reference) = direction_reference(this.clone(), line_a.clone(), line_b.clone())
+                else {
                     continue;
                 };
-                let (rdu, rdv) = line_direction_uv(doc, reference)?;
+                let (rdu, rdv) = line_direction_uv(doc, sketch, reference)?;
                 let angle = constraint_evaluated_angle(doc, index)?;
                 let (cos, sin) = (angle.cos(), angle.sin());
                 let rot_pos = (rdu * cos - rdv * sin, rdu * sin + rdv * cos);
@@ -726,6 +765,7 @@ fn direction_reference(
 /// slide the target along the constrained ray (so the drag can't override the direction).
 fn project_endpoint_onto_direction(
     doc: &Document,
+    sketch: SketchId,
     line_index: usize,
     end: LineEnd,
     u: f32,
@@ -734,9 +774,9 @@ fn project_endpoint_onto_direction(
     let Some((dir_u, dir_v)) = constrained_line_direction(doc, line_index) else {
         return Ok(None);
     };
-    let Some(sketch) = doc.lines.get(line_index).map(|line| line.sketch) else {
+    if doc.lines.get(line_index).is_none() {
         return Ok(None);
-    };
+    }
     let other = ConstraintPoint::LineEndpoint {
         line: line_index,
         end: match end {
@@ -746,10 +786,10 @@ fn project_endpoint_onto_direction(
     };
     // Only constrain the drag when the other endpoint cannot move; otherwise the solver keeps
     // the direction by moving that endpoint and the dragged end should follow the cursor.
-    if crate::sketch_solver::sketch_point_movable(doc, sketch, other).unwrap_or(true) {
+    if crate::sketch_solver::sketch_point_movable(doc, sketch, other.clone()).unwrap_or(true) {
         return Ok(None);
     }
-    let (ox, ov) = point_uv(doc, other)?;
+    let (ox, ov) = point_uv(doc, sketch, other)?;
     // The ray runs from the fixed endpoint toward the dragged one along the line direction.
     let (ray_u, ray_v) = match end {
         LineEnd::End => (dir_u, dir_v),
@@ -768,7 +808,7 @@ pub fn coincident_group(doc: &Document, sketch: SketchId, seed: ConstraintPoint)
             if constraint.deleted || constraint.sketch != sketch {
                 continue;
             }
-            let ConstraintKind::Coincident { a, b } = constraint.kind else {
+            let ConstraintKind::Coincident { a, b } = constraint.kind.clone() else {
                 continue;
             };
             let Some(pa) = entity_point(a) else {
@@ -810,6 +850,49 @@ pub fn incident_two_lines(
         [a, b] => Some([*a, *b]),
         _ => None,
     }
+}
+
+/// The two lines, their vertex-side ends, and the resolved corner geometry (shared vertex `v`
+/// plus each line's far endpoint `a`/`b`, in sketch-local UV coords) for a chamfer/fillet vertex
+/// treatment at `point`. Feeds directly into [`crate::model::vertex_treatment_geometry`].
+///
+/// `line1 < line2`, mirroring [`incident_two_lines`]'s ordering, so callers that need a single
+/// deterministic "primary" line for the pair (e.g. nesting a bridging line under the lower-index
+/// trimmed line in the Elements pane, #76) get a consistent answer.
+///
+/// Factored out of what used to be near-identical resolution code in "convert to bezier" (#54),
+/// commit-time chamfer/fillet (#37/#38), and the chamfer/fillet gizmo anchor/live-preview (#76).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VertexTreatmentCorner {
+    pub line1: usize,
+    pub end1: LineEnd,
+    pub line2: usize,
+    pub end2: LineEnd,
+    /// Shared vertex, in sketch-local UV coords.
+    pub v: (f32, f32),
+    /// `line1`'s far (non-vertex) endpoint, in sketch-local UV coords.
+    pub a: (f32, f32),
+    /// `line2`'s far (non-vertex) endpoint, in sketch-local UV coords.
+    pub b: (f32, f32),
+}
+
+pub fn treatment_corner(
+    doc: &Document,
+    sketch: SketchId,
+    point: ConstraintPoint,
+) -> Option<VertexTreatmentCorner> {
+    let [(line1, end1), (line2, end2)] = incident_two_lines(doc, sketch, point)?;
+    let l1 = doc.lines.get(line1)?;
+    let (v, a) = match end1 {
+        LineEnd::Start => ((l1.x0, l1.y0), (l1.x1, l1.y1)),
+        LineEnd::End => ((l1.x1, l1.y1), (l1.x0, l1.y0)),
+    };
+    let l2 = doc.lines.get(line2)?;
+    let b = match end2 {
+        LineEnd::Start => (l2.x1, l2.y1),
+        LineEnd::End => (l2.x0, l2.y0),
+    };
+    Some(VertexTreatmentCorner { line1, end1, line2, end2, v, a, b })
 }
 
 fn entity_point(entity: ConstraintEntity) -> Option<ConstraintPoint> {
@@ -1198,8 +1281,8 @@ mod tests {
         assert!((doc.rects[0].h - 50.0).abs() < EPS, "A height collapsed: {}", doc.rects[0].h);
         // The coincident constraints hold: B's left/right edges stay on A's edge lines, so B
         // keeps the same width as A rather than becoming wider.
-        let bl = point_uv(&doc, ConstraintPoint::RectCorner { rect: 1, corner: 0 }).unwrap();
-        let br = point_uv(&doc, ConstraintPoint::RectCorner { rect: 1, corner: 1 }).unwrap();
+        let bl = point_uv(&doc, sketch, ConstraintPoint::RectCorner { rect: 1, corner: 0 }).unwrap();
+        let br = point_uv(&doc, sketch, ConstraintPoint::RectCorner { rect: 1, corner: 1 }).unwrap();
         assert!(bl.0.abs() < EPS, "B left corner left A's left edge: x={}", bl.0);
         assert!((br.0 - 100.0).abs() < EPS, "B right corner left A's right edge: x={}", br.0);
         assert!(
@@ -1335,6 +1418,7 @@ mod tests {
         drag_line(&mut doc, sketch, &session, (0.0, 2.0)).unwrap();
         let bottom_left = point_uv(
             &doc,
+            sketch,
             ConstraintPoint::RectCorner {
                 rect: 0,
                 corner: 0,
@@ -1343,6 +1427,7 @@ mod tests {
         .unwrap();
         let bottom_right = point_uv(
             &doc,
+            sketch,
             ConstraintPoint::RectCorner {
                 rect: 0,
                 corner: 1,
@@ -1351,6 +1436,7 @@ mod tests {
         .unwrap();
         let top_left = point_uv(
             &doc,
+            sketch,
             ConstraintPoint::RectCorner {
                 rect: 0,
                 corner: 3,
@@ -1542,23 +1628,25 @@ mod tests {
 
     fn measured_angle_between_lines(
         doc: &Document,
+        sketch: SketchId,
         line_a: ConstraintLine,
         line_b: ConstraintLine,
     ) -> Option<f32> {
-        let (adu, adv) = line_direction_uv(doc, line_a)?;
-        let (bdu, bdv) = line_direction_uv(doc, line_b)?;
+        let (adu, adv) = line_direction_uv(doc, sketch, line_a)?;
+        let (bdu, bdv) = line_direction_uv(doc, sketch, line_b)?;
         let dot = (adu * bdu + adv * bdv).clamp(-1.0, 1.0);
         Some(dot.acos())
     }
 
     fn measured_line_line_distance(
         doc: &Document,
+        sketch: SketchId,
         line_a: ConstraintLine,
         line_b: ConstraintLine,
     ) -> Option<f32> {
         use crate::geometric_constraints::line_uv_endpoints;
-        let ((ax0, ay0), (ax1, ay1)) = line_uv_endpoints(doc, line_a).ok()?;
-        let ((bx0, by0), (bx1, by1)) = line_uv_endpoints(doc, line_b).ok()?;
+        let ((ax0, ay0), (ax1, ay1)) = line_uv_endpoints(doc, sketch, line_a).ok()?;
+        let ((bx0, by0), (bx1, by1)) = line_uv_endpoints(doc, sketch, line_b).ok()?;
         let du = ax1 - ax0;
         let dv = ay1 - ay0;
         let len = (du * du + dv * dv).sqrt();
@@ -1644,6 +1732,7 @@ mod tests {
 
         let angle = measured_angle_between_lines(
             &doc,
+            sketch,
             ConstraintLine::Line(0),
             ConstraintLine::Line(1),
         )
@@ -1656,14 +1745,15 @@ mod tests {
 
         let spacing = measured_line_line_distance(
             &doc,
+            sketch,
             ConstraintLine::Line(1),
             ConstraintLine::Line(2),
         )
         .unwrap();
         assert!((spacing - 15.0).abs() < 0.5, "spacing={spacing}");
 
-        let (bdu, bdv) = line_direction_uv(&doc, ConstraintLine::Line(1)).unwrap();
-        let (cdu, cdv) = line_direction_uv(&doc, ConstraintLine::Line(2)).unwrap();
+        let (bdu, bdv) = line_direction_uv(&doc, sketch, ConstraintLine::Line(1)).unwrap();
+        let (cdu, cdv) = line_direction_uv(&doc, sketch, ConstraintLine::Line(2)).unwrap();
         let parallel_dot = (bdu * cdu + bdv * cdv).clamp(-1.0, 1.0);
         assert!((parallel_dot - 1.0).abs() < 0.01, "parallel_dot={parallel_dot}");
     }
@@ -1752,7 +1842,7 @@ mod tests {
             doc,
             sketch,
             DistanceTarget::PointLineDistance {
-                point: distance_point,
+                point: distance_point.clone(),
                 line: rect_top,
                 side: 1,
             },
@@ -1763,9 +1853,14 @@ mod tests {
         Ok((distance_point, line_a, line_b))
     }
 
-    fn assert_lines_perpendicular(doc: &Document, line_a: ConstraintLine, line_b: ConstraintLine) {
-        let (adu, adv) = line_direction_uv(doc, line_a).unwrap();
-        let (bdu, bdv) = line_direction_uv(doc, line_b).unwrap();
+    fn assert_lines_perpendicular(
+        doc: &Document,
+        sketch: SketchId,
+        line_a: ConstraintLine,
+        line_b: ConstraintLine,
+    ) {
+        let (adu, adv) = line_direction_uv(doc, sketch, line_a).unwrap();
+        let (bdu, bdv) = line_direction_uv(doc, sketch, line_b).unwrap();
         let dot = (adu * bdu + adv * bdv).clamp(-1.0, 1.0);
         assert!(dot.abs() < 0.01, "lines should stay perpendicular, dot={dot}");
     }
@@ -1788,7 +1883,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_lines_perpendicular(&doc, line_a, line_b);
+        assert_lines_perpendicular(&doc, sketch, line_a, line_b);
     }
 
     #[test]
@@ -1799,16 +1894,17 @@ mod tests {
 
         drag_point(&mut doc, sketch, distance_point, 55.0, 95.0).unwrap();
 
-        assert_lines_perpendicular(&doc, line_a, line_b);
+        assert_lines_perpendicular(&doc, sketch, line_a, line_b);
     }
 
     fn point_point_distance_mm(
         doc: &Document,
+        sketch: SketchId,
         anchor: ConstraintPoint,
         mover: ConstraintPoint,
     ) -> f32 {
-        let (au, av) = point_uv(doc, anchor).unwrap();
-        let (mu, mv) = point_uv(doc, mover).unwrap();
+        let (au, av) = point_uv(doc, sketch, anchor).unwrap();
+        let (mu, mv) = point_uv(doc, sketch, mover).unwrap();
         (mu - au).hypot(mv - av)
     }
 
@@ -1823,7 +1919,7 @@ mod tests {
         doc.shape_order.push(crate::model::ShapeKind::Rect);
         doc.shape_order.push(crate::model::ShapeKind::Line);
 
-        // Lock the rectangle so the anchor corner cannot slide to absorb drag error.
+        // Lock the rectangle so the anchor.clone() corner cannot slide to absorb drag error.
         add_distance_constraint(
             &mut doc,
             sketch,
@@ -1852,8 +1948,8 @@ mod tests {
             &mut doc,
             sketch,
             DistanceTarget::PointPointDistance {
-                anchor,
-                mover,
+                anchor: anchor.clone(),
+                mover: mover.clone(),
                 dir_u: 1.0,
                 dir_v: 0.0,
             },
@@ -1862,17 +1958,17 @@ mod tests {
         .unwrap();
 
         assert!(
-            (point_point_distance_mm(&doc, anchor, mover) - 50.0).abs() < EPS,
+            (point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone()) - 50.0).abs() < EPS,
             "initial distance={}",
-            point_point_distance_mm(&doc, anchor, mover)
+            point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone())
         );
 
-        drag_point(&mut doc, sketch, mover, 200.0, 40.0).unwrap();
+        drag_point(&mut doc, sketch, mover.clone(), 200.0, 40.0).unwrap();
 
         assert!(
-            (point_point_distance_mm(&doc, anchor, mover) - 50.0).abs() < EPS,
+            (point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone()) - 50.0).abs() < EPS,
             "locked 50mm point-point distance must be preserved after drag, got {}",
-            point_point_distance_mm(&doc, anchor, mover)
+            point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone())
         );
     }
 
@@ -1908,8 +2004,8 @@ mod tests {
             &mut doc,
             sketch,
             DistanceTarget::PointPointDistance {
-                anchor,
-                mover,
+                anchor: anchor.clone(),
+                mover: mover.clone(),
                 dir_u: 1.0,
                 dir_v: 0.0,
             },
@@ -1917,7 +2013,7 @@ mod tests {
         )
         .unwrap();
 
-        drag_point(&mut doc, sketch, anchor, 150.0, 40.0).unwrap();
+        drag_point(&mut doc, sketch, anchor.clone(), 150.0, 40.0).unwrap();
 
         assert!(
             (doc.rects[0].w - 80.0).abs() < EPS,
@@ -1925,9 +2021,9 @@ mod tests {
             doc.rects[0].w
         );
         assert!(
-            (point_point_distance_mm(&doc, anchor, mover) - 50.0).abs() < EPS,
+            (point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone()) - 50.0).abs() < EPS,
             "point-point distance after drag={}",
-            point_point_distance_mm(&doc, anchor, mover)
+            point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone())
         );
     }
 
@@ -1963,8 +2059,8 @@ mod tests {
             &mut doc,
             sketch,
             DistanceTarget::PointPointDistance {
-                anchor,
-                mover,
+                anchor: anchor.clone(),
+                mover: mover.clone(),
                 dir_u: 1.0,
                 dir_v: 0.0,
             },
@@ -1972,15 +2068,15 @@ mod tests {
         )
         .unwrap();
 
-        let iv = point_uv(&doc, anchor).unwrap().1;
-        drag_point(&mut doc, sketch, anchor, 120.0, 95.0).unwrap();
-        let (fu, fv) = point_uv(&doc, anchor).unwrap();
+        let iv = point_uv(&doc, sketch, anchor.clone()).unwrap().1;
+        drag_point(&mut doc, sketch, anchor.clone(), 120.0, 95.0).unwrap();
+        let (fu, fv) = point_uv(&doc, sketch, anchor.clone()).unwrap();
 
         assert!((doc.rects[0].w - 80.0).abs() < EPS, "w={}", doc.rects[0].w);
         assert!(
-            (point_point_distance_mm(&doc, anchor, mover) - 50.0).abs() < EPS,
+            (point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone()) - 50.0).abs() < EPS,
             "distance={}",
-            point_point_distance_mm(&doc, anchor, mover)
+            point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone())
         );
         assert!((fu - 80.0).abs() < EPS, "locked side should stay at u=80, got {fu}");
         assert!(
@@ -2028,8 +2124,8 @@ mod tests {
             &mut doc,
             sketch,
             DistanceTarget::PointPointDistance {
-                anchor,
-                mover,
+                anchor: anchor.clone(),
+                mover: mover.clone(),
                 dir_u: 1.0,
                 dir_v: 0.0,
             },
@@ -2037,24 +2133,24 @@ mod tests {
         )
         .unwrap();
 
-        let (iu, iv) = point_uv(&doc, mover).unwrap();
+        let (iu, iv) = point_uv(&doc, sketch, mover.clone()).unwrap();
         assert!((iu - 130.0).abs() < EPS && (iv - 40.0).abs() < EPS, "iu={iu} iv={iv}");
 
-        drag_point(&mut doc, sketch, mover, 80.0, 90.0).unwrap();
+        drag_point(&mut doc, sketch, mover.clone(), 80.0, 90.0).unwrap();
 
-        let (fu, fv) = point_uv(&doc, mover).unwrap();
+        let (fu, fv) = point_uv(&doc, sketch, mover.clone()).unwrap();
         assert!(
-            (point_point_distance_mm(&doc, anchor, mover) - 50.0).abs() < EPS,
+            (point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone()) - 50.0).abs() < EPS,
             "distance after drag={}",
-            point_point_distance_mm(&doc, anchor, mover)
+            point_point_distance_mm(&doc, sketch, anchor.clone(), mover.clone())
         );
         assert!(
             (fu - 80.0).abs() < EPS && (fv - 90.0).abs() < EPS,
-            "mover should swing to (80, 90), got ({fu}, {fv})"
+            "mover.clone() should swing to (80, 90), got ({fu}, {fv})"
         );
         assert!(
             (fu - iu).abs() > 1.0 || (fv - iv).abs() > 1.0,
-            "drag should move the vertex around the anchor"
+            "drag should move the vertex around the anchor.clone()"
         );
     }
 
@@ -2185,8 +2281,8 @@ mod tests {
             &mut doc,
             sketch,
             DistanceTarget::PointPointDistance {
-                anchor: rect_top_left,
-                mover: line_vertex,
+                anchor: rect_top_left.clone(),
+                mover: line_vertex.clone(),
                 dir_u: -1.0,
                 dir_v: 0.0,
             },
@@ -2194,7 +2290,7 @@ mod tests {
         )
         .unwrap();
 
-        let (tlu_before, tlv_before) = point_uv(&doc, rect_top_left).unwrap();
+        let (tlu_before, tlv_before) = point_uv(&doc, sketch, rect_top_left.clone()).unwrap();
 
         // Push the top-right corner well to the left of the top-left corner.
         drag_point(
@@ -2209,23 +2305,24 @@ mod tests {
         // The top edge shrank (rather than the rect growing / flipping).
         assert!(doc.rects[0].w < 60.0, "width should not grow, w={}", doc.rects[0].w);
         // The top-left corner stayed put: it never flipped past the line vertex.
-        let (tlu_after, tlv_after) = point_uv(&doc, rect_top_left).unwrap();
+        let (tlu_after, tlv_after) = point_uv(&doc, sketch, rect_top_left.clone()).unwrap();
         assert!(
             (tlu_after - tlu_before).abs() < EPS && (tlv_after - tlv_before).abs() < EPS,
             "top-left corner must stay at ({tlu_before},{tlv_before}), got ({tlu_after},{tlv_after})"
         );
         // The 45mm distance to the line vertex is preserved.
         assert!(
-            (point_point_distance_mm(&doc, rect_top_left, line_vertex) - 45.0).abs() < EPS,
+            (point_point_distance_mm(&doc, sketch, rect_top_left.clone(), line_vertex.clone()) - 45.0).abs() < EPS,
             "distance to line vertex must stay 45mm, got {}",
-            point_point_distance_mm(&doc, rect_top_left, line_vertex)
+            point_point_distance_mm(&doc, sketch, rect_top_left, line_vertex)
         );
     }
 
-    fn line_top_edge_angle(doc: &Document) -> f32 {
-        let (ldu, ldv) = line_direction_uv(doc, ConstraintLine::Line(0)).unwrap();
+    fn line_top_edge_angle(doc: &Document, sketch: SketchId) -> f32 {
+        let (ldu, ldv) = line_direction_uv(doc, sketch, ConstraintLine::Line(0)).unwrap();
         let (tdu, tdv) = line_direction_uv(
             doc,
+            sketch,
             ConstraintLine::RectEdge {
                 rect: 0,
                 edge: RectEdge::Top,
@@ -2267,7 +2364,8 @@ mod tests {
             edge: RectEdge::Top,
         };
         let angle_line_b = ConstraintLine::Line(0);
-        let rotation_sign = angle_constraint_natural_sign(&doc, angle_line_a, angle_line_b).unwrap();
+        let rotation_sign =
+            angle_constraint_natural_sign(&doc, angle_line_a.clone(), angle_line_b.clone()).unwrap();
         add_angle_constraint_with_sign(
             &mut doc,
             sketch,
@@ -2278,7 +2376,7 @@ mod tests {
         )
         .unwrap();
 
-        let angle_before = line_top_edge_angle(&doc);
+        let angle_before = line_top_edge_angle(&doc, sketch);
         // Drag the free end far off the 45° ray.
         drag_point(
             &mut doc,
@@ -2291,7 +2389,7 @@ mod tests {
             45.0,
         )
         .unwrap();
-        let angle_after = line_top_edge_angle(&doc);
+        let angle_after = line_top_edge_angle(&doc, sketch);
         assert!(
             (angle_after - angle_before).abs() < 2.0_f32.to_radians(),
             "angle drifted from {} to {} deg",
@@ -2322,7 +2420,7 @@ mod tests {
             edge: RectEdge::Bottom,
         };
         let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Point(point), false);
+        click_scene_selection(&mut sel, SceneElement::Point(point.clone()), false);
         click_scene_selection(&mut sel, SceneElement::RectEdge(0, RectEdge::Bottom), true);
         add_geometric_constraint_from_selection(
             &mut doc,
@@ -2333,10 +2431,10 @@ mod tests {
         .unwrap();
 
         // Try to pull the vertex up and away from the edge.
-        drag_point(&mut doc, sketch, point, 35.0, 25.0).unwrap();
+        drag_point(&mut doc, sketch, point.clone(), 35.0, 25.0).unwrap();
 
-        let (pu, pv) = point_uv(&doc, point).unwrap();
-        let ((x0, y0), (x1, y1)) = line_uv_endpoints(&doc, bottom).unwrap();
+        let (pu, pv) = point_uv(&doc, sketch, point).unwrap();
+        let ((x0, y0), (x1, y1)) = line_uv_endpoints(&doc, sketch, bottom).unwrap();
         let mid = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
         assert!(
             (pu - mid.0).abs() < EPS && (pv - mid.1).abs() < EPS,
@@ -2365,8 +2463,8 @@ mod tests {
             end: LineEnd::Start,
         };
         let mut sel = SceneSelection::default();
-        click_scene_selection(&mut sel, SceneElement::Point(p0), false);
-        click_scene_selection(&mut sel, SceneElement::Point(p1), true);
+        click_scene_selection(&mut sel, SceneElement::Point(p0.clone()), false);
+        click_scene_selection(&mut sel, SceneElement::Point(p1.clone()), true);
         let id = add_geometric_constraint_from_selection(
             &mut doc,
             sketch,
@@ -2378,9 +2476,9 @@ mod tests {
         // Delete the coincident constraint.
         crate::document_lifecycle::tombstone_element(&mut doc, SceneElement::Constraint(id));
 
-        let partner_before = point_uv(&doc, p1).unwrap();
+        let partner_before = point_uv(&doc, sketch, p1.clone()).unwrap();
         drag_point(&mut doc, sketch, p0, 5.0, 5.0).unwrap();
-        let partner_after = point_uv(&doc, p1).unwrap();
+        let partner_after = point_uv(&doc, sketch, p1).unwrap();
 
         assert!(
             (partner_after.0 - partner_before.0).abs() < EPS
@@ -2407,8 +2505,52 @@ mod tests {
         .unwrap();
 
         // Bottom-left (the diagonal anchor) stays at the origin; rect collapses but never flips.
-        let (blu, blv) = point_uv(&doc, ConstraintPoint::RectCorner { rect: 0, corner: 0 }).unwrap();
+        let (blu, blv) = point_uv(&doc, sketch, ConstraintPoint::RectCorner { rect: 0, corner: 0 }).unwrap();
         assert!((blu).abs() < EPS && (blv).abs() < EPS, "anchor moved to ({blu},{blv})");
         assert!(doc.rects[0].w > 0.0 && doc.rects[0].h > 0.0, "extents must stay positive");
+    }
+
+    fn push_coincident(doc: &mut Document, sketch: SketchId, a: ConstraintPoint, b: ConstraintPoint) {
+        doc.constraints.push(crate::model::Constraint {
+            sketch,
+            kind: ConstraintKind::Coincident {
+                a: ConstraintEntity::Point(a),
+                b: ConstraintEntity::Point(b),
+            },
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+    }
+
+    #[test]
+    fn treatment_corner_resolves_shared_vertex_and_far_endpoints() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        doc.lines.push(Line::from_local_endpoints(sketch, 10.0, 0.0, 10.0, 10.0));
+        push_coincident(
+            &mut doc,
+            sketch,
+            ConstraintPoint::LineEndpoint { line: 0, end: LineEnd::End },
+            ConstraintPoint::LineEndpoint { line: 1, end: LineEnd::Start },
+        );
+        let point = ConstraintPoint::LineEndpoint { line: 0, end: LineEnd::End };
+        let corner = treatment_corner(&doc, sketch, point).unwrap();
+        assert_eq!(corner.line1, 0);
+        assert_eq!(corner.end1, LineEnd::End);
+        assert_eq!(corner.line2, 1);
+        assert_eq!(corner.end2, LineEnd::Start);
+        assert_eq!(corner.v, (10.0, 0.0));
+        assert_eq!(corner.a, (0.0, 0.0));
+        assert_eq!(corner.b, (10.0, 10.0));
+    }
+
+    #[test]
+    fn treatment_corner_none_when_vertex_has_only_one_line() {
+        let (mut doc, sketch) = sketch_doc();
+        doc.lines.push(Line::from_local_endpoints(sketch, 0.0, 0.0, 10.0, 0.0));
+        let point = ConstraintPoint::LineEndpoint { line: 0, end: LineEnd::Start };
+        assert!(treatment_corner(&doc, sketch, point).is_none());
     }
 }

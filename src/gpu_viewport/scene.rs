@@ -68,8 +68,14 @@ pub const SHAPE_FILL_DEPTH_BIAS_BASE: f32 = 0.04;
 pub const SHAPE_FILL_DEPTH_BIAS_STEP: f32 = 0.008;
 /// In-progress previews render above committed geometry.
 pub const PREVIEW_FILL_DEPTH_BIAS: f32 = 0.2;
-/// Ground grid lines sit on the reference plane so element strokes win overlaps.
-pub const GRID_DEPTH_BIAS: f32 = 0.0;
+/// Ground grid lines are nudged slightly *away* from the camera (rather than sitting exactly
+/// on the reference plane) so any real, coincident geometry — most commonly an extruded body's
+/// unbiased base cap, which sits at exactly the same z=0 plane as a ground-plane sketch — always
+/// wins the depth test and cleanly occludes the grid, instead of z-fighting with it. Z-fighting
+/// between two coplanar unbiased surfaces gets visibly worse at low grazing angles and far zoom
+/// (reduced depth-buffer precision), which is why it showed up as the ground grid appearing to
+/// slice through the middle of a body when orbiting below the ground and zooming out (#78).
+pub const GRID_DEPTH_BIAS: f32 = -0.05;
 /// Lift strokes toward the camera so lines draw over coplanar face fills and grid.
 pub const STROKE_DEPTH_BIAS: f32 = 0.10;
 /// Lift construction-plane hover fills above the plane surface (avoids z-fighting).
@@ -172,6 +178,11 @@ impl Default for ViewportPalette {
 pub enum ViewportHoverHighlight {
     SketchFace(FaceId),
     PickTarget(PickTargetKind),
+    /// A computed boolean-combined region (#16/#62): rendered as a filled/outlined polygon
+    /// directly from its resolved world-space loop, since (unlike `SketchFace`) it has no
+    /// `FaceId` of its own — it's not a stored shape, just `ExtrudeFace::Boolean`'s on-demand
+    /// geometry.
+    BooleanRegion { world_loop: Vec<Vec3> },
 }
 
 /// Prospective construction plane while creating or editing.
@@ -191,6 +202,13 @@ pub struct ViewportExtrudeGizmo {
     pub offset: f32,
     pub color: Color32,
     pub hovered: bool,
+}
+
+/// World-space polyline for the live chamfer/fillet corner preview (#76). See
+/// [`ViewportSceneInput::vertex_treatment_preview`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct VertexTreatmentPreviewGeom {
+    pub points: Vec<Vec3>,
 }
 
 /// Construction-plane offset/angle gizmo while creating or editing a plane.
@@ -229,6 +247,11 @@ pub struct ViewportSceneInput<'a> {
     /// Push/pull gizmo for the in-progress chamfer/fillet tool; reuses the same offset-gizmo
     /// mesh as [`ViewportSceneInput::extrude_gizmo`] (#37/#38).
     pub vertex_treatment_gizmo: Option<ViewportExtrudeGizmo>,
+    /// Live preview of the treated corner while the chamfer/fillet gizmo is being placed or
+    /// dragged (#76): world-space polyline from the first line's far endpoint, through the
+    /// truncated point, the bridge, the other truncated point, to the second line's far
+    /// endpoint. Recomputed every frame from the live gizmo amount.
+    pub vertex_treatment_preview: Option<VertexTreatmentPreviewGeom>,
     pub hover_highlight: Option<ViewportHoverHighlight>,
     pub hover_color: Color32,
     pub document_health: &'a DocumentHealth,
@@ -274,7 +297,7 @@ impl ViewportScene {
                 input.cam,
                 health_tint_color(
                     sketch_color(input.palette.rect_line, dim),
-                    input.document_health.element_status(element),
+                    input.document_health.element_status(element.clone()),
                 ),
                 health_tint_color(
                     sketch_color(input.palette.construction, dim),
@@ -305,7 +328,7 @@ impl ViewportScene {
                 input.cam,
                 health_tint_color(
                     sketch_color(input.palette.rect_line, dim),
-                    input.document_health.element_status(element),
+                    input.document_health.element_status(element.clone()),
                 ),
                 health_tint_color(
                     sketch_color(input.palette.construction, dim),
@@ -348,7 +371,7 @@ impl ViewportScene {
                     input.cam,
                     health_tint_color(
                         sketch_color(input.palette.rect_line, dim),
-                        input.document_health.element_status(element),
+                        input.document_health.element_status(element.clone()),
                     ),
                     health_tint_color(
                         sketch_color(input.palette.construction, dim),
@@ -414,6 +437,9 @@ impl ViewportScene {
                         input.viewport,
                         &vp,
                     );
+                }
+                crate::camera::ShadingMode::Realistic => {
+                    mesh.push_solid_realistic(&solid, SOLID_FILL, input.cam, cap_plane);
                 }
             }
         }
@@ -532,7 +558,7 @@ impl ViewportScene {
                 &vp,
                 health_tint_color(
                     sketch_color(input.palette.rect_line, dim),
-                    input.document_health.element_status(element),
+                    input.document_health.element_status(element.clone()),
                 ),
                 health_tint_color(
                     sketch_color(input.palette.construction, dim),
@@ -561,7 +587,7 @@ impl ViewportScene {
                 &vp,
                 health_tint_color(
                     sketch_color(input.palette.rect_line, dim),
-                    input.document_health.element_status(element),
+                    input.document_health.element_status(element.clone()),
                 ),
                 health_tint_color(
                     sketch_color(input.palette.construction, dim),
@@ -663,6 +689,18 @@ impl ViewportScene {
                 preview,
                 input.palette.preview,
                 input.palette.dim_edge_highlight,
+                input.cam,
+                input.viewport,
+                &vp,
+            );
+        }
+        // Live chamfer/fillet corner preview (#76): a single polyline through the treated
+        // corner, recomputed every frame from the live gizmo amount.
+        if let Some(preview) = input.vertex_treatment_preview.as_ref() {
+            mesh.push_polyline_segment(
+                &preview.points,
+                input.palette.preview,
+                2.0,
                 input.cam,
                 input.viewport,
                 &vp,
@@ -842,6 +880,39 @@ impl<'a> SceneMesh<'a> {
                 _ => *tri,
             };
             self.push_triangle(verts[0], verts[1], verts[2], scale_color(base, shade));
+        }
+    }
+
+    /// Push a solid mesh with flat (per-triangle) ambient + diffuse + specular shading — a
+    /// matte/satin "painted object" look, for `ShadingMode::Realistic` (#83). Unlike `push_solid`
+    /// (a single Lambert-ish term), this adds a camera-dependent Blinn-Phong specular highlight
+    /// via [`realistic_shade`]. Still flat-shaded per triangle (no shared vertex normals exist
+    /// on `SolidMesh`), so it reads as faceted rather than smoothly lit — a known, accepted
+    /// limitation given this app's flat-shaded mesh architecture. No materials/textures yet:
+    /// every body uses the same fixed gloss.
+    fn push_solid_realistic(
+        &mut self,
+        solid: &crate::extrude::SolidMesh,
+        base: Color32,
+        cam: &Camera,
+        cap_plane: Option<(Vec3, Vec3)>,
+    ) {
+        let light = Vec3::new(0.35, 0.45, 0.82).normalize_or_zero();
+        let eye = cam.eye();
+        for tri in &solid.triangles {
+            let normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
+            let centroid = (tri[0] + tri[1] + tri[2]) / 3.0;
+            let view = (eye - centroid).normalize_or_zero();
+            let color = realistic_shade(base, normal, light, view);
+            let verts = match cap_plane {
+                Some((origin, plane_normal)) if triangle_on_plane(tri, origin, plane_normal) => [
+                    offset_toward_camera(tri[0], plane_normal, eye, SOLID_CAP_DEPTH_BIAS),
+                    offset_toward_camera(tri[1], plane_normal, eye, SOLID_CAP_DEPTH_BIAS),
+                    offset_toward_camera(tri[2], plane_normal, eye, SOLID_CAP_DEPTH_BIAS),
+                ],
+                _ => *tri,
+            };
+            self.push_triangle(verts[0], verts[1], verts[2], color);
         }
     }
 
@@ -1401,8 +1472,8 @@ impl<'a> SceneMesh<'a> {
             return;
         }
         for element in selection.iter() {
-            let color = health_tint_color(base_color, health.element_status(element));
-            let dashed = selection_highlight_dashed(doc, element) == Some(true);
+            let color = health_tint_color(base_color, health.element_status(element.clone()));
+            let dashed = selection_highlight_dashed(doc, element.clone()) == Some(true);
             match element {
                 SceneElement::Line(index) => {
                     if !line_alive(doc, index) {
@@ -1729,6 +1800,37 @@ impl<'a> SceneMesh<'a> {
                     &project,
                 );
             }
+            ViewportHoverHighlight::BooleanRegion { world_loop } => {
+                if world_loop.len() >= 3 {
+                    let eye = cam.eye();
+                    let normal = (world_loop[1] - world_loop[0])
+                        .cross(world_loop[2] - world_loop[0])
+                        .normalize_or_zero();
+                    let fill = color.gamma_multiply(FACE_HOVER_FILL_MULTIPLIER);
+                    let lift = |p: Vec3| offset_toward_camera(p, normal, eye, HOVER_FILL_DEPTH_BIAS);
+                    for i in 1..world_loop.len() - 1 {
+                        self.push_triangle(
+                            lift(world_loop[0]),
+                            lift(world_loop[i]),
+                            lift(world_loop[i + 1]),
+                            fill,
+                        );
+                    }
+                    let n = world_loop.len();
+                    for i in 0..n {
+                        let j = (i + 1) % n;
+                        self.push_line_segment(
+                            world_loop[i],
+                            world_loop[j],
+                            color,
+                            2.0,
+                            cam,
+                            viewport,
+                            view_proj,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1838,7 +1940,7 @@ impl<'a> SceneMesh<'a> {
     ) {
         match kind {
             PickTargetKind::Point(point) => {
-                if let Some(world) = crate::construction::point_world_position(doc, *point) {
+                if let Some(world) = crate::construction::point_world_position(doc, point.clone()) {
                     push_screen_disc(
                         self,
                         world,
@@ -1863,7 +1965,9 @@ impl<'a> SceneMesh<'a> {
                     self.push_segment_hover_ring(doc, circle, color, cam, viewport, view_proj);
                 }
             }
-            PickTargetKind::ShapeEdge { a, b, .. } | PickTargetKind::PlaneEdge { a, b } => {
+            PickTargetKind::ShapeEdge { a, b, .. }
+            | PickTargetKind::PlaneEdge { a, b }
+            | PickTargetKind::BodyEdge { a, b, .. } => {
                 self.push_segment_hover(*a, *b, color, cam, viewport, view_proj, project);
             }
             PickTargetKind::GlobalAxis(axis) => {
@@ -2069,26 +2173,63 @@ fn quantize_vertex(v: Vec3) -> (i64, i64, i64) {
     )
 }
 
-/// Extract every unique edge of a triangle-soup solid mesh, deduplicating the edge shared
-/// by two adjacent triangles (#33). Performance: this walks all triangles once per frame,
-/// which is fine at this app's scale (small CAD models, not high-poly meshes) — not worth
-/// caching for a first cut.
-fn solid_mesh_unique_edges(solid: &crate::extrude::SolidMesh) -> Vec<(Vec3, Vec3)> {
-    let mut seen = std::collections::HashSet::new();
-    let mut edges = Vec::new();
+/// Cosine of the smallest angle between two triangles' face normals that counts as a real
+/// feature edge (crease) between them, rather than an internal triangulation seam within a
+/// flat face (e.g. the diagonal splitting a square face into two triangles) — see
+/// [`solid_mesh_unique_edges`] (#82). ~1 degree of tolerance for floating-point noise.
+const WIREFRAME_CREASE_COS_THRESHOLD: f32 = 0.9998;
+
+/// Extract the *feature* edges of a triangle-soup solid mesh (#33/#82): an edge is kept only
+/// if it's a mesh boundary (used by just one triangle) or a real crease — shared by two or
+/// more triangles whose face normals meaningfully differ. An edge shared only by coplanar
+/// triangles (the internal diagonals ear-clipping/faceting adds to make a flat face, or the
+/// facets approximating a circle/curve) is dropped, so wireframe view shows the shape's real
+/// flat faces rather than its internal triangulation. Performance: this walks all triangles
+/// once per frame, which is fine at this app's scale (small CAD models, not high-poly meshes)
+/// — not worth caching for a first cut.
+pub fn solid_mesh_unique_edges(solid: &crate::extrude::SolidMesh) -> Vec<(Vec3, Vec3)> {
+    type EdgeKey = ((i64, i64, i64), (i64, i64, i64));
+    let mut by_edge: std::collections::HashMap<EdgeKey, (Vec3, Vec3, Vec<Vec3>)> =
+        std::collections::HashMap::new();
     for tri in &solid.triangles {
+        let normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
         for &(i, j) in &[(0usize, 1usize), (1, 2), (2, 0)] {
             let a = tri[i];
             let b = tri[j];
             let ka = quantize_vertex(a);
             let kb = quantize_vertex(b);
             let key = if ka <= kb { (ka, kb) } else { (kb, ka) };
-            if seen.insert(key) {
-                edges.push((a, b));
+            by_edge
+                .entry(key)
+                .or_insert_with(|| (a, b, Vec::new()))
+                .2
+                .push(normal);
+        }
+    }
+    by_edge
+        .into_values()
+        .filter(|(_, _, normals)| is_feature_edge(normals))
+        .map(|(a, b, _)| (a, b))
+        .collect()
+}
+
+/// An edge is a real feature edge if it's a mesh boundary (one adjacent triangle) or any pair
+/// of its adjacent triangles' normals diverge beyond [`WIREFRAME_CREASE_COS_THRESHOLD`].
+/// Compares normals by absolute dot product: this mesh's triangles are shaded two-sided (see
+/// `push_solid`'s `.abs()`), so two triangles can be genuinely coplanar yet wound in opposite
+/// directions (anti-parallel normals) — that must still count as flat, not a crease.
+fn is_feature_edge(normals: &[Vec3]) -> bool {
+    if normals.len() <= 1 {
+        return true;
+    }
+    for i in 0..normals.len() {
+        for j in (i + 1)..normals.len() {
+            if normals[i].dot(normals[j]).abs() < WIREFRAME_CREASE_COS_THRESHOLD {
+                return true;
             }
         }
     }
-    edges
+    false
 }
 
 pub fn offset_toward_camera(pos: Vec3, normal: Vec3, eye: Vec3, bias: f32) -> Vec3 {
@@ -2629,6 +2770,38 @@ fn scale_color(color: Color32, factor: f32) -> Color32 {
     )
 }
 
+/// Blend `color` toward white by `amount` (0 = unchanged, 1 = white) — used to add a specular
+/// highlight on top of the already-lit base color in [`realistic_shade`].
+fn lighten_color(color: Color32, amount: f32) -> Color32 {
+    let t = amount.clamp(0.0, 1.0);
+    Color32::from_rgba_unmultiplied(
+        (color.r() as f32 + (255.0 - color.r() as f32) * t) as u8,
+        (color.g() as f32 + (255.0 - color.g() as f32) * t) as u8,
+        (color.b() as f32 + (255.0 - color.b() as f32) * t) as u8,
+        color.a(),
+    )
+}
+
+/// Ambient/diffuse/specular weights for `ShadingMode::Realistic` (#83) — a fixed matte/satin
+/// "painted object" look; no per-material tuning yet.
+const REALISTIC_AMBIENT: f32 = 0.30;
+const REALISTIC_DIFFUSE: f32 = 0.55;
+const REALISTIC_SPECULAR: f32 = 0.35;
+const REALISTIC_SHININESS: f32 = 24.0;
+
+/// Blinn-Phong-ish flat shading for one triangle face, two-sided (the normal is flipped to
+/// face the camera first, matching `push_solid`'s two-sided convention): ambient + diffuse +
+/// a camera-dependent specular highlight, instead of `push_solid`'s single Lambert-ish term.
+fn realistic_shade(base: Color32, normal: Vec3, light: Vec3, view: Vec3) -> Color32 {
+    let n = if normal.dot(view) < 0.0 { -normal } else { normal };
+    let diffuse = n.dot(light).max(0.0);
+    let half = (light + view).normalize_or_zero();
+    let specular = n.dot(half).max(0.0).powf(REALISTIC_SHININESS);
+    let intensity = REALISTIC_AMBIENT + REALISTIC_DIFFUSE * diffuse;
+    let shaded = scale_color(base, intensity.min(1.0));
+    lighten_color(shaded, REALISTIC_SPECULAR * specular)
+}
+
 pub fn sketch_ground_color(color: Color32, in_sketch: bool) -> Color32 {
     if in_sketch {
         color.gamma_multiply(SKETCH_GROUND_DIMMED)
@@ -2876,6 +3049,7 @@ mod tests {
                 plane_gizmo: None,
                 extrude_gizmo: None,
                 vertex_treatment_gizmo: None,
+                vertex_treatment_preview: None,
                 hover_highlight: None,
                 hover_color: Color32::WHITE,
                 document_health: &DocumentHealth::default(),
@@ -2952,6 +3126,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3012,6 +3187,63 @@ mod tests {
     }
 
     #[test]
+    fn realistic_shading_fills_body_with_no_wireframe_overlay() {
+        use crate::camera::ShadingMode;
+
+        let state = state_with_one_body();
+        let solid = build_scene_with_shading(&state, ShadingMode::Solid);
+        let realistic = build_scene_with_shading(&state, ShadingMode::Realistic);
+        assert_eq!(
+            realistic.indices.len(),
+            solid.indices.len(),
+            "realistic mode should fill the same triangles as solid mode, just shaded differently"
+        );
+        assert!(
+            realistic.wireframe_indices.is_empty(),
+            "realistic mode should not populate the wireframe overlay layer"
+        );
+    }
+
+    #[test]
+    fn realistic_shade_lights_a_face_toward_the_light_brighter_than_one_facing_away() {
+        let base = Color32::from_rgb(200, 200, 200);
+        let light = Vec3::new(0.0, 0.0, 1.0);
+        let view = Vec3::new(0.0, 0.0, 1.0);
+        let lit = realistic_shade(base, Vec3::Z, light, view);
+        let unlit = realistic_shade(base, Vec3::new(1.0, 0.0, 0.0), light, view);
+        assert!(
+            lit.r() > unlit.r(),
+            "a face pointing at the light should be brighter than one perpendicular to it"
+        );
+    }
+
+    #[test]
+    fn realistic_shade_adds_a_specular_highlight_near_the_reflection_direction() {
+        let base = Color32::from_rgb(150, 150, 150);
+        let light = Vec3::new(0.0, 0.0, 1.0);
+        let view = Vec3::new(0.0, 0.0, 1.0);
+        // The half-vector of light and view is straight up, so a face whose normal matches it
+        // sits right at the specular peak and should be lighter than a face merely lit
+        // face-on to the light but shaded with no floor-on specular contribution possible
+        // (e.g. tilted away from the half-vector).
+        let at_peak = realistic_shade(base, Vec3::Z, light, view);
+        let off_peak = realistic_shade(base, Vec3::new(0.6, 0.0, 0.8).normalize(), light, view);
+        assert!(
+            at_peak.r() >= off_peak.r(),
+            "the specular peak should be at least as bright as an off-peak angle"
+        );
+    }
+
+    #[test]
+    fn realistic_shade_never_darkens_below_ambient() {
+        let base = Color32::from_rgb(180, 90, 40);
+        // Facing directly away from both light and camera: diffuse and specular are both zero.
+        let shaded = realistic_shade(base, Vec3::new(0.0, 1.0, 0.0), Vec3::Z, Vec3::Z);
+        let ambient_only = scale_color(base, REALISTIC_AMBIENT);
+        assert_eq!(shaded, ambient_only);
+    }
+
+    #[test]
     fn transparent_solid_shading_moves_body_into_the_translucent_layer() {
         use crate::camera::ShadingMode;
 
@@ -3031,9 +3263,10 @@ mod tests {
     }
 
     #[test]
-    fn solid_mesh_unique_edges_dedupes_the_shared_diagonal() {
-        // Two triangles forming a unit-square quad, split along one diagonal: 3 + 3 edges
-        // with the diagonal counted once should leave 5 unique edges, not 6.
+    fn solid_mesh_unique_edges_drops_the_coplanar_diagonal() {
+        // Two coplanar triangles forming a unit-square quad, split along one diagonal (#82):
+        // the shared diagonal is an internal triangulation seam, not a real edge of the flat
+        // face, so it should be dropped — leaving just the 4 perimeter edges, not 5.
         let solid = crate::extrude::SolidMesh {
             triangles: vec![
                 [
@@ -3049,13 +3282,14 @@ mod tests {
             ],
         };
         let edges = solid_mesh_unique_edges(&solid);
-        assert_eq!(edges.len(), 5, "expected 5 unique edges, got {edges:?}");
+        assert_eq!(edges.len(), 4, "expected 4 perimeter edges, got {edges:?}");
     }
 
     #[test]
     fn solid_mesh_unique_edges_ignores_triangle_winding() {
-        // The same shared edge traversed in opposite directions by its two triangles
-        // (the normal case for a closed mesh) must still dedupe to one edge.
+        // The same shared (coplanar) edge traversed in opposite directions by its two
+        // triangles must still be recognized as one edge and dropped, regardless of winding —
+        // otherwise it would double-count as two never-matching edges instead of vanishing.
         let solid = crate::extrude::SolidMesh {
             triangles: vec![
                 [
@@ -3071,7 +3305,33 @@ mod tests {
             ],
         };
         let edges = solid_mesh_unique_edges(&solid);
-        assert_eq!(edges.len(), 5, "expected 5 unique edges, got {edges:?}");
+        assert_eq!(edges.len(), 4, "expected 4 edges, got {edges:?}");
+    }
+
+    #[test]
+    fn solid_mesh_unique_edges_keeps_a_real_crease() {
+        // Two non-coplanar triangles sharing an edge (like two faces meeting at a cube
+        // corner) — that shared edge is a real feature edge and must be kept.
+        let solid = crate::extrude::SolidMesh {
+            triangles: vec![
+                [
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(1.0, 0.0, 0.0),
+                    Vec3::new(1.0, 0.0, 1.0),
+                ],
+                [
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(1.0, 0.0, 1.0),
+                    Vec3::new(0.0, 1.0, 1.0),
+                ],
+            ],
+        };
+        let edges = solid_mesh_unique_edges(&solid);
+        let shared = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 1.0));
+        assert!(
+            edges.contains(&shared) || edges.contains(&(shared.1, shared.0)),
+            "the shared crease edge should be kept, got {edges:?}"
+        );
     }
 
     #[test]
@@ -3099,6 +3359,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3130,6 +3391,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3167,6 +3429,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: crate::construction::PICK_HOVER_RGBA,
             document_health: &DocumentHealth::default(),
@@ -3193,6 +3456,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: Some(ViewportHoverHighlight::SketchFace(
                 FaceId::ConstructionPlane(0),
             )),
@@ -3236,6 +3500,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3274,6 +3539,7 @@ mod tests {
             plane_gizmo: Some(gizmo),
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3311,6 +3577,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3355,6 +3622,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3402,6 +3670,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3710,6 +3979,7 @@ mod tests {
             expression: String::new(),
             name: None,
             deleted: false,
+            edge_treatments: Vec::new(),
         };
 
         let cam = state.cam.clone();
@@ -3733,6 +4003,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3802,6 +4073,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -3849,6 +4121,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -4053,6 +4326,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -4079,6 +4353,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -4173,6 +4448,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -4199,6 +4475,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -4221,6 +4498,23 @@ mod tests {
             (eye - stroke_a).length() < (eye - grid).length(),
             "element strokes should render above coplanar grid lines"
         );
+    }
+
+    #[test]
+    fn ground_grid_sits_behind_coincident_unbiased_geometry_from_above_and_below() {
+        // #78: an extruded body's base cap sits exactly at z=0, unbiased, same as the ground
+        // sketch plane it was drawn on. The grid must lose that depth tie regardless of which
+        // side of the plane the camera is on, or it z-fights with (and can appear to slice
+        // through) the body when viewed from below.
+        let on_plane = Vec3::new(5.0, 5.0, 0.0);
+        for eye in [Vec3::new(0.0, -20.0, 20.0), Vec3::new(0.0, -20.0, -20.0)] {
+            let grid = offset_toward_camera(on_plane, Vec3::Z, eye, GRID_DEPTH_BIAS);
+            let unbiased_body_cap = on_plane;
+            assert!(
+                (eye - grid).length() > (eye - unbiased_body_cap).length(),
+                "grid should sit behind coincident unbiased geometry when viewed from {eye:?}"
+            );
+        }
     }
 
     #[test]
@@ -4289,6 +4583,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: Some(ViewportHoverHighlight::SketchFace(FaceId::Rect(0))),
             hover_color: crate::construction::PICK_HOVER_RGBA,
             document_health: &DocumentHealth::default(),
@@ -4401,6 +4696,7 @@ mod tests {
 
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -4431,6 +4727,7 @@ mod tests {
 
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -4527,6 +4824,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -4555,6 +4853,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),
@@ -4581,6 +4880,7 @@ mod tests {
             plane_gizmo: None,
             extrude_gizmo: None,
             vertex_treatment_gizmo: None,
+            vertex_treatment_preview: None,
             hover_highlight: None,
             hover_color: Color32::WHITE,
             document_health: &DocumentHealth::default(),

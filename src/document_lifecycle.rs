@@ -48,10 +48,11 @@ pub fn element_alive(doc: &Document, element: SceneElement) -> bool {
         SceneElement::Line(index) => line_alive(doc, index),
         SceneElement::Circle(index) => circle_alive(doc, index),
         SceneElement::RectEdge(index, _) => rect_alive(doc, index),
-        SceneElement::Point(point) => point_owner_alive(doc, point),
+        SceneElement::Point(point) => point_owner_alive(doc, &point),
         SceneElement::Constraint(index) => constraint_alive(doc, index),
         SceneElement::Extrusion(index) => extrusion_alive(doc, index),
         SceneElement::Body(index) => body_alive(doc, index),
+        SceneElement::FaceEdge(line) => constraint_line_alive(doc, &line),
     }
 }
 
@@ -65,13 +66,18 @@ pub fn body_alive(doc: &Document, index: usize) -> bool {
 
 fn point_owner_alive(
     doc: &Document,
-    point: crate::model::ConstraintPoint,
+    point: &crate::model::ConstraintPoint,
 ) -> bool {
     use crate::model::ConstraintPoint;
     match point {
-        ConstraintPoint::LineEndpoint { line, .. } => line_alive(doc, line),
-        ConstraintPoint::RectCorner { rect, .. } => rect_alive(doc, rect),
-        ConstraintPoint::CircleCenter(circle) => circle_alive(doc, circle),
+        ConstraintPoint::LineEndpoint { line, .. } => line_alive(doc, *line),
+        ConstraintPoint::RectCorner { rect, .. } => rect_alive(doc, *rect),
+        ConstraintPoint::CircleCenter(circle) => circle_alive(doc, *circle),
+        // A face's own vertex is "alive" exactly when it still resolves (extrusion present,
+        // index still within its current boundary loop) — it has no owning scene entity.
+        ConstraintPoint::FaceVertex { face, index } => {
+            crate::extrude::face_boundary_loop_world(doc, face).is_some_and(|l| *index < l.len())
+        }
     }
 }
 
@@ -79,18 +85,24 @@ fn point_owner_alive(
 pub fn delete_target_for_element(element: SceneElement) -> SceneElement {
     match element {
         SceneElement::RectEdge(index, _) => SceneElement::Rect(index),
-        SceneElement::Point(point) => point_owner_element(point),
+        SceneElement::Point(point) => match point_owner_element(&point) {
+            Some(owner) => owner,
+            // A face's own vertex has no owning scene entity to delete instead — deleting it
+            // is a no-op (it's fixed by the body, mirrors `ConstraintEntity::Origin`).
+            None => SceneElement::Point(point),
+        },
         other => other,
     }
 }
 
-fn point_owner_element(point: crate::model::ConstraintPoint) -> SceneElement {
+fn point_owner_element(point: &crate::model::ConstraintPoint) -> Option<SceneElement> {
     use crate::model::ConstraintPoint;
-    match point {
-        ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(line),
-        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(rect),
-        ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(circle),
-    }
+    Some(match point {
+        ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(*line),
+        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(*rect),
+        ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(*circle),
+        ConstraintPoint::FaceVertex { .. } => return None,
+    })
 }
 
 /// Unique tombstone targets from the current selection (deduped).
@@ -99,7 +111,7 @@ pub fn delete_targets_from_selection(selection: &SceneSelection) -> Vec<SceneEle
     let mut targets = Vec::new();
     for element in selection.iter() {
         let target = delete_target_for_element(element);
-        if seen.insert(target) {
+        if seen.insert(target.clone()) {
             targets.push(target);
         }
     }
@@ -146,7 +158,9 @@ pub fn tombstone_element(doc: &mut Document, element: SceneElement) -> bool {
             }
         }
         SceneElement::Point(point) => {
-            changed |= tombstone_element(doc, point_owner_element(point));
+            if let Some(owner) = point_owner_element(&point) {
+                changed |= tombstone_element(doc, owner);
+            }
         }
         SceneElement::Extrusion(index) => {
             if tombstone_extrusion(doc, index) {
@@ -158,6 +172,8 @@ pub fn tombstone_element(doc: &mut Document, element: SceneElement) -> bool {
                 changed = true;
             }
         }
+        // Fixed by the body's own geometry — deleting it is a no-op, same as `FaceVertex`.
+        SceneElement::FaceEdge(_) => {}
     }
     changed
 }
@@ -206,8 +222,8 @@ fn tombstone_body(doc: &mut Document, index: usize) -> bool {
 /// Tombstone every target in `elements`.
 pub fn tombstone_elements(doc: &mut Document, elements: &[SceneElement]) -> usize {
     let mut count = 0usize;
-    for &element in elements {
-        if tombstone_element(doc, element) {
+    for element in elements {
+        if tombstone_element(doc, element.clone()) {
             count += 1;
         }
     }
@@ -365,13 +381,13 @@ pub fn tombstone_parameter(doc: &mut Document, index: usize) -> bool {
     true
 }
 
-pub fn distance_target_alive(doc: &Document, target: DistanceTarget) -> bool {
+pub fn distance_target_alive(doc: &Document, target: &DistanceTarget) -> bool {
     match target {
-        DistanceTarget::LineLength(index) => line_alive(doc, index),
+        DistanceTarget::LineLength(index) => line_alive(doc, *index),
         DistanceTarget::RectWidth(index) | DistanceTarget::RectHeight(index) => {
-            rect_alive(doc, index)
+            rect_alive(doc, *index)
         }
-        DistanceTarget::CircleDiameter(index) => circle_alive(doc, index),
+        DistanceTarget::CircleDiameter(index) => circle_alive(doc, *index),
         DistanceTarget::LineLineDistance {
             line_a,
             line_b,
@@ -386,32 +402,38 @@ pub fn distance_target_alive(doc: &Document, target: DistanceTarget) -> bool {
     }
 }
 
-pub fn constraint_line_alive(doc: &Document, line: ConstraintLine) -> bool {
+pub fn constraint_line_alive(doc: &Document, line: &ConstraintLine) -> bool {
     match line {
-        ConstraintLine::Line(index) => line_alive(doc, index),
-        ConstraintLine::RectEdge { rect, .. } => rect_alive(doc, rect),
+        ConstraintLine::Line(index) => line_alive(doc, *index),
+        ConstraintLine::RectEdge { rect, .. } => rect_alive(doc, *rect),
+        ConstraintLine::FaceEdge { face, index } => {
+            crate::extrude::face_boundary_loop_world(doc, face).is_some_and(|l| *index < l.len())
+        }
     }
 }
 
-pub fn constraint_entity_alive(doc: &Document, entity: ConstraintEntity) -> bool {
+pub fn constraint_entity_alive(doc: &Document, entity: &ConstraintEntity) -> bool {
     match entity {
         ConstraintEntity::Point(point) => constraint_point_alive(doc, point),
         ConstraintEntity::Line(line) => constraint_line_alive(doc, line),
-        ConstraintEntity::Circle(circle) => circle_alive(doc, circle),
+        ConstraintEntity::Circle(circle) => circle_alive(doc, *circle),
         ConstraintEntity::Origin => true,
     }
 }
 
-pub fn constraint_point_alive(doc: &Document, point: ConstraintPoint) -> bool {
+pub fn constraint_point_alive(doc: &Document, point: &ConstraintPoint) -> bool {
     match point {
-        ConstraintPoint::LineEndpoint { line, .. } => line_alive(doc, line),
-        ConstraintPoint::RectCorner { rect, .. } => rect_alive(doc, rect),
-        ConstraintPoint::CircleCenter(circle) => circle_alive(doc, circle),
+        ConstraintPoint::LineEndpoint { line, .. } => line_alive(doc, *line),
+        ConstraintPoint::RectCorner { rect, .. } => rect_alive(doc, *rect),
+        ConstraintPoint::CircleCenter(circle) => circle_alive(doc, *circle),
+        ConstraintPoint::FaceVertex { face, index } => {
+            crate::extrude::face_boundary_loop_world(doc, face).is_some_and(|l| *index < l.len())
+        }
     }
 }
 
 /// Whether a constraint can still be applied (all referenced geometry is alive).
-pub fn constraint_kind_applicable(doc: &Document, kind: ConstraintKind) -> bool {
+pub fn constraint_kind_applicable(doc: &Document, kind: &ConstraintKind) -> bool {
     match kind {
         ConstraintKind::Distance { target } => distance_target_alive(doc, target),
         ConstraintKind::Parallel { line_a, line_b }

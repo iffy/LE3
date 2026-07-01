@@ -1,0 +1,1 @@
+Add document-wide and per-sketch default length/angle unit settings, editable from the Context pane (nothing selected = document default; a sketch selected = per-sketch override with a 'follow document' inherit option) and scriptable via bearcad.set_units{}; storage/display only for now, does not yet drive bare-number parsing defaults or dimension-label formatting (#52).

@@ -1,0 +1,1 @@
+Constrain sketch geometry to a body face's own boundary (#26/#27): coincident a sketch point to a face vertex, or a distance/midpoint constraint to a face edge, while sketching directly on an extrusion cap or side wall

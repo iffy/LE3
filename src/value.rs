@@ -269,6 +269,13 @@ pub fn shows_computed_length_in_doc(text: &str, doc: &Document) -> bool {
 }
 
 /// Format a length in millimetres for display above an expression field.
+///
+/// Kept hardcoded to mm intentionally: the Lua scripting numeric API is unit-agnostic-in-mm
+/// by design, and `script.rs`'s tests assert on this literal raw-mm output. UI display call
+/// sites should use [`format_length_display_in`] instead (#85), which is unit-parameterized;
+/// this function is retained only for that scripting contract (hence `#[allow(dead_code)]`
+/// outside `cfg(test)` builds, since production UI code no longer calls it directly).
+#[allow(dead_code)]
 pub fn format_length_display(v: f32) -> String {
     if v.abs() < 0.1 {
         "0 mm".to_string()
@@ -278,11 +285,35 @@ pub fn format_length_display(v: f32) -> String {
 }
 
 /// Format a circle diameter for dimension labels (architectural naught prefix).
+///
+/// See [`format_length_display`]: kept hardcoded to mm for the scripting contract; UI call
+/// sites should use [`format_diameter_display_in`] instead (#85).
+#[allow(dead_code)]
 pub fn format_diameter_display(v: f32) -> String {
     if v.abs() < 0.1 {
         "Ø0 mm".to_string()
     } else {
         format!("Ø{:.1} mm", v)
+    }
+}
+
+/// Format a length (stored internally in mm) for display in `unit` (#85).
+///
+/// The near-zero snap threshold is checked in mm-space so it doesn't vary by unit.
+pub fn format_length_display_in(v_mm: f32, unit: LengthUnit) -> String {
+    if v_mm.abs() < 0.1 {
+        format!("0 {}", unit.label())
+    } else {
+        format!("{:.1} {}", v_mm / unit.to_mm(), unit.label())
+    }
+}
+
+/// Format a circle diameter (stored internally in mm) for display in `unit` (#85).
+pub fn format_diameter_display_in(v_mm: f32, unit: LengthUnit) -> String {
+    if v_mm.abs() < 0.1 {
+        format!("Ø0 {}", unit.label())
+    } else {
+        format!("Ø{:.1} {}", v_mm / unit.to_mm(), unit.label())
     }
 }
 
@@ -358,12 +389,37 @@ fn eval_angle_rad_inner(text: &str, params: &[(&str, &str)], visiting: &mut Vec<
 }
 
 /// Format an angle in radians for dimension labels (degrees by default).
+///
+/// See [`format_length_display`]: kept hardcoded to degrees for the scripting contract; UI
+/// call sites should use [`format_angle_display_in`] instead (#85).
+#[allow(dead_code)]
 pub fn format_angle_display(rad: f32) -> String {
     let deg = rad.to_degrees();
     if deg.abs() < 0.05 {
         "0 deg".to_string()
     } else {
         format!("{deg:.1} deg", deg = deg)
+    }
+}
+
+/// Format an angle (stored internally in radians) for display in `unit` (#85).
+pub fn format_angle_display_in(rad: f32, unit: AngleUnit) -> String {
+    match unit {
+        AngleUnit::Deg => {
+            let deg = rad.to_degrees();
+            if deg.abs() < 0.05 {
+                "0 deg".to_string()
+            } else {
+                format!("{deg:.1} deg")
+            }
+        }
+        AngleUnit::Rad => {
+            if rad.abs() < 0.001 {
+                "0 rad".to_string()
+            } else {
+                format!("{rad:.2} rad")
+            }
+        }
     }
 }
 
@@ -1041,6 +1097,39 @@ mod tests {
     }
 
     #[test]
+    fn format_length_display_in_converts_to_target_unit() {
+        assert_eq!(format_length_display_in(0.0, LengthUnit::In), "0 in");
+        assert_eq!(format_length_display_in(25.4, LengthUnit::In), "1.0 in");
+        assert_eq!(format_length_display_in(304.8, LengthUnit::Ft), "1.0 ft");
+        assert_eq!(format_length_display_in(1000.0, LengthUnit::M), "1.0 m");
+        assert_eq!(format_length_display_in(10.0, LengthUnit::Cm), "1.0 cm");
+        assert_eq!(format_length_display_in(53.3, LengthUnit::Mm), "53.3 mm");
+        // Zero-snap threshold stays in mm-space, not converted-unit space.
+        assert_eq!(format_length_display_in(0.05, LengthUnit::In), "0 in");
+    }
+
+    #[test]
+    fn format_diameter_display_in_converts_to_target_unit() {
+        assert_eq!(format_diameter_display_in(0.0, LengthUnit::In), "Ø0 in");
+        assert_eq!(format_diameter_display_in(25.4, LengthUnit::In), "Ø1.0 in");
+        assert_eq!(format_diameter_display_in(53.3, LengthUnit::Mm), "Ø53.3 mm");
+    }
+
+    #[test]
+    fn format_angle_display_in_supports_deg_and_rad() {
+        assert_eq!(format_angle_display_in(0.0, AngleUnit::Deg), "0 deg");
+        assert_eq!(
+            format_angle_display_in(std::f32::consts::FRAC_PI_2, AngleUnit::Deg),
+            "90.0 deg"
+        );
+        assert_eq!(format_angle_display_in(0.0, AngleUnit::Rad), "0 rad");
+        assert_eq!(
+            format_angle_display_in(std::f32::consts::PI, AngleUnit::Rad),
+            "3.14 rad"
+        );
+    }
+
+    #[test]
     fn expression_string_round_trips_via_eval() {
         let expr = "2in + 5mm / 2";
         let v = eval_length_mm(expr).unwrap();
@@ -1173,5 +1262,33 @@ mod tests {
         }
         assert!(!parameter_name_conflicts_with_unit("width"));
         assert!(is_valid_parameter_name("width"));
+    }
+
+    #[test]
+    fn length_unit_defaults_to_mm_matching_bare_number_fallback() {
+        assert_eq!(LengthUnit::default(), LengthUnit::Mm);
+    }
+
+    #[test]
+    fn angle_unit_defaults_to_deg_matching_bare_number_fallback() {
+        assert_eq!(AngleUnit::default(), AngleUnit::Deg);
+    }
+
+    #[test]
+    fn length_unit_name_round_trips_through_script_name() {
+        for unit in LengthUnit::ALL {
+            assert_eq!(LengthUnit::from_name(unit.script_name()), Some(unit));
+        }
+        assert_eq!(LengthUnit::from_name("MM"), Some(LengthUnit::Mm));
+        assert_eq!(LengthUnit::from_name("furlongs"), None);
+    }
+
+    #[test]
+    fn angle_unit_name_round_trips_through_script_name() {
+        for unit in AngleUnit::ALL {
+            assert_eq!(AngleUnit::from_name(unit.script_name()), Some(unit));
+        }
+        assert_eq!(AngleUnit::from_name("DEG"), Some(AngleUnit::Deg));
+        assert_eq!(AngleUnit::from_name("gradians"), None);
     }
 }
