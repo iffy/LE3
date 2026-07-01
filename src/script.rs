@@ -10,7 +10,7 @@ use crate::command_palette::{best_match, commands_for_state, PaletteOutcome};
 use crate::constraints::add_distance_constraint;
 use crate::hierarchy::SceneElement;
 use crate::model::{
-    ConstraintLine, ConstraintPoint, DistanceTarget, ExtrudeFace, FaceId, RectEdge, SketchId,
+    ConstraintLine, ConstraintPoint, DistanceTarget, ExtrudeFace, FaceId, SketchId,
     VertexTreatmentKind,
 };
 use crate::value::{AngleUnit, LengthUnit};
@@ -584,7 +584,6 @@ pub fn parse_key(name: &str) -> Result<Key, String> {
 struct ElementScriptTokens {
     kind: &'static str,
     index: usize,
-    edge: Option<RectEdge>,
     point: Option<crate::model::ConstraintPoint>,
 }
 
@@ -593,61 +592,41 @@ fn element_script_tokens(element: SceneElement) -> ElementScriptTokens {
         SceneElement::ConstructionPlane(i) => ElementScriptTokens {
             kind: "construction_plane",
             index: i,
-            edge: None,
             point: None,
         },
         SceneElement::Sketch(i) => ElementScriptTokens {
             kind: "sketch",
             index: i,
-            edge: None,
-            point: None,
-        },
-        SceneElement::Rect(i) => ElementScriptTokens {
-            kind: "rect",
-            index: i,
-            edge: None,
             point: None,
         },
         SceneElement::Line(i) => ElementScriptTokens {
             kind: "line",
             index: i,
-            edge: None,
             point: None,
         },
         SceneElement::Circle(i) => ElementScriptTokens {
             kind: "circle",
             index: i,
-            edge: None,
-            point: None,
-        },
-        SceneElement::RectEdge(i, edge) => ElementScriptTokens {
-            kind: "rect",
-            index: i,
-            edge: Some(edge),
             point: None,
         },
         SceneElement::Constraint(i) => ElementScriptTokens {
             kind: "constraint",
             index: i,
-            edge: None,
             point: None,
         },
         SceneElement::Point(point) => ElementScriptTokens {
             kind: "point",
             index: 0,
-            edge: None,
             point: Some(point),
         },
         SceneElement::Extrusion(i) => ElementScriptTokens {
             kind: "extrusion",
             index: i,
-            edge: None,
             point: None,
         },
         SceneElement::Body(i) => ElementScriptTokens {
             kind: "body",
             index: i,
-            edge: None,
             point: None,
         },
         // Handled directly in `element_lua_ref` before this is reached (a `FaceEdge` doesn't
@@ -655,7 +634,6 @@ fn element_script_tokens(element: SceneElement) -> ElementScriptTokens {
         SceneElement::FaceEdge(_) => ElementScriptTokens {
             kind: "face_edge",
             index: 0,
-            edge: None,
             point: None,
         },
     }
@@ -700,12 +678,32 @@ pub fn instruction_from_action(action: &Action, doc: &crate::model::Document) ->
         // declarative Create*/Extrude actions (#59); replay them as the equivalent call
         // using the as-committed geometry. A failed commit (e.g. "too small") returns
         // `ActionResult::Err`, so `after_apply` never reaches here for those.
-        Action::CommitRectangle => doc.rects.last().map(|r| Instruction::CreateRect {
-            x: r.x,
-            y: r.y,
-            width: r.w,
-            height: r.h,
-        }),
+        // A rectangle is now four plain lines (#66 polygon); reconstruct its origin/extent
+        // from the bounding box of the four lines just appended by the commit.
+        Action::CommitRectangle => {
+            let n = doc.lines.len();
+            (n >= 4).then(|| {
+                let rect_lines = &doc.lines[n - 4..];
+                let mut min_x = f32::INFINITY;
+                let mut min_y = f32::INFINITY;
+                let mut max_x = f32::NEG_INFINITY;
+                let mut max_y = f32::NEG_INFINITY;
+                for l in rect_lines {
+                    for (x, y) in [(l.x0, l.y0), (l.x1, l.y1)] {
+                        min_x = min_x.min(x);
+                        min_y = min_y.min(y);
+                        max_x = max_x.max(x);
+                        max_y = max_y.max(y);
+                    }
+                }
+                Instruction::CreateRect {
+                    x: min_x,
+                    y: min_y,
+                    width: max_x - min_x,
+                    height: max_y - min_y,
+                }
+            })
+        }
         Action::CommitLine => doc.lines.last().map(|l| Instruction::CreateLine {
             x0: l.x0,
             y0: l.y0,
@@ -891,13 +889,11 @@ pub fn instruction_for_new_extrusion(doc: &crate::model::Document) -> Option<Ins
 /// way to extrude more than one closed-loop face alongside the others in one call.
 fn extrude_face_args(faces: &[crate::model::ExtrudeFace]) -> String {
     use crate::model::ExtrudeFace;
-    let mut rects = Vec::new();
     let mut circles = Vec::new();
     let mut polygon = None;
     let mut boolean = None;
     for face in faces {
         match face {
-            ExtrudeFace::Rect(i) => rects.push(*i),
             ExtrudeFace::Circle(i) => circles.push(*i),
             ExtrudeFace::Polygon(lines) => {
                 polygon.get_or_insert(lines);
@@ -914,11 +910,6 @@ fn extrude_face_args(faces: &[crate::model::ExtrudeFace]) -> String {
         indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
     };
     let mut parts = Vec::new();
-    match rects.as_slice() {
-        [] => {}
-        [single] => parts.push(format!("rect = {single}")),
-        many => parts.push(format!("rects = {{{}}}", index_list(many))),
-    }
     match circles.as_slice() {
         [] => {}
         [single] => parts.push(format!("circle = {single}")),
@@ -958,7 +949,6 @@ fn boolean_face_lua_table(
 fn extrude_face_spec_table(face: &crate::model::ExtrudeFace) -> String {
     use crate::model::ExtrudeFace;
     match face {
-        ExtrudeFace::Rect(i) => format!("{{rect = {i}}}"),
         ExtrudeFace::Circle(i) => format!("{{circle = {i}}}"),
         ExtrudeFace::Polygon(lines) => {
             let idx = lines.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
@@ -1088,7 +1078,6 @@ fn tool_lua_name(tool: Tool) -> &'static str {
 
 fn face_lua_parts(face: &FaceId) -> (&'static str, usize) {
     match face {
-        FaceId::Rect(i) => ("rect", *i),
         FaceId::Circle(i) => ("circle", *i),
         FaceId::ConstructionPlane(i) => ("construction_plane", *i),
         // Cap/side faces aren't yet addressable from the two-argument script form.
@@ -1144,12 +1133,6 @@ fn element_lua_ref(element: &SceneElement) -> String {
     if let Some(point) = tokens.point {
         return format!("{{ kind = \"point\", {} }}", point_lua_fields(&point));
     }
-    if let Some(edge) = tokens.edge {
-        return format!(
-            "{{ kind = \"{}\", index = {}, edge = {:?} }}",
-            tokens.kind, tokens.index, edge.script_name()
-        );
-    }
     format!("{{ kind = \"{}\", index = {} }}", tokens.kind, tokens.index)
 }
 
@@ -1164,9 +1147,6 @@ fn point_lua_fields(point: &ConstraintPoint) -> String {
             // `end` is a Lua reserved word, so it can't be a bareword table key; bracket it.
             format!("kind = \"line\", index = {line}, [\"end\"] = \"{end_name}\"")
         }
-        ConstraintPoint::RectCorner { rect, corner } => {
-            format!("kind = \"rect\", index = {rect}, corner = {corner}")
-        }
         ConstraintPoint::CircleCenter(circle) => {
             format!("kind = \"circle\", index = {circle}")
         }
@@ -1180,10 +1160,6 @@ fn point_lua_fields(point: &ConstraintPoint) -> String {
 fn constraint_line_lua_ref(line: &ConstraintLine) -> String {
     match line {
         ConstraintLine::Line(index) => format!("{{ kind = \"line\", index = {index} }}"),
-        ConstraintLine::RectEdge { rect, edge } => format!(
-            "{{ kind = \"rect\", index = {rect}, edge = {:?} }}",
-            edge.script_name()
-        ),
         // #26/#27: mirrors `lua_script::parse_constraint_line_table`'s `"face"` shape.
         ConstraintLine::FaceEdge { face, index } => format!(
             "{{ kind = \"face\", face = {}, index = {index} }}",
@@ -1201,7 +1177,6 @@ fn constraint_point_lua_ref(point: &ConstraintPoint) -> String {
 /// `parse_face_id_table` — a polygon profile isn't a single index, #66).
 fn face_id_lua_ref(face: &FaceId) -> String {
     match face {
-        FaceId::Rect(i) => format!("{{ kind = \"rect\", index = {i} }}"),
         FaceId::Circle(i) => format!("{{ kind = \"circle\", index = {i} }}"),
         FaceId::ConstructionPlane(i) => format!("{{ kind = \"construction_plane\", index = {i} }}"),
         FaceId::Polygon(lines) => format!(
@@ -1221,7 +1196,6 @@ fn face_id_lua_ref(face: &FaceId) -> String {
 
 fn extrude_face_profile_lua_fields(profile: &ExtrudeFace) -> String {
     match profile {
-        ExtrudeFace::Rect(i) => format!("profile = \"rect\", profile_index = {i}"),
         ExtrudeFace::Circle(i) => format!("profile = \"circle\", profile_index = {i}"),
         // Not round-trippable: `parse_face_id_table` only accepts `rect`/`circle` profiles
         // (same limitation as `face_lua_parts`'s polygon case, #66).
@@ -1258,12 +1232,6 @@ fn distance_target_lua_ref(target: &DistanceTarget) -> String {
         }
         DistanceTarget::CircleDiameter(index) => {
             format!("{{ kind = \"circle\", index = {index} }}")
-        }
-        DistanceTarget::RectWidth(index) => {
-            format!("{{ kind = \"rect\", index = {index}, axis = \"width\" }}")
-        }
-        DistanceTarget::RectHeight(index) => {
-            format!("{{ kind = \"rect\", index = {index}, axis = \"height\" }}")
         }
         DistanceTarget::LineLineDistance { .. }
         | DistanceTarget::PointPointDistance { .. }

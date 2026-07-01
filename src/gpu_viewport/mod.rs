@@ -7,7 +7,7 @@ mod scene;
 pub use dim_labels::{build_planar_label_mesh, ViewportDimLabel};
 pub use renderer::paint_viewport;
 pub use scene::{
-    fill_color, sketch_ground_color, solid_mesh_unique_edges, ViewportHoverHighlight,
+    fill_color, sketch_ground_color, solid_mesh_unique_edges, PreviewRect, ViewportHoverHighlight,
     ViewportPalette, ViewportExtrudeGizmo, ViewportPlaneGizmo, ViewportPlanePreview,
     ViewportScene, ViewportSceneInput, VertexTreatmentPreviewGeom,
     DEFAULT_CONSTRUCTION_PLANE_OPACITY, GRID_EXTENT, GRID_STEP, SKETCH_DIMMED,

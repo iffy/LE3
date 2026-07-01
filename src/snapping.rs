@@ -4,7 +4,7 @@
 
 use crate::geometric_constraints::{line_uv_endpoints, point_uv};
 use crate::model::{
-    ConstraintEntity, ConstraintKind, ConstraintLine, ConstraintPoint, Document, LineEnd, RectEdge,
+    ConstraintEntity, ConstraintKind, ConstraintLine, ConstraintPoint, Document, LineEnd,
     SketchId,
 };
 
@@ -201,15 +201,6 @@ fn entity_eq(a: &ConstraintEntity, b: &ConstraintEntity) -> bool {
 fn owning_lines(point: &ConstraintPoint) -> Vec<ConstraintLine> {
     match point {
         ConstraintPoint::LineEndpoint { line, .. } => vec![ConstraintLine::Line(*line)],
-        ConstraintPoint::RectCorner { rect, .. } => [
-            RectEdge::Bottom,
-            RectEdge::Right,
-            RectEdge::Top,
-            RectEdge::Left,
-        ]
-        .into_iter()
-        .map(|edge| ConstraintLine::RectEdge { rect: *rect, edge })
-        .collect(),
         // Fixed by the body's own geometry, so it's never the dragged endpoint of anything —
         // there's nothing to exclude on its behalf.
         ConstraintPoint::CircleCenter(_) | ConstraintPoint::FaceVertex { .. } => Vec::new(),
@@ -232,14 +223,6 @@ pub fn all_sketch_vertices(doc: &Document) -> Vec<ConstraintPoint> {
             end: LineEnd::End,
         });
     }
-    for (index, rect) in doc.rects.iter().enumerate() {
-        if rect.deleted {
-            continue;
-        }
-        for corner in 0..4u8 {
-            points.push(ConstraintPoint::RectCorner { rect: index, corner });
-        }
-    }
     for (index, circle) in doc.circles.iter().enumerate() {
         if circle.deleted {
             continue;
@@ -249,7 +232,7 @@ pub fn all_sketch_vertices(doc: &Document) -> Vec<ConstraintPoint> {
     points
 }
 
-/// All snap-able vertices in a sketch (line endpoints, rect corners, circle centers).
+/// All snap-able vertices in a sketch (line endpoints, circle centers).
 pub fn sketch_vertices(doc: &Document, sketch: SketchId) -> Vec<ConstraintPoint> {
     let mut points = Vec::new();
     for (index, line) in doc.lines.iter().enumerate() {
@@ -265,14 +248,6 @@ pub fn sketch_vertices(doc: &Document, sketch: SketchId) -> Vec<ConstraintPoint>
             end: LineEnd::End,
         });
     }
-    for (index, rect) in doc.rects.iter().enumerate() {
-        if rect.deleted || rect.sketch != sketch {
-            continue;
-        }
-        for corner in 0..4u8 {
-            points.push(ConstraintPoint::RectCorner { rect: index, corner });
-        }
-    }
     for (index, circle) in doc.circles.iter().enumerate() {
         if circle.deleted || circle.sketch != sketch {
             continue;
@@ -282,7 +257,7 @@ pub fn sketch_vertices(doc: &Document, sketch: SketchId) -> Vec<ConstraintPoint>
     points
 }
 
-/// All snap-able line segments in a sketch (lines and rectangle edges).
+/// All snap-able line segments in a sketch (lines).
 pub fn sketch_lines(doc: &Document, sketch: SketchId) -> Vec<ConstraintLine> {
     let mut lines = Vec::new();
     for (index, line) in doc.lines.iter().enumerate() {
@@ -290,19 +265,6 @@ pub fn sketch_lines(doc: &Document, sketch: SketchId) -> Vec<ConstraintLine> {
             continue;
         }
         lines.push(ConstraintLine::Line(index));
-    }
-    for (index, rect) in doc.rects.iter().enumerate() {
-        if rect.deleted || rect.sketch != sketch {
-            continue;
-        }
-        for edge in [
-            RectEdge::Bottom,
-            RectEdge::Right,
-            RectEdge::Top,
-            RectEdge::Left,
-        ] {
-            lines.push(ConstraintLine::RectEdge { rect: index, edge });
-        }
     }
     lines
 }

@@ -10,7 +10,7 @@
 use crate::face::default_xy_plane;
 use crate::constraints::{migrate_legacy_dimensions, solve_document_constraints};
 use crate::model::{
-    Circle, ConstructionPlane, Constraint, Document, FaceId, Line, Parameter, Rect, ShapeKind,
+    Circle, ConstructionPlane, Constraint, Document, FaceId, Line, Parameter, ShapeKind,
     Sketch,
 };
 use crate::parameters::validate_document_parameters_no_cycles;
@@ -109,14 +109,13 @@ pub fn save(path: &str, doc: &Document) -> Result<()> {
     .map_err(|e| e.to_string())?;
 
     tx.execute(
-        "DELETE FROM dag_nodes WHERE kind IN ('sketch', 'rectangle', 'line', 'circle', 'parameter', 'constraint', 'construction_plane', 'extrusion', 'body', 'imported_mesh')",
+        "DELETE FROM dag_nodes WHERE kind IN ('sketch', 'line', 'circle', 'parameter', 'constraint', 'construction_plane', 'extrusion', 'body', 'imported_mesh')",
         [],
     )
     .map_err(|e| e.to_string())?;
 
     let mut row_id = 0i64;
     save_indexed_nodes(&tx, &mut row_id, "sketch", &doc.sketches)?;
-    save_indexed_nodes(&tx, &mut row_id, "rectangle", &doc.rects)?;
     save_indexed_nodes(&tx, &mut row_id, "line", &doc.lines)?;
     save_indexed_nodes(&tx, &mut row_id, "circle", &doc.circles)?;
     save_indexed_nodes(&tx, &mut row_id, "parameter", &doc.parameters)?;
@@ -269,7 +268,6 @@ fn load_legacy_document_nodes(
 ) -> Result<(
     Vec<Parameter>,
     Vec<Sketch>,
-    Vec<Rect>,
     Vec<Line>,
     Vec<Circle>,
     Vec<Constraint>,
@@ -279,7 +277,7 @@ fn load_legacy_document_nodes(
     let mut stmt = conn
         .prepare(
             "SELECT kind, payload FROM dag_nodes
-             WHERE kind IN ('sketch', 'rectangle', 'line', 'circle', 'parameter', 'constraint', 'construction_plane')
+             WHERE kind IN ('sketch', 'line', 'circle', 'parameter', 'constraint', 'construction_plane')
              ORDER BY id",
         )
         .map_err(|e| e.to_string())?;
@@ -290,7 +288,6 @@ fn load_legacy_document_nodes(
 
     let mut parameters = Vec::new();
     let mut sketches = Vec::new();
-    let mut rects = Vec::new();
     let mut lines = Vec::new();
     let mut circles = Vec::new();
     let mut constraints = Vec::new();
@@ -303,11 +300,6 @@ fn load_legacy_document_nodes(
                 let sketch: Sketch = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
                 sketches.push(sketch);
                 shape_order.push(ShapeKind::Sketch);
-            }
-            "rectangle" => {
-                let rect: Rect = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
-                rects.push(rect);
-                shape_order.push(ShapeKind::Rect);
             }
             "line" => {
                 let line: Line = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
@@ -342,7 +334,6 @@ fn load_legacy_document_nodes(
     Ok((
         parameters,
         sketches,
-        rects,
         lines,
         circles,
         constraints,
@@ -358,7 +349,6 @@ pub fn open(path: &str) -> Result<Document> {
     let (
         parameters,
         sketches,
-        rects,
         lines,
         circles,
         constraints,
@@ -367,7 +357,6 @@ pub fn open(path: &str) -> Result<Document> {
     ) = if let Some(shape_order) = load_shape_order_meta(&conn) {
         let parameters = load_indexed_entities(&conn, "parameter")?;
         let sketches = load_indexed_entities(&conn, "sketch")?;
-        let rects = load_indexed_entities(&conn, "rectangle")?;
         let lines = load_indexed_entities(&conn, "line")?;
         let circles = load_indexed_entities(&conn, "circle")?;
         let constraints = load_indexed_entities(&conn, "constraint")?;
@@ -375,7 +364,6 @@ pub fn open(path: &str) -> Result<Document> {
         (
             parameters,
             sketches,
-            rects,
             lines,
             circles,
             constraints,
@@ -398,7 +386,6 @@ pub fn open(path: &str) -> Result<Document> {
     let mut doc = Document {
         parameters,
         sketches,
-        rects,
         lines,
         circles,
         constraints,

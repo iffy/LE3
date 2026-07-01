@@ -17,10 +17,6 @@ pub fn sketch_alive(doc: &Document, sketch: SketchId) -> bool {
     doc.sketches.get(sketch).is_some_and(|s| !s.deleted)
 }
 
-pub fn rect_alive(doc: &Document, index: usize) -> bool {
-    doc.rects.get(index).is_some_and(|r| !r.deleted)
-}
-
 pub fn line_alive(doc: &Document, index: usize) -> bool {
     doc.lines.get(index).is_some_and(|l| !l.deleted)
 }
@@ -44,10 +40,8 @@ pub fn element_alive(doc: &Document, element: SceneElement) -> bool {
     match element {
         SceneElement::ConstructionPlane(index) => construction_plane_alive(doc, index),
         SceneElement::Sketch(sketch) => sketch_alive(doc, sketch),
-        SceneElement::Rect(index) => rect_alive(doc, index),
         SceneElement::Line(index) => line_alive(doc, index),
         SceneElement::Circle(index) => circle_alive(doc, index),
-        SceneElement::RectEdge(index, _) => rect_alive(doc, index),
         SceneElement::Point(point) => point_owner_alive(doc, &point),
         SceneElement::Constraint(index) => constraint_alive(doc, index),
         SceneElement::Extrusion(index) => extrusion_alive(doc, index),
@@ -71,7 +65,6 @@ fn point_owner_alive(
     use crate::model::ConstraintPoint;
     match point {
         ConstraintPoint::LineEndpoint { line, .. } => line_alive(doc, *line),
-        ConstraintPoint::RectCorner { rect, .. } => rect_alive(doc, *rect),
         ConstraintPoint::CircleCenter(circle) => circle_alive(doc, *circle),
         // A face's own vertex is "alive" exactly when it still resolves (extrusion present,
         // index still within its current boundary loop) — it has no owning scene entity.
@@ -84,7 +77,6 @@ fn point_owner_alive(
 /// Normalize a selection entry to the entity that should be tombstoned.
 pub fn delete_target_for_element(element: SceneElement) -> SceneElement {
     match element {
-        SceneElement::RectEdge(index, _) => SceneElement::Rect(index),
         SceneElement::Point(point) => match point_owner_element(&point) {
             Some(owner) => owner,
             // A face's own vertex has no owning scene entity to delete instead — deleting it
@@ -99,7 +91,6 @@ fn point_owner_element(point: &crate::model::ConstraintPoint) -> Option<SceneEle
     use crate::model::ConstraintPoint;
     Some(match point {
         ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(*line),
-        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(*rect),
         ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(*circle),
         ConstraintPoint::FaceVertex { .. } => return None,
     })
@@ -132,11 +123,6 @@ pub fn tombstone_element(doc: &mut Document, element: SceneElement) -> bool {
                 changed = true;
             }
         }
-        SceneElement::Rect(index) => {
-            if tombstone_rect(doc, index) {
-                changed = true;
-            }
-        }
         SceneElement::Circle(index) => {
             if tombstone_circle(doc, index) {
                 changed = true;
@@ -149,11 +135,6 @@ pub fn tombstone_element(doc: &mut Document, element: SceneElement) -> bool {
         }
         SceneElement::Constraint(index) => {
             if tombstone_constraint(doc, index) {
-                changed = true;
-            }
-        }
-        SceneElement::RectEdge(index, _) => {
-            if tombstone_rect(doc, index) {
                 changed = true;
             }
         }
@@ -256,16 +237,6 @@ fn tombstone_sketch(doc: &mut Document, sketch: SketchId) -> bool {
     entry.deleted = true;
     remove_shape_order_entry(doc, ShapeKind::Sketch, sketch);
 
-    let rects: Vec<usize> = doc
-        .rects
-        .iter()
-        .enumerate()
-        .filter(|(_, rect)| rect.sketch == sketch && !rect.deleted)
-        .map(|(i, _)| i)
-        .collect();
-    for ri in rects {
-        tombstone_rect(doc, ri);
-    }
     let lines: Vec<usize> = doc
         .lines
         .iter()
@@ -308,22 +279,6 @@ fn tombstone_sketch(doc: &mut Document, sketch: SketchId) -> bool {
         .collect();
     for pi in planes {
         tombstone_construction_plane(doc, pi);
-    }
-    true
-}
-
-fn tombstone_rect(doc: &mut Document, index: usize) -> bool {
-    let Some(rect) = doc.rects.get_mut(index) else {
-        return false;
-    };
-    if rect.deleted {
-        return false;
-    }
-    rect.deleted = true;
-    remove_shape_order_entry(doc, ShapeKind::Rect, index);
-    let face = FaceId::Rect(index);
-    for sketch in doc.sketches_on_face(face).collect::<Vec<_>>() {
-        tombstone_sketch(doc, sketch);
     }
     true
 }
@@ -384,9 +339,6 @@ pub fn tombstone_parameter(doc: &mut Document, index: usize) -> bool {
 pub fn distance_target_alive(doc: &Document, target: &DistanceTarget) -> bool {
     match target {
         DistanceTarget::LineLength(index) => line_alive(doc, *index),
-        DistanceTarget::RectWidth(index) | DistanceTarget::RectHeight(index) => {
-            rect_alive(doc, *index)
-        }
         DistanceTarget::CircleDiameter(index) => circle_alive(doc, *index),
         DistanceTarget::LineLineDistance {
             line_a,
@@ -405,7 +357,6 @@ pub fn distance_target_alive(doc: &Document, target: &DistanceTarget) -> bool {
 pub fn constraint_line_alive(doc: &Document, line: &ConstraintLine) -> bool {
     match line {
         ConstraintLine::Line(index) => line_alive(doc, *index),
-        ConstraintLine::RectEdge { rect, .. } => rect_alive(doc, *rect),
         ConstraintLine::FaceEdge { face, index } => {
             crate::extrude::face_boundary_loop_world(doc, face).is_some_and(|l| *index < l.len())
         }
@@ -424,7 +375,6 @@ pub fn constraint_entity_alive(doc: &Document, entity: &ConstraintEntity) -> boo
 pub fn constraint_point_alive(doc: &Document, point: &ConstraintPoint) -> bool {
     match point {
         ConstraintPoint::LineEndpoint { line, .. } => line_alive(doc, *line),
-        ConstraintPoint::RectCorner { rect, .. } => rect_alive(doc, *rect),
         ConstraintPoint::CircleCenter(circle) => circle_alive(doc, *circle),
         ConstraintPoint::FaceVertex { face, index } => {
             crate::extrude::face_boundary_loop_world(doc, face).is_some_and(|l| *index < l.len())

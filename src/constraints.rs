@@ -7,7 +7,7 @@ use crate::geometric_constraints::{
 use crate::model::{
     default_constraint_sign, effective_angle_unit, effective_length_unit, Constraint,
     ConstraintEntity, ConstraintKind, ConstraintLine, ConstraintPoint, DimensionTarget,
-    DistanceTarget, Document, RectEdge, SketchId,
+    DistanceTarget, Document, SketchId,
 };
 use crate::value::{
     eval_angle_rad_in_doc, eval_length_mm_in_doc, format_angle_display_in, format_diameter_display_in,
@@ -29,8 +29,6 @@ pub fn finalize_distance_target(
 ) -> Result<DistanceTarget, String> {
     match target {
         DistanceTarget::LineLength(_)
-        | DistanceTarget::RectWidth(_)
-        | DistanceTarget::RectHeight(_)
         | DistanceTarget::CircleDiameter(_) => Ok(target),
         DistanceTarget::LineLineDistance { line_a, line_b, .. } => {
             let (line_a, line_b) = normalize_line_pair(line_a, line_b);
@@ -333,8 +331,6 @@ pub fn constraint_evaluated_angle(doc: &Document, index: ConstraintId) -> Option
 fn measured_distance(doc: &Document, sketch: SketchId, target: DistanceTarget) -> Option<f32> {
     match target {
         DistanceTarget::LineLength(i) => doc.lines.get(i).map(|l| l.length()),
-        DistanceTarget::RectWidth(i) => doc.rects.get(i).map(|r| r.w),
-        DistanceTarget::RectHeight(i) => doc.rects.get(i).map(|r| r.h),
         DistanceTarget::CircleDiameter(i) => doc.circles.get(i).map(|c| c.diameter()),
         DistanceTarget::LineLineDistance { line_a, line_b, .. } => {
             measured_line_line_distance(doc, sketch, line_a, line_b)
@@ -458,8 +454,6 @@ pub fn constraint_label(doc: &Document, index: ConstraintId) -> String {
 fn distance_target_label(target: DistanceTarget) -> String {
     match target {
         DistanceTarget::LineLength(i) => format!("Line {i} length"),
-        DistanceTarget::RectWidth(i) => format!("Rectangle {i} width"),
-        DistanceTarget::RectHeight(i) => format!("Rectangle {i} height"),
         DistanceTarget::CircleDiameter(i) => format!("Circle {i} diameter"),
         DistanceTarget::LineLineDistance { .. } => "Line spacing".to_string(),
         DistanceTarget::PointPointDistance { .. } => "Point distance".to_string(),
@@ -470,7 +464,6 @@ fn distance_target_label(target: DistanceTarget) -> String {
 fn line_sort_key(line: &ConstraintLine) -> (u8, usize, u8, usize) {
     match line {
         ConstraintLine::Line(i) => (0, *i, 0, 0),
-        ConstraintLine::RectEdge { rect, edge } => (1, *rect, edge.index() as u8, 0),
         ConstraintLine::FaceEdge { index, .. } => (2, *index, 0, 0),
     }
 }
@@ -601,15 +594,6 @@ fn validate_line_in_sketch(
                 return Err(format!("Line {index} is not in sketch {sketch}"));
             }
         }
-        ConstraintLine::RectEdge { rect, .. } => {
-            let entity = doc
-                .rects
-                .get(rect)
-                .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-            if entity.sketch != sketch {
-                return Err(format!("Rectangle {rect} is not in sketch {sketch}"));
-            }
-        }
         // A face's own edge has no owning sketch — valid for any sketch as long as the
         // underlying extrusion/face still resolves (mirrors `geometric_constraints`'
         // `validate_line_ref`).
@@ -632,14 +616,6 @@ fn validate_point_in_sketch(
             doc,
             sketch,
             ConstraintLine::Line(line),
-        ),
-        ConstraintPoint::RectCorner { rect, .. } => validate_line_in_sketch(
-            doc,
-            sketch,
-            ConstraintLine::RectEdge {
-                rect,
-                edge: RectEdge::Bottom,
-            },
         ),
         ConstraintPoint::CircleCenter(circle) => {
             let entity = doc
@@ -678,21 +654,10 @@ pub fn distance_target_from_scene_element(
     element: crate::hierarchy::SceneElement,
 ) -> Option<DistanceTarget> {
     use crate::hierarchy::SceneElement;
-    use crate::model::RectEdge;
     match element {
         SceneElement::Line(index) => {
             let line = doc.lines.get(index)?;
             (line.sketch == sketch).then_some(DistanceTarget::LineLength(index))
-        }
-        SceneElement::RectEdge(rect_index, edge) => {
-            let rect = doc.rects.get(rect_index)?;
-            if rect.sketch != sketch {
-                return None;
-            }
-            match edge {
-                RectEdge::Bottom | RectEdge::Top => Some(DistanceTarget::RectWidth(rect_index)),
-                RectEdge::Left | RectEdge::Right => Some(DistanceTarget::RectHeight(rect_index)),
-            }
         }
         SceneElement::Circle(index) => {
             let circle = doc.circles.get(index)?;
@@ -712,16 +677,6 @@ pub fn distance_target_from_pick(
         crate::construction::PickTargetKind::Line(index) => {
             let line = doc.lines.get(*index)?;
             (line.sketch == sketch).then_some(DistanceTarget::LineLength(*index))
-        }
-        crate::construction::PickTargetKind::ShapeEdge { rect_index, edge, .. } => {
-            let rect = doc.rects.get(*rect_index)?;
-            if rect.sketch != sketch {
-                return None;
-            }
-            match edge {
-                RectEdge::Bottom | RectEdge::Top => Some(DistanceTarget::RectWidth(*rect_index)),
-                RectEdge::Left | RectEdge::Right => Some(DistanceTarget::RectHeight(*rect_index)),
-            }
         }
         crate::construction::PickTargetKind::Circle(index) => {
             let circle = doc.circles.get(*index)?;
@@ -860,15 +815,6 @@ pub fn validate_distance_target(
                 return Err(format!("Line {i} is not in sketch {sketch}"));
             }
         }
-        DistanceTarget::RectWidth(i) | DistanceTarget::RectHeight(i) => {
-            let rect = doc
-                .rects
-                .get(i)
-                .ok_or_else(|| format!("Rectangle {i} not found"))?;
-            if rect.sketch != sketch {
-                return Err(format!("Rectangle {i} is not in sketch {sketch}"));
-            }
-        }
         DistanceTarget::CircleDiameter(i) => {
             let circle = doc
                 .circles
@@ -959,12 +905,6 @@ pub fn solve_document_constraints_with_pins(
 }
 
 fn clear_legacy_dimension_locks(doc: &mut Document) {
-    for rect in &mut doc.rects {
-        rect.width_locked = false;
-        rect.height_locked = false;
-        rect.width_expr = None;
-        rect.height_expr = None;
-    }
     for line in &mut doc.lines {
         line.length_locked = false;
         line.length_expr = None;
@@ -982,24 +922,6 @@ fn sync_legacy_dimension_flags(
     dim_offset: Option<f32>,
 ) {
     match target {
-        DistanceTarget::RectWidth(i) => {
-            if let Some(rect) = doc.rects.get_mut(i) {
-                rect.width_locked = true;
-                rect.width_expr = Some(expression.to_string());
-                if dim_offset.is_some() {
-                    rect.width_dim_offset = dim_offset;
-                }
-            }
-        }
-        DistanceTarget::RectHeight(i) => {
-            if let Some(rect) = doc.rects.get_mut(i) {
-                rect.height_locked = true;
-                rect.height_expr = Some(expression.to_string());
-                if dim_offset.is_some() {
-                    rect.height_dim_offset = dim_offset;
-                }
-            }
-        }
         DistanceTarget::LineLength(i) => {
             if let Some(line) = doc.lines.get_mut(i) {
                 line.length_locked = true;
@@ -1027,34 +949,6 @@ fn sync_legacy_dimension_flags(
 /// Create constraints from legacy `*_locked` fields (pre-constraint documents).
 pub fn migrate_legacy_dimensions(doc: &mut Document) {
     let mut pending = Vec::new();
-    for (i, rect) in doc.rects.iter().enumerate() {
-        if rect.width_locked {
-            let expr = rect.width_expr.clone().unwrap_or_else(|| {
-                format_length_display_in(rect.w, effective_length_unit(doc, rect.sketch))
-            });
-            if find_distance_constraint(doc, DistanceTarget::RectWidth(i)).is_none() {
-                pending.push((
-                    rect.sketch,
-                    DistanceTarget::RectWidth(i),
-                    expr,
-                    rect.width_dim_offset,
-                ));
-            }
-        }
-        if rect.height_locked {
-            let expr = rect.height_expr.clone().unwrap_or_else(|| {
-                format_length_display_in(rect.h, effective_length_unit(doc, rect.sketch))
-            });
-            if find_distance_constraint(doc, DistanceTarget::RectHeight(i)).is_none() {
-                pending.push((
-                    rect.sketch,
-                    DistanceTarget::RectHeight(i),
-                    expr,
-                    rect.height_dim_offset,
-                ));
-            }
-        }
-    }
     for (i, line) in doc.lines.iter().enumerate() {
         if line.length_locked {
             let expr = line.length_expr.clone().unwrap_or_else(|| {
@@ -1149,17 +1043,6 @@ fn distance_target_segment_endpoints_inner(
             let line = doc.lines.get(i)?;
             crate::face::line_world_endpoints(doc, line)
         }
-        DistanceTarget::RectWidth(i) | DistanceTarget::RectHeight(i) => {
-            let rect = doc.rects.get(i)?;
-            let edge = match target {
-                DistanceTarget::RectWidth(_) => RectEdge::Bottom,
-                DistanceTarget::RectHeight(_) => RectEdge::Left,
-                _ => unreachable!(),
-            };
-            let segments = crate::construction::rect_edge_segments(doc, rect);
-            let (a, b) = segments[edge.index()];
-            Some((a, b))
-        }
         DistanceTarget::CircleDiameter(i) => {
             let circle = doc.circles.get(i)?;
             crate::face::circle_world_diameter_endpoints(doc, circle)
@@ -1228,7 +1111,6 @@ fn distance_target_segment_endpoints_inner(
 fn line_sketch(doc: &Document, line: ConstraintLine) -> Option<SketchId> {
     match line {
         ConstraintLine::Line(index) => doc.lines.get(index).map(|l| l.sketch),
-        ConstraintLine::RectEdge { rect, .. } => doc.rects.get(rect).map(|r| r.sketch),
         // A face's own edge has no owning sketch of its own (it's referenced *from* a sketch,
         // not owned by one) — angle constraints/display against a `FaceEdge` reference aren't
         // supported (out of scope for #26/#27, which only asks for coincident-to-vertex and

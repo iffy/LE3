@@ -447,7 +447,6 @@ pub fn constraint_point_world(doc: &Document, point: crate::model::ConstraintPoi
     }
     let sketch = match point {
         crate::model::ConstraintPoint::LineEndpoint { line, .. } => doc.lines.get(line)?.sketch,
-        crate::model::ConstraintPoint::RectCorner { rect, .. } => doc.rects.get(rect)?.sketch,
         crate::model::ConstraintPoint::CircleCenter(circle) => doc.circles.get(circle)?.sketch,
         crate::model::ConstraintPoint::FaceVertex { .. } => unreachable!("handled above"),
     };
@@ -475,14 +474,6 @@ pub fn faces_anchor(doc: &Document, faces: &[ExtrudeFace]) -> Option<(Vec3, Vec3
 /// World center and normal of a face.
 fn face_center_world(doc: &Document, face: &ExtrudeFace) -> Option<(Vec3, Vec3)> {
     match face {
-        ExtrudeFace::Rect(i) => {
-            let rect = doc.rects.get(*i)?;
-            let frame = sketch_geometry_frame(doc, rect.sketch)?;
-            Some((
-                local_to_world(&frame, rect.x + rect.w * 0.5, rect.y + rect.h * 0.5),
-                frame.normal,
-            ))
-        }
         ExtrudeFace::Circle(i) => {
             let circle = doc.circles.get(*i)?;
             let frame = sketch_geometry_frame(doc, circle.sketch)?;
@@ -504,21 +495,6 @@ fn face_center_world(doc: &Document, face: &ExtrudeFace) -> Option<(Vec3, Vec3)>
 /// World-space boundary loop (CCW in the face frame) and outward normal of a face.
 pub fn face_profile_world(doc: &Document, face: &ExtrudeFace) -> Option<(Vec<Vec3>, Vec3)> {
     match face {
-        ExtrudeFace::Rect(index) => {
-            let rect = doc.rects.get(*index)?;
-            if rect.deleted {
-                return None;
-            }
-            let frame = sketch_geometry_frame(doc, rect.sketch)?;
-            let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
-            let corners = [
-                local_to_world(&frame, x, y),
-                local_to_world(&frame, x + w, y),
-                local_to_world(&frame, x + w, y + h),
-                local_to_world(&frame, x, y + h),
-            ];
-            Some((corners.to_vec(), frame.normal))
-        }
         ExtrudeFace::Circle(index) => {
             let circle = doc.circles.get(*index)?;
             if circle.deleted {
@@ -558,14 +534,6 @@ pub fn extrude_face_uv_loop(
     face: &ExtrudeFace,
 ) -> Option<Vec<(f32, f32)>> {
     match face {
-        ExtrudeFace::Rect(i) => {
-            let rect = doc.rects.get(*i)?;
-            if rect.deleted || rect.sketch != sketch {
-                return None;
-            }
-            let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
-            Some(vec![(x, y), (x + w, y), (x + w, y + h), (x, y + h)])
-        }
         ExtrudeFace::Circle(i) => {
             let circle = doc.circles.get(*i)?;
             if circle.deleted || circle.sketch != sketch {
@@ -599,11 +567,6 @@ pub fn extrude_face_uv_loop(
 /// closed line-loop polygon (#66) whose owning sketch is `sketch`.
 fn raw_faces_in_sketch(doc: &Document, sketch: crate::model::SketchId) -> Vec<ExtrudeFace> {
     let mut out = Vec::new();
-    for (i, r) in doc.rects.iter().enumerate() {
-        if !r.deleted && r.sketch == sketch {
-            out.push(ExtrudeFace::Rect(i));
-        }
-    }
     for (i, c) in doc.circles.iter().enumerate() {
         if !c.deleted && c.sketch == sketch {
             out.push(ExtrudeFace::Circle(i));
@@ -728,7 +691,6 @@ pub fn cap_polygon_world(
 /// one per edge; circular profiles are curved and have none).
 pub fn side_face_count(profile: &ExtrudeFace) -> usize {
     match profile {
-        ExtrudeFace::Rect(_) => 4,
         ExtrudeFace::Circle(_) => 0,
         ExtrudeFace::Polygon(lines) => lines.len(),
         // The resolved edge count depends on the boolean-clipped geometry (Document state),
@@ -784,8 +746,7 @@ pub fn face_boundary_loop_world(doc: &Document, face: &FaceId) -> Option<Vec<Vec
             profile,
             edge,
         } => side_quad_world(doc, *extrusion, profile, *edge as usize).map(|quad| quad.to_vec()),
-        FaceId::Rect(_)
-        | FaceId::Circle(_)
+        FaceId::Circle(_)
         | FaceId::Polygon(_)
         | FaceId::ConstructionPlane(_) => None,
     }

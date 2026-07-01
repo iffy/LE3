@@ -6,7 +6,7 @@ use crate::constraint_viewport::ConstraintViewportGraphic;
 use crate::constraints::constraint_segment_endpoints;
 use crate::document_health::constraint_annotation_color;
 use crate::document_health::{health_tint_color, DocumentHealth};
-use crate::document_lifecycle::{circle_alive, constraint_alive, line_alive, rect_alive};
+use crate::document_lifecycle::{circle_alive, constraint_alive, line_alive};
 use crate::construction::{
     axis_angle_handle, axis_normal, axis_reference_perp, gizmo_display_offset, global_axis_segment,
     plane_corners, AxisGizmoHit, AXIS_ANGLE_GIZMO_RADIUS_MM, CONSTRUCTION_DASH_GAP_PX,
@@ -16,12 +16,21 @@ use crate::construction::{
 };
 use crate::context::selection_highlight_dashed;
 use crate::face::{
-    circle_world_perimeter, rect_world_corners, rect_world_corners_resolved, sketch_geometry_frame,
+    circle_world_perimeter, sketch_geometry_frame,
 };
 use crate::hierarchy::SceneElement;
 use crate::model::{
-    Circle, ConstructionPlane, Document, FaceId, Line, Rect as ModelRect, RectEdge,
+    Circle, ConstructionPlane, Document, FaceId, Line,
 };
+
+/// A live drag-preview of the rectangle tool: its four world-space corners (bottom-left,
+/// bottom-right, top-right, top-left) and whether it's construction geometry. Rendered as a
+/// translucent quad + closed edge strokes; the committed rectangle is four plain `Line`s.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreviewRect {
+    pub corners: [Vec3; 4],
+    pub construction: bool,
+}
 use crate::hierarchy::ElementVisibility;
 use crate::dimensions::{
     dimension_arrow_wing_world, pixels_to_world_distance, LinearDimensionWorldGeom,
@@ -230,7 +239,7 @@ pub struct ViewportSceneInput<'a> {
     pub sketch_session: Option<SketchSession>,
     pub selection: &'a SceneSelection,
     pub element_visibility: &'a ElementVisibility,
-    pub preview_rect: Option<ModelRect>,
+    pub preview_rect: Option<PreviewRect>,
     pub preview_line: Option<Line>,
     pub preview_circle: Option<Circle>,
     /// In-progress extrusion (rendered as a translucent preview solid).
@@ -276,37 +285,6 @@ impl ViewportScene {
             sketch_dimmed,
             &input.palette,
         );
-
-        for (ri, rect) in input.doc.rects.iter().enumerate() {
-            if !rect_alive(input.doc, ri)
-                || !input
-                    .element_visibility
-                    .effective_visible(input.doc, SceneElement::Rect(ri))
-            {
-                continue;
-            }
-            let dim = input.sketch_session.is_some_and(|s| {
-                !sketch_rect_is_active(input.doc, s, ri, rect.sketch)
-            });
-            let element = SceneElement::Rect(ri);
-            mesh.set_index_layer(MeshIndexLayer::SketchFill);
-            mesh.push_rect_fill(
-                input.doc,
-                rect,
-                ri,
-                input.cam,
-                health_tint_color(
-                    sketch_color(input.palette.rect_line, dim),
-                    input.document_health.element_status(element.clone()),
-                ),
-                health_tint_color(
-                    sketch_color(input.palette.construction, dim),
-                    input.document_health.element_status(element),
-                ),
-                shape_fill_depth_bias_laned(ri, 0),
-            );
-            mesh.set_index_layer(MeshIndexLayer::Base);
-        }
 
         for (ci, circle) in input.doc.circles.iter().enumerate() {
             if !circle_alive(input.doc, ci)
@@ -538,34 +516,6 @@ impl ViewportScene {
         }
 
         mesh.set_index_layer(MeshIndexLayer::Overlay);
-        for (ri, rect) in input.doc.rects.iter().enumerate() {
-            if !rect_alive(input.doc, ri)
-                || !input
-                    .element_visibility
-                    .effective_visible(input.doc, SceneElement::Rect(ri))
-            {
-                continue;
-            }
-            let dim = input.sketch_session.is_some_and(|s| {
-                !sketch_rect_is_active(input.doc, s, ri, rect.sketch)
-            });
-            let element = SceneElement::Rect(ri);
-            mesh.push_rect_strokes(
-                input.doc,
-                rect,
-                input.cam,
-                input.viewport,
-                &vp,
-                health_tint_color(
-                    sketch_color(input.palette.rect_line, dim),
-                    input.document_health.element_status(element.clone()),
-                ),
-                health_tint_color(
-                    sketch_color(input.palette.construction, dim),
-                    input.document_health.element_status(element),
-                ),
-            );
-        }
         for (ci, circle) in input.doc.circles.iter().enumerate() {
             if !circle_alive(input.doc, ci)
                 || !input
@@ -632,16 +582,13 @@ impl ViewportScene {
         }
 
         if let Some(rect) = input.preview_rect.as_ref() {
-            mesh.push_rect(
-                input.doc,
+            mesh.push_preview_rect(
                 rect,
-                usize::MAX,
                 input.cam,
                 input.viewport,
                 &vp,
                 input.palette.preview,
                 input.palette.construction,
-                PREVIEW_FILL_DEPTH_BIAS,
             );
         }
         if let Some(line) = input.preview_line.as_ref() {
@@ -1183,75 +1130,38 @@ impl<'a> SceneMesh<'a> {
         );
     }
 
-    fn push_rect_fill(
+    /// Draw the rectangle tool's live drag-preview (translucent quad + closed edge strokes).
+    fn push_preview_rect(
         &mut self,
-        doc: &Document,
-        rect: &ModelRect,
-        _index: usize,
-        cam: &Camera,
-        solid: Color32,
-        construction: Color32,
-        fill_depth_bias: f32,
-    ) {
-        let Some(corners) = rect_world_corners(doc, rect) else {
-            return;
-        };
-        let Some(frame) = sketch_geometry_frame(doc, rect.sketch) else {
-            return;
-        };
-        let fill_corners =
-            offset_corners_toward_camera(corners, frame.normal, cam.eye(), fill_depth_bias);
-        let all_construction = rect.all_edges_construction();
-        let has_solid_edge = rect.construction_edges.iter().any(|&c| !c);
-        if all_construction {
-            self.push_quad_fill(
-                fill_corners,
-                fill_color(construction, CONSTRUCTION_FILL_OPACITY),
-            );
-        } else if has_solid_edge {
-            self.push_quad_fill(fill_corners, fill_color(solid, SOLID_FILL_OPACITY));
-        }
-    }
-
-    fn push_rect_strokes(
-        &mut self,
-        doc: &Document,
-        rect: &ModelRect,
+        preview: &PreviewRect,
         cam: &Camera,
         viewport: UiRect,
         view_proj: &Mat4,
         solid: Color32,
         construction: Color32,
     ) {
-        let all_construction = rect.all_edges_construction();
-        let has_solid_edge = rect.construction_edges.iter().any(|&c| !c);
-        if !all_construction && !has_solid_edge {
-            return;
-        }
-        for (edge_index, (a, b)) in rect_edge_segments(doc, rect).into_iter().enumerate() {
-            let edge = RectEdge::from_index(edge_index);
-            if rect.edge_construction(edge) {
-                self.push_dashed_line_segment(a, b, construction, 1.5, cam, viewport, view_proj);
+        let corners = preview.corners;
+        let normal = (corners[1] - corners[0])
+            .cross(corners[3] - corners[0])
+            .normalize_or_zero();
+        let fill_corners =
+            offset_corners_toward_camera(corners, normal, cam.eye(), PREVIEW_FILL_DEPTH_BIAS);
+        let stroke = if preview.construction { construction } else { solid };
+        let fill = if preview.construction {
+            fill_color(construction, CONSTRUCTION_FILL_OPACITY)
+        } else {
+            fill_color(solid, SOLID_FILL_OPACITY)
+        };
+        self.push_quad_fill(fill_corners, fill);
+        for (i, j) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+            if preview.construction {
+                self.push_dashed_line_segment(
+                    corners[i], corners[j], stroke, 1.5, cam, viewport, view_proj,
+                );
             } else {
-                self.push_line_segment(a, b, solid, 1.5, cam, viewport, view_proj);
+                self.push_line_segment(corners[i], corners[j], stroke, 1.5, cam, viewport, view_proj);
             }
         }
-    }
-
-    fn push_rect(
-        &mut self,
-        doc: &Document,
-        rect: &ModelRect,
-        index: usize,
-        cam: &Camera,
-        viewport: UiRect,
-        view_proj: &Mat4,
-        solid: Color32,
-        construction: Color32,
-        fill_depth_bias: f32,
-    ) {
-        self.push_rect_fill(doc, rect, index, cam, solid, construction, fill_depth_bias);
-        self.push_rect_strokes(doc, rect, cam, viewport, view_proj, solid, construction);
     }
 
     fn push_circle_fill(
@@ -1434,9 +1344,6 @@ impl<'a> SceneMesh<'a> {
         for (_, plane) in &dependents.planes {
             self.push_plane_outline(plane, preview_color, PREVIEW_STROKE, cam, viewport, view_proj);
         }
-        for corners in &dependents.rects {
-            self.push_quad_outline(*corners, preview_color, PREVIEW_STROKE, cam, viewport, view_proj);
-        }
         for &(a, b) in &dependents.lines {
             self.push_line_segment(a, b, preview_color, PREVIEW_STROKE, cam, viewport, view_proj);
         }
@@ -1487,46 +1394,6 @@ impl<'a> SceneMesh<'a> {
                                 );
                             } else {
                                 self.push_polyline_segment(&points, color, 3.0, cam, viewport, view_proj);
-                            }
-                        }
-                    }
-                }
-                SceneElement::RectEdge(index, edge) => {
-                    if !rect_alive(doc, index) {
-                        continue;
-                    }
-                    if let Some(rect) = doc.rects.get(index) {
-                        let segments = rect_edge_segments(doc, rect);
-                        let (a, b) = segments[edge.index()];
-                        if dashed {
-                            self.push_dashed_line_segment(
-                                a, b, color, 3.0, cam, viewport, view_proj,
-                            );
-                        } else {
-                            self.push_line_segment(a, b, color, 3.0, cam, viewport, view_proj);
-                        }
-                    }
-                }
-                SceneElement::Rect(index) => {
-                    if !rect_alive(doc, index) {
-                        continue;
-                    }
-                    if let Some(rect) = doc.rects.get(index) {
-                        for (edge_index, (a, b)) in
-                            rect_edge_segments(doc, rect).into_iter().enumerate()
-                        {
-                            let edge = RectEdge::from_index(edge_index);
-                            let stroke = if rect.edge_construction(edge) {
-                                color.gamma_multiply(0.85)
-                            } else {
-                                color
-                            };
-                            if dashed && rect.edge_construction(edge) {
-                                self.push_dashed_line_segment(
-                                    a, b, stroke, 3.0, cam, viewport, view_proj,
-                                );
-                            } else {
-                                self.push_line_segment(a, b, stroke, 3.0, cam, viewport, view_proj);
                             }
                         }
                     }
@@ -1655,22 +1522,6 @@ impl<'a> SceneMesh<'a> {
         let fill = color.gamma_multiply(fill_multiplier);
         let eye = cam.eye();
         match face {
-            FaceId::Rect(index) => {
-                if let Some(rect) = doc.rects.get(index) {
-                    if let (Some(corners), Some(frame)) =
-                        (rect_world_corners(doc, rect), sketch_geometry_frame(doc, rect.sketch))
-                    {
-                        let c = offset_corners_toward_camera(
-                            corners,
-                            frame.normal,
-                            eye,
-                            HOVER_FILL_DEPTH_BIAS,
-                        );
-                        self.push_triangle(c[0], c[1], c[2], fill);
-                        self.push_triangle(c[0], c[2], c[3], fill);
-                    }
-                }
-            }
             FaceId::Circle(index) => {
                 if let Some(circle) = doc.circles.get(index) {
                     if let Some(perimeter) =
@@ -1845,20 +1696,6 @@ impl<'a> SceneMesh<'a> {
         view_proj: &Mat4,
     ) {
         match face {
-            FaceId::Rect(index) => {
-                if let Some(rect) = doc.rects.get(index) {
-                    if let Some(corners) = rect_world_corners(doc, rect) {
-                        for (a, b) in [
-                            (corners[0], corners[1]),
-                            (corners[1], corners[2]),
-                            (corners[2], corners[3]),
-                            (corners[3], corners[0]),
-                        ] {
-                            self.push_line_segment(a, b, color, width, cam, viewport, view_proj);
-                        }
-                    }
-                }
-            }
             FaceId::Circle(index) => {
                 if let Some(circle) = doc.circles.get(index) {
                     if let Some(perimeter) =
@@ -1965,8 +1802,7 @@ impl<'a> SceneMesh<'a> {
                     self.push_segment_hover_ring(doc, circle, color, cam, viewport, view_proj);
                 }
             }
-            PickTargetKind::ShapeEdge { a, b, .. }
-            | PickTargetKind::PlaneEdge { a, b }
+            PickTargetKind::PlaneEdge { a, b }
             | PickTargetKind::BodyEdge { a, b, .. } => {
                 self.push_segment_hover(*a, *b, color, cam, viewport, view_proj, project);
             }
@@ -1974,30 +1810,6 @@ impl<'a> SceneMesh<'a> {
                 let (a, b) = global_axis_segment(*axis);
                 let axis_color = axis.color().gamma_multiply(1.25);
                 self.push_segment_hover(a, b, axis_color, cam, viewport, view_proj, project);
-            }
-            PickTargetKind::Rect(rect) => {
-                if let Some(corners) = rect_world_corners(doc, rect) {
-                    for (a, b) in [
-                        (corners[0], corners[1]),
-                        (corners[1], corners[2]),
-                        (corners[2], corners[3]),
-                        (corners[3], corners[0]),
-                    ] {
-                        self.push_line_segment(a, b, color, 3.0, cam, viewport, view_proj);
-                    }
-                    for corner in corners {
-                        push_screen_disc(
-                            self,
-                            corner,
-                            4.0,
-                            color,
-                            cam,
-                            viewport,
-                            view_proj,
-                            project,
-                        );
-                    }
-                }
             }
             PickTargetKind::ConstructionPlane(index) => {
                 if let Some(plane) = doc.construction_planes.get(*index) {
@@ -2810,21 +2622,6 @@ pub fn sketch_ground_color(color: Color32, in_sketch: bool) -> Color32 {
     }
 }
 
-fn sketch_rect_is_active(
-    doc: &Document,
-    session: SketchSession,
-    rect_index: usize,
-    rect_sketch: crate::model::SketchId,
-) -> bool {
-    if rect_sketch == session.sketch {
-        return true;
-    }
-    if let Some(FaceId::Rect(face_index)) = doc.sketch_face(session.sketch) {
-        return rect_index == face_index;
-    }
-    false
-}
-
 fn sketch_circle_is_active(
     doc: &Document,
     session: SketchSession,
@@ -2857,16 +2654,6 @@ fn line_world_polyline(doc: &Document, line: &Line) -> Option<Vec<Vec3>> {
             .map(|(u, v)| crate::face::local_to_world(&frame, u, v))
             .collect(),
     )
-}
-
-fn rect_edge_segments(doc: &Document, rect: &ModelRect) -> [(Vec3, Vec3); 4] {
-    let corners = rect_world_corners_resolved(doc, rect);
-    [
-        (corners[0], corners[1]),
-        (corners[1], corners[2]),
-        (corners[2], corners[3]),
-        (corners[3], corners[0]),
-    ]
 }
 
 fn world_t_at_screen_fraction(

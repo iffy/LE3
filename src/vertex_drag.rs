@@ -4,10 +4,9 @@ use crate::constraints::{
     constraint_evaluated_angle, constraint_evaluated_length, find_distance_constraint,
     solve_document_constraints_with_pins,
 };
-use crate::model::RectEdge;
 use crate::construction::point_sketch;
 use crate::geometric_constraints::{
-    line_direction_uv, line_uv_endpoints, point_uv, set_line_uv_endpoints, set_point_uv,
+    line_direction_uv, line_uv_endpoints, point_uv, set_point_uv,
     translate_line,
 };
 use crate::hierarchy::SceneElement;
@@ -31,7 +30,6 @@ pub fn point_in_sketch(doc: &Document, point: ConstraintPoint, sketch: SketchId)
 pub fn scene_element_for_point(point: ConstraintPoint) -> SceneElement {
     match point {
         ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(line),
-        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(rect),
         ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(circle),
         // A face's own vertex tracks the extrusion that produced its face, same convention
         // as `document_health`/`hierarchy`'s owner mappings for `FaceVertex`/`FaceEdge`.
@@ -44,7 +42,6 @@ pub fn scene_element_for_point(point: ConstraintPoint) -> SceneElement {
 pub fn scene_element_for_line(line: ConstraintLine) -> SceneElement {
     match line {
         ConstraintLine::Line(index) => SceneElement::Line(index),
-        ConstraintLine::RectEdge { rect, edge } => SceneElement::RectEdge(rect, edge),
         // A face's own edge (#26/#27) is itself a first-class selectable/constraint-authoring
         // target, so it wraps whole like `ConstraintPoint`/`SceneElement::Point` do — not the
         // extrusion-owner mapping other (dependency-tracking) call sites use.
@@ -64,13 +61,6 @@ pub fn line_drag_seed_points(line: ConstraintLine) -> Vec<ConstraintPoint> {
                 end: LineEnd::End,
             },
         ],
-        ConstraintLine::RectEdge { rect, edge } => {
-            let (c0, c1) = edge.corner_indices();
-            vec![
-                ConstraintPoint::RectCorner { rect, corner: c0 },
-                ConstraintPoint::RectCorner { rect, corner: c1 },
-            ]
-        }
         // A face's own edge is fixed (not draggable), so it has no seed points to drag.
         ConstraintLine::FaceEdge { .. } => Vec::new(),
     }
@@ -84,9 +74,6 @@ pub fn can_drag_point(doc: &Document, sketch: SketchId, point: ConstraintPoint) 
     if let ConstraintPoint::LineEndpoint { line, .. } = point {
         return !crate::sketch_solver::sketch_line_vertex_drag_blocked(doc, sketch, line)
             .unwrap_or(false);
-    }
-    if let ConstraintPoint::RectCorner { rect, .. } = point {
-        return !rect_corner_drag_blocked(doc, rect);
     }
     // A face's own vertex is fixed by the body's geometry, never draggable.
     if let ConstraintPoint::FaceVertex { .. } = point {
@@ -102,16 +89,6 @@ pub fn can_drag_line(doc: &Document, sketch: SketchId, target: ConstraintLine) -
             point_in_sketch(doc, line_drag_seed_points(target)[0].clone(), sketch)
                 && !crate::sketch_solver::sketch_line_vertex_drag_blocked(doc, sketch, line)
                     .unwrap_or(false)
-        }
-        ConstraintLine::RectEdge { rect, edge } => {
-            if !doc
-                .rects
-                .get(rect)
-                .is_some_and(|rect_entity| rect_entity.sketch == sketch)
-            {
-                return false;
-            }
-            !rect_edge_drag_blocked(doc, rect, edge)
         }
         // Fixed by the body's own geometry, never draggable.
         ConstraintLine::FaceEdge { .. } => false,
@@ -140,60 +117,15 @@ pub fn drag_line(
     current_uv: (f32, f32),
 ) -> Result<(), String> {
     validate_line_drag_target(doc, sketch, session.target.clone())?;
-    let mut du = current_uv.0 - session.anchor_uv.0;
-    let mut dv = current_uv.1 - session.anchor_uv.1;
-    if let ConstraintLine::RectEdge { rect, edge } = session.target {
-        let (locked_w, locked_h) = rect_locked_dimensions(doc, rect);
-        if locked_w.is_some() && matches!(edge, RectEdge::Left | RectEdge::Right) {
-            du = 0.0;
-        }
-        if locked_h.is_some() && matches!(edge, RectEdge::Bottom | RectEdge::Top) {
-            dv = 0.0;
-        }
-        // A corner of this edge coincident onto an axis-aligned reference line must stay on
-        // that line: lock the motion component that would pull it off (otherwise the drag pin
-        // silently breaks the coincident constraint and the rectangle distorts). See #42.
-        let (corner_a, corner_b) = edge.corner_indices();
-        for corner in [corner_a, corner_b] {
-            let point = ConstraintPoint::RectCorner { rect, corner };
-            let Some(line) = coincident_line_for_point(doc, point) else {
-                continue;
-            };
-            let Ok(((lx0, ly0), (lx1, ly1))) = line_uv_endpoints(doc, sketch, line) else {
-                continue;
-            };
-            let (ldx, ldy) = (lx1 - lx0, ly1 - ly0);
-            if ldx.abs() <= 1e-4 && ldy.abs() > 1e-4 {
-                du = 0.0; // vertical reference line -> corner's u is fixed
-            } else if ldy.abs() <= 1e-4 && ldx.abs() > 1e-4 {
-                dv = 0.0; // horizontal reference line -> corner's v is fixed
-            }
-        }
-    }
+    let du = current_uv.0 - session.anchor_uv.0;
+    let dv = current_uv.1 - session.anchor_uv.1;
     let seeds = line_drag_seed_points(session.target.clone());
-    if let ConstraintLine::RectEdge { .. } = session.target {
-        let start = seeds[0].clone();
-        let end = seeds[1].clone();
-        let (iu0, iv0) = session.initial_positions[&start];
-        let (iu1, iv1) = session.initial_positions[&end];
-        let (u0, v0) = project_drag_uv(doc, sketch, start, iu0 + du, iv0 + dv)?;
-        let (u1, v1) = project_drag_uv(doc, sketch, end, iu1 + du, iv1 + dv)?;
-        set_line_uv_endpoints(doc, sketch, session.target.clone(), (u0, v0), (u1, v1))?;
-        for (point, (iu, iv)) in &session.initial_positions {
-            if seeds.contains(point) || !point_in_sketch(doc, point.clone(), sketch) {
-                continue;
-            }
-            let (pu, pv) = project_drag_uv(doc, sketch, point.clone(), iu + du, iv + dv)?;
-            set_point_uv(doc, sketch, point.clone(), pu, pv)?;
+    translate_line(doc, sketch, session.target.clone(), du, dv)?;
+    for (point, (iu, iv)) in &session.initial_positions {
+        if seeds.contains(point) || !point_in_sketch(doc, point.clone(), sketch) {
+            continue;
         }
-    } else {
-        translate_line(doc, sketch, session.target.clone(), du, dv)?;
-        for (point, (iu, iv)) in &session.initial_positions {
-            if seeds.contains(point) || !point_in_sketch(doc, point.clone(), sketch) {
-                continue;
-            }
-            set_point_uv(doc, sketch, point.clone(), iu + du, iv + dv)?;
-        }
+        set_point_uv(doc, sketch, point.clone(), iu + du, iv + dv)?;
     }
     let pins: Vec<(ConstraintPoint, (f32, f32))> = session
         .initial_positions
@@ -221,15 +153,6 @@ fn validate_line_drag_target(
                 .ok_or_else(|| format!("Line {index} not found"))?;
             if line.sketch != sketch {
                 return Err(format!("Line {index} is not in sketch {sketch}"));
-            }
-        }
-        ConstraintLine::RectEdge { rect, edge: _ } => {
-            let rect_entity = doc
-                .rects
-                .get(rect)
-                .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-            if rect_entity.sketch != sketch {
-                return Err(format!("Rectangle {rect} is not in sketch {sketch}"));
             }
         }
         // Fixed by the body's own geometry — never a valid line-drag target.
@@ -263,7 +186,6 @@ fn collect_line_drag_positions(
 fn constraint_point_sort_key(point: ConstraintPoint) -> (u8, usize, u8, u8) {
     match point {
         ConstraintPoint::LineEndpoint { line, end } => (0, line, end as u8, 0),
-        ConstraintPoint::RectCorner { rect, corner } => (1, rect, corner, 0),
         ConstraintPoint::CircleCenter(circle) => (2, circle, 0, 0),
         ConstraintPoint::FaceVertex { index, .. } => (3, index, 0, 0),
     }
@@ -292,113 +214,6 @@ pub fn drag_point(
     let pins: Vec<(ConstraintPoint, (f32, f32))> =
         group.iter().map(|point| (point.clone(), (u, v))).collect();
     solve_document_constraints_with_pins(doc, &pins)
-}
-
-fn rect_locked_dimensions(doc: &Document, rect: usize) -> (Option<f32>, Option<f32>) {
-    let width = find_distance_constraint(doc, DistanceTarget::RectWidth(rect))
-        .and_then(|id| constraint_evaluated_length(doc, id))
-        .filter(|value| *value > 0.0);
-    let height = find_distance_constraint(doc, DistanceTarget::RectHeight(rect))
-        .and_then(|id| constraint_evaluated_length(doc, id))
-        .filter(|value| *value > 0.0);
-    (width, height)
-}
-
-fn rect_corner_drag_blocked(doc: &Document, rect: usize) -> bool {
-    let (locked_w, locked_h) = rect_locked_dimensions(doc, rect);
-    locked_w.is_some() && locked_h.is_some()
-}
-
-fn rect_edge_drag_blocked(doc: &Document, rect: usize, edge: RectEdge) -> bool {
-    let (locked_w, locked_h) = rect_locked_dimensions(doc, rect);
-    match (locked_w, locked_h) {
-        (Some(_), Some(_)) => true,
-        (Some(_), None) => matches!(edge, RectEdge::Left | RectEdge::Right),
-        (None, Some(_)) => matches!(edge, RectEdge::Bottom | RectEdge::Top),
-        (None, None) => false,
-    }
-}
-
-fn rect_corner_axis_locks(
-    entity: &crate::model::Rect,
-    corner: u8,
-    locked_w: Option<f32>,
-    locked_h: Option<f32>,
-) -> (Option<f32>, Option<f32>) {
-    let fixed_u = locked_w.map(|width| match corner {
-        0 | 3 => entity.x,
-        1 | 2 => entity.x + width,
-        _ => entity.x,
-    });
-    let fixed_v = locked_h.map(|height| match corner {
-        0 | 1 => entity.y,
-        2 | 3 => entity.y + height,
-        _ => entity.y,
-    });
-    (fixed_u, fixed_v)
-}
-
-fn project_rect_corner_drag(
-    doc: &Document,
-    rect: usize,
-    corner: u8,
-    u: f32,
-    v: f32,
-) -> Result<(f32, f32), String> {
-    let entity = doc
-        .rects
-        .get(rect)
-        .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-    let sketch = entity.sketch;
-    let (locked_w, locked_h) = rect_locked_dimensions(doc, rect);
-    let (fixed_u, fixed_v) = rect_corner_axis_locks(entity, corner, locked_w, locked_h);
-    let point = ConstraintPoint::RectCorner { rect, corner };
-
-    // A corner coincident onto a line must slide along that line, not pull off it (the drag
-    // pin would otherwise override and break the coincident constraint). See #42.
-    let (u, v) = match coincident_line_for_point(doc, point.clone()) {
-        Some(line) => project_point_onto_line_uv(doc, sketch, line, u, v)?,
-        None => (u, v),
-    };
-
-    let (pu, pv) = if let Some((pu, pv)) =
-        project_point_point_distance_drag(doc, sketch, point, u, v, fixed_u, fixed_v)?
-    {
-        (pu, pv)
-    } else {
-        (fixed_u.unwrap_or(u), fixed_v.unwrap_or(v))
-    };
-
-    // Keep the corner on its own side of the diagonal anchor so the rectangle cannot invert
-    // (which would relabel the corners and jump constrained geometry). This must run on the
-    // projected position because the drag pins the corner here, overriding `set_point_uv`.
-    Ok(clamp_rect_corner_to_anchor(entity, corner, pu, pv))
-}
-
-/// Clamp a rect corner's target so it stays on its side of the diagonally opposite corner.
-fn clamp_rect_corner_to_anchor(
-    entity: &crate::model::Rect,
-    corner: u8,
-    u: f32,
-    v: f32,
-) -> (f32, f32) {
-    const MIN_EXTENT: f32 = 1e-3;
-    let (anchor_u, anchor_v) = match corner {
-        0 => (entity.x + entity.w, entity.y + entity.h),
-        1 => (entity.x, entity.y + entity.h),
-        2 => (entity.x, entity.y),
-        3 => (entity.x + entity.w, entity.y),
-        _ => (entity.x, entity.y),
-    };
-    let cu = match corner {
-        0 | 3 => u.min(anchor_u - MIN_EXTENT),
-        _ => u.max(anchor_u + MIN_EXTENT),
-    };
-    let cv = match corner {
-        0 | 1 => v.min(anchor_v - MIN_EXTENT),
-        _ => v.max(anchor_v + MIN_EXTENT),
-    };
-    (cu, cv)
 }
 
 fn project_onto_distance_circle(
@@ -545,15 +360,10 @@ fn project_drag_uv(
 ) -> Result<(f32, f32), String> {
     // A point pinned to a line's midpoint or onto a line must not be draggable off it; project
     // the cursor onto the constrained position so the drag pin can't break the constraint.
-    if !matches!(dragged, ConstraintPoint::RectCorner { .. }) {
-        if let Some((pu, pv)) = project_onto_anchoring_constraint(doc, sketch, dragged.clone(), u, v)? {
-            return Ok((pu, pv));
-        }
+    if let Some((pu, pv)) = project_onto_anchoring_constraint(doc, sketch, dragged.clone(), u, v)? {
+        return Ok((pu, pv));
     }
     match dragged.clone() {
-        ConstraintPoint::RectCorner { rect, corner } => {
-            return project_rect_corner_drag(doc, rect, corner, u, v);
-        }
         ConstraintPoint::LineEndpoint { line: line_index, end } => {
             let line = ConstraintLine::Line(line_index);
             let mut projected_u = u;
@@ -650,26 +460,6 @@ fn project_onto_anchoring_constraint(
     Ok(None)
 }
 
-/// If `point` is constrained coincident onto a line (point-on-line), return that line.
-fn coincident_line_for_point(doc: &Document, point: ConstraintPoint) -> Option<ConstraintLine> {
-    for constraint in &doc.constraints {
-        if constraint.deleted {
-            continue;
-        }
-        if let ConstraintKind::Coincident { a, b } = &constraint.kind {
-            match (a, b) {
-                (ConstraintEntity::Point(p), ConstraintEntity::Line(l))
-                | (ConstraintEntity::Line(l), ConstraintEntity::Point(p))
-                    if *p == point =>
-                {
-                    return Some(l.clone());
-                }
-                _ => {}
-            }
-        }
-    }
-    None
-}
 
 /// Perpendicular foot of `(u, v)` on the infinite line through `line` (sketch units).
 fn project_point_onto_line_uv(

@@ -12,7 +12,7 @@ use crate::document_health::{DocumentHealth, HealthStatus};
 use crate::document_lifecycle::{element_alive, sketch_alive};
 use crate::model::{
     ConstraintEntity, ConstraintKind, ConstraintLine, ConstraintPoint, ConstructionPlaneParent,
-    DistanceTarget, Document, FaceId, RectEdge, ShapeKind, SketchId,
+    DistanceTarget, Document, FaceId, ShapeKind, SketchId,
 };
 use crate::names;
 use crate::selection::{additive_click_modifiers, SceneSelection};
@@ -33,7 +33,6 @@ pub enum HierarchyNode {
     Document,
     ConstructionPlane(usize),
     Sketch(SketchId),
-    Rect(usize),
     Line(usize),
     Circle(usize),
     Constraint(usize),
@@ -50,18 +49,16 @@ pub enum HierarchyNode {
 pub enum SceneElement {
     ConstructionPlane(usize),
     Sketch(SketchId),
-    Rect(usize),
     Line(usize),
     Circle(usize),
-    RectEdge(usize, RectEdge),
     Point(ConstraintPoint),
     Constraint(usize),
     Extrusion(usize),
     Body(usize),
     /// An edge of an extrusion-backed body face's own boundary loop (#26/#27), for
     /// constraint-authoring selection — mirrors `Point` wrapping the whole `ConstraintPoint`
-    /// enum; only ever constructed with `ConstraintLine::FaceEdge` (the `Line`/`RectEdge`
-    /// variants already have their own dedicated `SceneElement::Line`/`RectEdge`).
+    /// enum; only ever constructed with `ConstraintLine::FaceEdge` (the `Line`
+    /// variant already has its own dedicated `SceneElement::Line`).
     FaceEdge(ConstraintLine),
 }
 
@@ -73,7 +70,6 @@ pub fn scene_element_for_node(node: HierarchyNode) -> Option<SceneElement> {
         HierarchyNode::Document => return None,
         HierarchyNode::ConstructionPlane(i) => SceneElement::ConstructionPlane(i),
         HierarchyNode::Sketch(i) => SceneElement::Sketch(i),
-        HierarchyNode::Rect(i) => SceneElement::Rect(i),
         HierarchyNode::Line(i) => SceneElement::Line(i),
         HierarchyNode::Circle(i) => SceneElement::Circle(i),
         HierarchyNode::Constraint(i) => SceneElement::Constraint(i),
@@ -125,17 +121,11 @@ impl ElementVisibility {
             SceneElement::Sketch(sketch) => doc
                 .sketch_face(sketch)
                 .is_some_and(|face| self.effective_visible(doc, face_element(face))),
-            SceneElement::Rect(index) => doc.rects.get(index).is_some_and(|rect| {
-                self.effective_visible(doc, SceneElement::Sketch(rect.sketch))
-            }),
             SceneElement::Line(index) => doc.lines.get(index).is_some_and(|line| {
                 self.effective_visible(doc, SceneElement::Sketch(line.sketch))
             }),
             SceneElement::Circle(index) => doc.circles.get(index).is_some_and(|circle| {
                 self.effective_visible(doc, SceneElement::Sketch(circle.sketch))
-            }),
-            SceneElement::RectEdge(index, _) => doc.rects.get(index).is_some_and(|rect| {
-                self.effective_visible(doc, SceneElement::Sketch(rect.sketch))
             }),
             SceneElement::Point(point) => point_effective_visible(self, doc, point),
             SceneElement::Constraint(index) => doc.constraints.get(index).is_some_and(|c| {
@@ -155,7 +145,7 @@ impl ElementVisibility {
             SceneElement::FaceEdge(line) => {
                 let extrusion = match &line {
                     ConstraintLine::FaceEdge { face, .. } => face.extrusion_index(),
-                    ConstraintLine::Line(_) | ConstraintLine::RectEdge { .. } => None,
+                    ConstraintLine::Line(_) => None,
                 };
                 self.effective_visible(
                     doc,
@@ -175,9 +165,6 @@ fn point_effective_visible(
         ConstraintPoint::LineEndpoint { line, .. } => doc.lines.get(line).is_some_and(|entity| {
             visibility.effective_visible(doc, SceneElement::Sketch(entity.sketch))
         }),
-        ConstraintPoint::RectCorner { rect, .. } => doc.rects.get(rect).is_some_and(|entity| {
-            visibility.effective_visible(doc, SceneElement::Sketch(entity.sketch))
-        }),
         ConstraintPoint::CircleCenter(circle) => doc.circles.get(circle).is_some_and(|entity| {
             visibility.effective_visible(doc, SceneElement::Sketch(entity.sketch))
         }),
@@ -195,7 +182,6 @@ fn point_effective_visible(
 fn face_element(face: FaceId) -> SceneElement {
     match face {
         FaceId::ConstructionPlane(i) => SceneElement::ConstructionPlane(i),
-        FaceId::Rect(i) => SceneElement::Rect(i),
         FaceId::Circle(i) => SceneElement::Circle(i),
         // A polygon face is just a closed loop of existing lines (#66); its visibility
         // tracks its first constituent line.
@@ -516,7 +502,6 @@ impl GraphLayout {
 #[derive(Clone, Debug, Default)]
 struct CreationRanks {
     sketches: HashMap<SketchId, usize>,
-    rects: HashMap<usize, usize>,
     lines: HashMap<usize, usize>,
     circles: HashMap<usize, usize>,
     constraints: HashMap<usize, usize>,
@@ -529,7 +514,6 @@ fn build_creation_ranks(doc: &Document) -> CreationRanks {
     let mut ranks = CreationRanks::default();
     ranks.planes.insert(0, 0);
     let mut sketch_n = 0usize;
-    let mut rect_n = 0usize;
     let mut line_n = 0usize;
     let mut circle_n = 0usize;
     let mut constraint_n = 0usize;
@@ -541,10 +525,6 @@ fn build_creation_ranks(doc: &Document) -> CreationRanks {
             ShapeKind::Sketch => {
                 ranks.sketches.insert(sketch_n, rank);
                 sketch_n += 1;
-            }
-            ShapeKind::Rect => {
-                ranks.rects.insert(rect_n, rank);
-                rect_n += 1;
             }
             ShapeKind::Line => {
                 ranks.lines.insert(line_n, rank);
@@ -584,7 +564,6 @@ fn creation_rank(ranks: &CreationRanks, node: HierarchyNode) -> usize {
         HierarchyNode::Document => 0,
         HierarchyNode::ConstructionPlane(i) => *ranks.planes.get(&i).unwrap_or(&i),
         HierarchyNode::Sketch(i) => *ranks.sketches.get(&i).unwrap_or(&i),
-        HierarchyNode::Rect(i) => *ranks.rects.get(&i).unwrap_or(&i),
         HierarchyNode::Line(i) => *ranks.lines.get(&i).unwrap_or(&i),
         HierarchyNode::Circle(i) => *ranks.circles.get(&i).unwrap_or(&i),
         HierarchyNode::Constraint(i) => *ranks.constraints.get(&i).unwrap_or(&i),
@@ -716,10 +695,6 @@ fn parent_element(doc: &Document, element: SceneElement) -> Option<SceneElement>
         SceneElement::Sketch(sketch) => doc
             .sketch_face(sketch)
             .map(face_element),
-        SceneElement::Rect(index) => doc
-            .rects
-            .get(index)
-            .map(|rect| SceneElement::Sketch(rect.sketch)),
         SceneElement::Line(index) => doc
             .lines
             .get(index)
@@ -728,7 +703,6 @@ fn parent_element(doc: &Document, element: SceneElement) -> Option<SceneElement>
             .circles
             .get(index)
             .map(|circle| SceneElement::Sketch(circle.sketch)),
-        SceneElement::RectEdge(index, _) => Some(SceneElement::Rect(index)),
         SceneElement::Constraint(index) => doc
             .constraints
             .get(index)
@@ -759,7 +733,6 @@ fn point_parent_element(doc: &Document, point: ConstraintPoint) -> Option<SceneE
             .lines
             .get(line)
             .map(|_| SceneElement::Line(line)),
-        ConstraintPoint::RectCorner { rect, .. } => Some(SceneElement::Rect(rect)),
         ConstraintPoint::CircleCenter(circle) => Some(SceneElement::Circle(circle)),
         // A face's own vertex nests under the extrusion that produced its face.
         ConstraintPoint::FaceVertex { face, .. } => {
@@ -786,12 +759,6 @@ fn collect_descendants(doc: &Document, element: SceneElement, out: &mut HashSet<
             }
         }
         SceneElement::Sketch(sketch) => {
-            for (ri, rect) in doc.rects.iter().enumerate() {
-                if rect.sketch == sketch {
-                    out.insert(SceneElement::Rect(ri));
-                    collect_descendants(doc, SceneElement::Rect(ri), out);
-                }
-            }
             for (li, line) in doc.lines.iter().enumerate() {
                 if line.sketch == sketch {
                     out.insert(SceneElement::Line(li));
@@ -820,12 +787,6 @@ fn collect_descendants(doc: &Document, element: SceneElement, out: &mut HashSet<
                 }
             }
         }
-        SceneElement::Rect(index) => {
-            for sketch in doc.sketches_on_face(FaceId::Rect(index)) {
-                out.insert(SceneElement::Sketch(sketch));
-                collect_descendants(doc, SceneElement::Sketch(sketch), out);
-            }
-        }
         SceneElement::Circle(index) => {
             for sketch in doc.sketches_on_face(FaceId::Circle(index)) {
                 out.insert(SceneElement::Sketch(sketch));
@@ -851,7 +812,6 @@ fn collect_descendants(doc: &Document, element: SceneElement, out: &mut HashSet<
             }
         }
         SceneElement::Line(_)
-        | SceneElement::RectEdge(_, _)
         | SceneElement::Constraint(_)
         | SceneElement::Point(_)
         | SceneElement::Body(_)
@@ -860,25 +820,12 @@ fn collect_descendants(doc: &Document, element: SceneElement, out: &mut HashSet<
 }
 
 fn selection_anchor(element: &SceneElement) -> SceneElement {
-    match element {
-        SceneElement::RectEdge(index, _) => SceneElement::Rect(*index),
-        other => other.clone(),
-    }
+    element.clone()
 }
 
 fn distance_target_touches_element(target: &DistanceTarget, element: &SceneElement) -> bool {
     match (target, element) {
         (DistanceTarget::LineLength(i), SceneElement::Line(j)) => i == j,
-        (DistanceTarget::RectWidth(r) | DistanceTarget::RectHeight(r), SceneElement::Rect(i)) => {
-            r == i
-        }
-        (DistanceTarget::RectWidth(r), SceneElement::RectEdge(i, RectEdge::Bottom | RectEdge::Top)) => {
-            r == i
-        }
-        (
-            DistanceTarget::RectHeight(r),
-            SceneElement::RectEdge(i, RectEdge::Left | RectEdge::Right),
-        ) => r == i,
         (DistanceTarget::CircleDiameter(c), SceneElement::Circle(i)) => c == i,
         (DistanceTarget::LineLineDistance {
             line_a,
@@ -907,14 +854,6 @@ fn constraint_line_touches_element(line: &ConstraintLine, element: &SceneElement
             ConstraintLine::Line(i),
             SceneElement::Point(ConstraintPoint::LineEndpoint { line, .. }),
         ) => i == line,
-        (ConstraintLine::RectEdge { rect, edge }, SceneElement::RectEdge(r, e)) => {
-            rect == r && edge == e
-        }
-        (ConstraintLine::RectEdge { rect, .. }, SceneElement::Rect(r)) => rect == r,
-        (
-            ConstraintLine::RectEdge { rect, .. },
-            SceneElement::Point(ConstraintPoint::RectCorner { rect: r, .. }),
-        ) => rect == r,
         (ConstraintLine::FaceEdge { face, index }, SceneElement::Point(ConstraintPoint::FaceVertex {
             face: f,
             index: i,
@@ -928,8 +867,6 @@ fn constraint_point_touches_element(point: &ConstraintPoint, element: &SceneElem
     match (point, element) {
         (p, SceneElement::Point(q)) => p == q,
         (ConstraintPoint::LineEndpoint { line, .. }, SceneElement::Line(i)) => line == i,
-        (ConstraintPoint::RectCorner { rect, .. }, SceneElement::Rect(r)) => rect == r,
-        (ConstraintPoint::RectCorner { rect, .. }, SceneElement::RectEdge(r, _)) => rect == r,
         (ConstraintPoint::CircleCenter(c), SceneElement::Circle(i)) => c == i,
         _ => false,
     }
@@ -1041,7 +978,6 @@ const USES_VARIABLE_TEXT: Color32 = Color32::from_rgb(120, 215, 230);
 
 fn row_is_selected(element: &SceneElement, selection: &SceneSelection) -> bool {
     selection.is_selected(element.clone())
-        || matches!(element, SceneElement::Rect(index) if selection.has_rect_edge_selected(*index))
 }
 
 /// Only dim the list when a selected element is actually shown in it.
@@ -1124,7 +1060,6 @@ fn icon_for_hierarchy_node(doc: &Document, node: HierarchyNode) -> Option<IconId
         HierarchyNode::Document => return None,
         HierarchyNode::ConstructionPlane(_) => IconId::Plane,
         HierarchyNode::Sketch(_) => IconId::Sketch,
-        HierarchyNode::Rect(_) => IconId::Rectangle,
         HierarchyNode::Line(_) => IconId::Line,
         HierarchyNode::Circle(_) => IconId::Circle,
         HierarchyNode::Constraint(index) => doc
@@ -1208,16 +1143,6 @@ fn build_sketch_entry(
     let mut children = build_sketch_child_planes(doc, sketch, sketch_session);
 
     if sketch_session.is_some_and(|s| s.sketch == sketch) {
-        for (ri, rect) in doc.rects.iter().enumerate() {
-            if rect.deleted || rect.sketch != sketch {
-                continue;
-            }
-            let nested = build_face_sketches(doc, FaceId::Rect(ri), sketch_session);
-            children.push(HierarchyEntry {
-                node: HierarchyNode::Rect(ri),
-                children: nested,
-            });
-        }
         for (li, line) in doc.lines.iter().enumerate() {
             if line.deleted || line.sketch != sketch {
                 continue;
@@ -1270,18 +1195,6 @@ fn build_sketch_entry(
             });
         }
     } else {
-        for (ri, rect) in doc.rects.iter().enumerate() {
-            if rect.deleted || rect.sketch != sketch {
-                continue;
-            }
-            let nested = build_face_sketches(doc, FaceId::Rect(ri), sketch_session);
-            if !nested.is_empty() {
-                children.push(HierarchyEntry {
-                    node: HierarchyNode::Rect(ri),
-                    children: nested,
-                });
-            }
-        }
         for (ci, circle) in doc.circles.iter().enumerate() {
             if circle.deleted || circle.sketch != sketch {
                 continue;
@@ -1841,8 +1754,7 @@ fn show_row(
                     }
                 });
             }
-            HierarchyNode::Rect(_)
-            | HierarchyNode::Line(_)
+            HierarchyNode::Line(_)
             | HierarchyNode::Circle(_)
             | HierarchyNode::Constraint(_) => {
                 if response.clicked() {

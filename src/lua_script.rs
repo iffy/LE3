@@ -6,7 +6,7 @@ use crate::construction::PlaneDim;
 use crate::geometric_constraints::GeometricConstraintType;
 use crate::hierarchy::SceneElement;
 use crate::model::{
-    ConstraintLine, ConstraintPoint, DistanceTarget, ExtrusionEdgeRef, FaceId, LineEnd, RectEdge,
+    ConstraintLine, ConstraintPoint, DistanceTarget, ExtrusionEdgeRef, FaceId, LineEnd,
     SketchId, VertexTreatmentKind,
 };
 use crate::names::find_element_by_name;
@@ -78,7 +78,6 @@ fn element_kind_name(element: SceneElement) -> &'static str {
     match element {
         SceneElement::ConstructionPlane(_) => "construction_plane",
         SceneElement::Sketch(_) => "sketch",
-        SceneElement::Rect(_) | SceneElement::RectEdge(_, _) => "rect",
         SceneElement::Line(_) => "line",
         SceneElement::Circle(_) => "circle",
         SceneElement::Constraint(_) => "constraint",
@@ -93,13 +92,11 @@ fn element_index(element: SceneElement) -> usize {
     match element {
         SceneElement::ConstructionPlane(i)
         | SceneElement::Sketch(i)
-        | SceneElement::Rect(i)
         | SceneElement::Line(i)
         | SceneElement::Circle(i)
         | SceneElement::Constraint(i)
         | SceneElement::Extrusion(i)
         | SceneElement::Body(i) => i,
-        SceneElement::RectEdge(i, _) => i,
         SceneElement::Point(_) | SceneElement::FaceEdge(_) => 0,
     }
 }
@@ -110,7 +107,6 @@ pub fn scene_element_from_kind(kind: &str, index: usize) -> Option<SceneElement>
             Some(SceneElement::ConstructionPlane(index))
         }
         "sketch" => Some(SceneElement::Sketch(index)),
-        "rect" | "rectangle" => Some(SceneElement::Rect(index)),
         "line" => Some(SceneElement::Line(index)),
         "circle" => Some(SceneElement::Circle(index)),
         "constraint" => Some(SceneElement::Constraint(index)),
@@ -206,14 +202,8 @@ fn parse_element_table(lua: &Lua, table: Table) -> mlua::Result<SceneElement> {
         return Ok(SceneElement::Point(parse_constraint_point_table(table)?));
     }
     let index: usize = table.get("index")?;
-    if let Ok(edge_name) = table.get::<String>("edge") {
-        let edge = RectEdge::from_name(&edge_name).ok_or_else(|| {
-            mlua::Error::external(format!("unknown rect edge '{edge_name}'"))
-        })?;
-        return Ok(SceneElement::RectEdge(index, edge));
-    }
-    // Point-level selector (#68): a line endpoint (`end = "start"|"end"`), a rect corner
-    // (`corner = 0..3`), or an explicit `point = true` (e.g. a circle's center) — otherwise
+    // Point-level selector (#68): a line endpoint (`end = "start"|"end"`), or an explicit
+    // `point = true` (e.g. a circle's center) — otherwise
     // `kind`/`index` alone resolve to the whole element as before.
     if table.contains_key("end")?
         || table.contains_key("corner")?
@@ -241,7 +231,6 @@ fn parse_face_id_table(table: Table) -> mlua::Result<FaceId> {
                 .get("profile_index")
                 .or_else(|_| table.get("index"))?;
             let profile = match profile_kind.to_ascii_lowercase().as_str() {
-                "rect" | "rectangle" => crate::model::ExtrudeFace::Rect(profile_index),
                 "circle" => crate::model::ExtrudeFace::Circle(profile_index),
                 other => {
                     return Err(mlua::Error::external(format!(
@@ -279,9 +268,6 @@ fn parse_face_id_table(table: Table) -> mlua::Result<FaceId> {
 /// spec>}}` (#16/#62). Mirrors `extrude_face_spec_table`/`boolean_face_lua_table` in
 /// src/script.rs, which render this same shape back out for the recorded-script export.
 fn parse_extrude_face_table(table: &Table) -> mlua::Result<crate::model::ExtrudeFace> {
-    if let Some(i) = table.get::<Option<usize>>("rect")? {
-        return Ok(crate::model::ExtrudeFace::Rect(i));
-    }
     if let Some(i) = table.get::<Option<usize>>("circle")? {
         return Ok(crate::model::ExtrudeFace::Circle(i));
     }
@@ -292,7 +278,7 @@ fn parse_extrude_face_table(table: &Table) -> mlua::Result<crate::model::Extrude
         return parse_boolean_face_table(&boolean);
     }
     Err(mlua::Error::external(
-        "face spec requires one of rect/circle/polygon/boolean",
+        "face spec requires one of circle/polygon/boolean",
     ))
 }
 
@@ -330,15 +316,8 @@ fn parse_constraint_line_table(table: Table) -> mlua::Result<ConstraintLine> {
     let index: usize = table.get("index")?;
     match kind.to_ascii_lowercase().as_str() {
         "line" => Ok(ConstraintLine::Line(index)),
-        "rect" | "rectangle" => {
-            let edge_name: String = table.get("edge")?;
-            let edge = RectEdge::from_name(&edge_name).ok_or_else(|| {
-                mlua::Error::external(format!("unknown rect edge '{edge_name}'"))
-            })?;
-            Ok(ConstraintLine::RectEdge { rect: index, edge })
-        }
         other => Err(mlua::Error::external(format!(
-            "drag_line target must be line or rect, not '{other}'"
+            "drag_line target must be line, not '{other}'"
         ))),
     }
 }
@@ -367,10 +346,6 @@ fn parse_constraint_point_table(table: Table) -> mlua::Result<ConstraintPoint> {
                 }
             };
             Ok(ConstraintPoint::LineEndpoint { line: index, end })
-        }
-        "rect" | "rectangle" => {
-            let corner: u8 = table.get("corner")?;
-            Ok(ConstraintPoint::RectCorner { rect: index, corner })
         }
         "circle" => Ok(ConstraintPoint::CircleCenter(index)),
         other => Err(mlua::Error::external(format!(
@@ -418,16 +393,6 @@ fn parse_distance_target(table: Table) -> mlua::Result<DistanceTarget> {
     match kind.to_ascii_lowercase().as_str() {
         "line" => Ok(DistanceTarget::LineLength(index)),
         "circle" => Ok(DistanceTarget::CircleDiameter(index)),
-        "rect" | "rectangle" => {
-            let axis_name: String = table.get("axis")?;
-            let axis = RectAxis::from_name(&axis_name).ok_or_else(|| {
-                mlua::Error::external(format!("unknown rectangle axis '{axis_name}'"))
-            })?;
-            Ok(match axis {
-                RectAxis::Width => DistanceTarget::RectWidth(index),
-                RectAxis::Height => DistanceTarget::RectHeight(index),
-            })
-        }
         other => Err(mlua::Error::external(format!(
             "unknown constraint target '{other}'"
         ))),
@@ -1330,8 +1295,12 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
                     height,
                 })?;
             }
-            let element =
-                SceneElement::Rect(unsafe { tick.state().doc.rects.len().saturating_sub(1) });
+            // A rectangle is now four plain lines (#66 polygon); return a handle to its bottom
+            // edge (the first of the four lines just created).
+            let element = {
+                let n = unsafe { tick.state().doc.lines.len() };
+                SceneElement::Line(n.saturating_sub(4))
+            };
             apply_optional_name(lua, element, Some(opts))
         })?,
     )?;
@@ -1406,16 +1375,11 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, opts: Table| {
             let tick = lua.app_data_ref::<ScriptTickData>().unwrap();
             let distance: f32 = opts.get("distance")?;
-            // Faces: `rect`/`circle` (single) and/or `rects`/`circles` (arrays of indices).
+            // Faces: `circle` (single) and/or `circles` (array of indices), a `polygon` loop
+            // (#66 — a rectangle is four lines forming such a loop), or a `boolean` region.
             let mut faces: Vec<crate::model::ExtrudeFace> = Vec::new();
-            if let Some(i) = opts.get::<Option<usize>>("rect")? {
-                faces.push(crate::model::ExtrudeFace::Rect(i));
-            }
             if let Some(i) = opts.get::<Option<usize>>("circle")? {
                 faces.push(crate::model::ExtrudeFace::Circle(i));
-            }
-            if let Some(list) = opts.get::<Option<Vec<usize>>>("rects")? {
-                faces.extend(list.into_iter().map(crate::model::ExtrudeFace::Rect));
             }
             if let Some(list) = opts.get::<Option<Vec<usize>>>("circles")? {
                 faces.extend(list.into_iter().map(crate::model::ExtrudeFace::Circle));
@@ -1433,7 +1397,7 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
             }
             if faces.is_empty() {
                 return Err(mlua::Error::external(
-                    "extrude requires a `rect`/`circle`/`polygon`/`boolean` or `rects`/`circles` face list",
+                    "extrude requires a `circle`/`polygon`/`boolean` or `circles` face list",
                 ));
             }
             // `body = "merge"` joins the body of the face being extruded from (if any), and

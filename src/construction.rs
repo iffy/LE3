@@ -4,13 +4,13 @@
 //! (and optionally an angle around an axis).
 
 use crate::face::{
-    line_world_endpoints, line_world_polyline, rect_center_world, rect_world_corners, sketch_frame,
+    line_world_endpoints, line_world_polyline, sketch_frame,
     SketchFrame,
 };
 use crate::hierarchy::SceneElement;
 use crate::model::{
     ConstructionPlane, ConstructionPlaneParent, ConstraintPoint, Document, FaceId, Line, LineEnd,
-    PlaneAnchor, PlaneDefinition, Rect, RectEdge, SketchId,
+    PlaneAnchor, PlaneDefinition, SketchId,
 };
 use crate::value::{eval_length_mm, parse_length_or};
 use eframe::egui;
@@ -189,11 +189,6 @@ pub fn descendant_plane_indices(doc: &Document, root_plane: usize) -> Vec<usize>
                     faces.push(FaceId::ConstructionPlane(pi));
                 }
             }
-            for (ri, rect) in doc.rects.iter().enumerate() {
-                if rect.sketch == sketch {
-                    faces.push(FaceId::Rect(ri));
-                }
-            }
             for (ci, circle) in doc.circles.iter().enumerate() {
                 if circle.sketch == sketch {
                     faces.push(FaceId::Circle(ci));
@@ -222,11 +217,6 @@ pub fn descendant_faces(doc: &Document, root_plane: usize) -> Vec<FaceId> {
                     faces.push(FaceId::ConstructionPlane(pi));
                 }
             }
-            for (ri, rect) in doc.rects.iter().enumerate() {
-                if rect.sketch == sketch {
-                    faces.push(FaceId::Rect(ri));
-                }
-            }
             for (ci, circle) in doc.circles.iter().enumerate() {
                 if circle.sketch == sketch {
                     faces.push(FaceId::Circle(ci));
@@ -242,7 +232,6 @@ pub fn descendant_faces(doc: &Document, root_plane: usize) -> Vec<FaceId> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaneEditDependentPreview {
     pub planes: Vec<(usize, ConstructionPlane)>,
-    pub rects: Vec<[Vec3; 4]>,
     pub lines: Vec<(Vec3, Vec3)>,
 }
 
@@ -274,20 +263,8 @@ pub fn preview_plane_edit_dependents(
         }
     }
 
-    let mut rects = Vec::new();
     let mut lines = Vec::new();
     for sketch in sketches {
-        for rect in &doc.rects {
-            if rect.sketch != sketch {
-                continue;
-            }
-            let Some(corners) = rect_world_corners(doc, rect) else {
-                continue;
-            };
-            rects.push(corners.map(|corner| {
-                transform_point_between_frames(&old_frame, &new_frame, corner)
-            }));
-        }
         for line in &doc.lines {
             if line.sketch != sketch {
                 continue;
@@ -304,7 +281,6 @@ pub fn preview_plane_edit_dependents(
 
     Some(PlaneEditDependentPreview {
         planes,
-        rects,
         lines,
     })
 }
@@ -462,10 +438,6 @@ pub fn sketch_from_pick_target(doc: &Document, kind: PickTargetKind) -> Option<S
     match kind {
         PickTargetKind::Line(index) => doc.lines.get(index).map(|line| line.sketch),
         PickTargetKind::Circle(index) => doc.circles.get(index).map(|circle| circle.sketch),
-        PickTargetKind::ShapeEdge { rect_index, .. } => {
-            doc.rects.get(rect_index).map(|rect| rect.sketch)
-        }
-        PickTargetKind::Rect(rect) => Some(rect.sketch),
         PickTargetKind::ConstructionPlane(index) => doc.construction_planes.get(index).and_then(|plane| {
             match plane.parent {
                 ConstructionPlaneParent::Sketch(sketch) => Some(sketch),
@@ -483,7 +455,6 @@ pub fn sketch_from_pick_target(doc: &Document, kind: PickTargetKind) -> Option<S
 pub fn point_sketch(doc: &Document, point: ConstraintPoint) -> Option<SketchId> {
     match point {
         ConstraintPoint::LineEndpoint { line, .. } => doc.lines.get(line).map(|l| l.sketch),
-        ConstraintPoint::RectCorner { rect, .. } => doc.rects.get(rect).map(|r| r.sketch),
         ConstraintPoint::CircleCenter(circle) => doc.circles.get(circle).map(|c| c.sketch),
         // A face's own vertex has no owning sketch of its own — it's referenced *from*
         // whichever sketch a constraint projects it into, not owned by one.
@@ -891,13 +862,6 @@ pub enum PickTargetKind {
     Line(usize),
     /// A sketch circle (picked on its perimeter).
     Circle(usize),
-    /// One edge of a rectangle (or other 2D shape).
-    ShapeEdge {
-        rect_index: usize,
-        edge: RectEdge,
-        a: Vec3,
-        b: Vec3,
-    },
     /// One edge of a construction-plane quad.
     PlaneEdge {
         a: Vec3,
@@ -913,7 +877,6 @@ pub enum PickTargetKind {
         b: Vec3,
     },
     GlobalAxis(GlobalAxis),
-    Rect(Rect),
     ConstructionPlane(usize),
     Ground(Vec3),
 }
@@ -1012,28 +975,6 @@ pub fn resolve_pick_target(
         });
     }
 
-    if let Some((rect, dist)) = nearest_rect(screen, project, doc) {
-        let origin = rect_center_world(doc, &rect)
-            .or_else(|| ground_point)
-            .unwrap_or_else(|| rect_center_legacy(&rect));
-        let face = doc
-            .sketch_face(rect.sketch)
-            .unwrap_or(FaceId::ConstructionPlane(0));
-        let normal = crate::face::sketch_frame(doc, face)
-            .map(|f| f.normal)
-            .unwrap_or(Vec3::Z);
-        consider(PickTarget {
-            kind: PickTargetKind::Rect(rect),
-            reference: PlaneReference::Face {
-                origin,
-                normal,
-                label: "Rectangle face".to_string(),
-            },
-            distance_px: dist,
-            priority: 1,
-        });
-    }
-
     if let Some((a, b, dist)) = nearest_construction_plane_edge(screen, project, doc) {
         consider(PickTarget {
             kind: PickTargetKind::PlaneEdge { a, b },
@@ -1095,11 +1036,6 @@ pub fn scene_element_from_pick(kind: &PickTargetKind) -> Option<SceneElement> {
         PickTargetKind::Point(point) => Some(SceneElement::Point(point.clone())),
         PickTargetKind::Line(index) => Some(SceneElement::Line(*index)),
         PickTargetKind::Circle(index) => Some(SceneElement::Circle(*index)),
-        PickTargetKind::ShapeEdge {
-            rect_index,
-            edge,
-            ..
-        } => Some(SceneElement::RectEdge(*rect_index, *edge)),
         _ => None,
     }
 }
@@ -1131,9 +1067,6 @@ pub fn draw_pick_highlight(
                 draw_circle_highlight(painter, project, doc, circle, color);
             }
         }
-        PickTargetKind::ShapeEdge { a, b, .. } => {
-            draw_segment_highlight(painter, project, a, b, color);
-        }
         PickTargetKind::PlaneEdge { a, b } => {
             draw_segment_highlight(painter, project, a, b, color);
         }
@@ -1144,9 +1077,6 @@ pub fn draw_pick_highlight(
             let (a, b) = global_axis_segment(axis);
             let axis_color = axis.color().gamma_multiply(1.25);
             draw_segment_highlight(painter, project, a, b, axis_color);
-        }
-        PickTargetKind::Rect(rect) => {
-            draw_rect_highlight(painter, project, doc, &rect, color);
         }
         PickTargetKind::ConstructionPlane(index) => {
             if let Some(plane) = doc.construction_planes.get(index) {
@@ -1205,27 +1135,6 @@ fn draw_segment_highlight(
         painter.line_segment([pa, pb], egui::Stroke::new(4.0, color));
         for p in [pa, pb] {
             painter.circle_filled(p, 5.0, color);
-        }
-    }
-}
-
-fn draw_rect_highlight(
-    painter: &egui::Painter,
-    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
-    doc: &Document,
-    rect: &Rect,
-    color: egui::Color32,
-) {
-    let corners = rect_corners_world(doc, rect);
-    let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
-    let Some(pts) = pts else { return };
-    painter.add(egui::Shape::closed_line(
-        pts,
-        egui::Stroke::new(3.0, color),
-    ));
-    for p in corners {
-        if let Some(sp) = project(p) {
-            painter.circle_filled(sp, 4.0, color);
         }
     }
 }
@@ -1345,12 +1254,6 @@ fn dist_point_to_segment_px(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 
     (p - (a + ab * t)).length()
 }
 
-/// Edges of a rectangle as world-space segment pairs (bottom, right, top, left).
-pub fn rect_edge_segments(doc: &Document, rect: &Rect) -> [(Vec3, Vec3); 4] {
-    let c = rect_corners_world(doc, rect);
-    [(c[0], c[1]), (c[1], c[2]), (c[2], c[3]), (c[3], c[0])]
-}
-
 /// Edges of a construction-plane quad as world-space segment pairs.
 pub fn construction_plane_edge_segments(plane: &ConstructionPlane) -> [(Vec3, Vec3); 4] {
     let c = plane_corners(plane, PLANE_DISPLAY_HALF);
@@ -1393,11 +1296,6 @@ pub fn point_world_position(doc: &Document, point: ConstraintPoint) -> Option<Ve
                 LineEnd::End => (entity.x1, entity.y1),
             };
             Some(local_to_world(&frame, u, v))
-        }
-        ConstraintPoint::RectCorner { rect, corner } => {
-            let entity = doc.rects.get(rect)?;
-            let corners = rect_world_corners(doc, entity)?;
-            Some(corners[corner as usize])
         }
         ConstraintPoint::CircleCenter(circle) => {
             let entity = doc.circles.get(circle)?;
@@ -1453,22 +1351,6 @@ pub fn nearest_sketch_point_in_sketch(
             },
             b,
         );
-    }
-
-    for (ri, rect) in doc.rects.iter().enumerate() {
-        if rect.deleted || rect.sketch != sketch {
-            continue;
-        }
-        let corners = rect_corners_world(doc, rect);
-        for (corner, world) in corners.into_iter().enumerate() {
-            consider(
-                ConstraintPoint::RectCorner {
-                    rect: ri,
-                    corner: corner as u8,
-                },
-                world,
-            );
-        }
     }
 
     for (ci, circle) in doc.circles.iter().enumerate() {
@@ -1541,22 +1423,6 @@ pub fn nearest_sketch_line_in_sketch(
         }
     }
 
-    for (ri, rect) in doc.rects.iter().enumerate() {
-        if rect.deleted || rect.sketch != sketch {
-            continue;
-        }
-        for (edge_index, (a, b)) in rect_edge_segments(doc, rect).into_iter().enumerate() {
-            consider(
-                ConstraintLine::RectEdge {
-                    rect: ri,
-                    edge: RectEdge::from_index(edge_index),
-                },
-                a,
-                b,
-            );
-        }
-    }
-
     // Edges of the sketch's own body face (#26/#27), scoped exactly like the vertex loop in
     // `nearest_sketch_point_in_sketch` above. Vertices win over edges via the existing caller
     // precedence: callers already check `nearest_sketch_point_in_sketch` first and skip this
@@ -1624,22 +1490,6 @@ fn nearest_sketch_point(
         );
     }
 
-    for (ri, rect) in doc.rects.iter().enumerate() {
-        if rect.deleted {
-            continue;
-        }
-        let corners = rect_corners_world(doc, rect);
-        for (corner, world) in corners.into_iter().enumerate() {
-            consider(
-                ConstraintPoint::RectCorner {
-                    rect: ri,
-                    corner: corner as u8,
-                },
-                world,
-            );
-        }
-    }
-
     for (ci, circle) in doc.circles.iter().enumerate() {
         if circle.deleted {
             continue;
@@ -1677,25 +1527,6 @@ fn nearest_sketch_edge(
         };
         for pair in points.windows(2) {
             consider(PickTargetKind::Line(li), pair[0], pair[1], "Line");
-        }
-    }
-
-    for (ri, rect) in doc.rects.iter().enumerate() {
-        if rect.deleted {
-            continue;
-        }
-        for (edge_index, (a, b)) in rect_edge_segments(doc, rect).into_iter().enumerate() {
-            consider(
-                PickTargetKind::ShapeEdge {
-                    rect_index: ri,
-                    edge: RectEdge::from_index(edge_index),
-                    a,
-                    b,
-                },
-                a,
-                b,
-                "Rectangle edge",
-            );
         }
     }
 
@@ -1832,31 +1663,6 @@ fn nearest_global_axis(
     best
 }
 
-fn nearest_rect(
-    screen: egui::Pos2,
-    project: &impl Fn(Vec3) -> Option<egui::Pos2>,
-    doc: &Document,
-) -> Option<(Rect, f32)> {
-    let mut best: Option<(Rect, f32)> = None;
-    for rect in &doc.rects {
-        let corners = rect_corners_world(doc, rect);
-        let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
-        let Some(pts) = pts else { continue };
-        let quad = [pts[0], pts[1], pts[2], pts[3]];
-        let dist = if point_in_screen_quad(screen, quad) {
-            0.0
-        } else {
-            dist_point_to_quad_edges(screen, quad)
-        };
-        if dist <= FACE_PICK_MARGIN_PX {
-            if best.as_ref().is_none_or(|(_, d)| dist < *d) {
-                best = Some((rect.clone(), dist));
-            }
-        }
-    }
-    best
-}
-
 fn nearest_construction_plane(
     screen: egui::Pos2,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
@@ -1890,21 +1696,74 @@ fn dist_point_to_quad_edges(p: egui::Pos2, quad: [egui::Pos2; 4]) -> f32 {
         .fold(f32::MAX, f32::min)
 }
 
-fn rect_corners_world(doc: &Document, rect: &Rect) -> [Vec3; 4] {
-    rect_world_corners(doc, rect).unwrap_or_else(|| rect_corners_world_legacy(rect))
-}
-
-fn rect_corners_world_legacy(rect: &Rect) -> [Vec3; 4] {
-    [
-        Vec3::new(rect.x, rect.y, 0.0),
-        Vec3::new(rect.x + rect.w, rect.y, 0.0),
-        Vec3::new(rect.x + rect.w, rect.y + rect.h, 0.0),
-        Vec3::new(rect.x, rect.y + rect.h, 0.0),
-    ]
-}
-
-fn rect_center_legacy(rect: &Rect) -> Vec3 {
-    Vec3::new(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5, 0.0)
+/// Drop a rectangle as four plain `Line`s forming a closed loop (bottom → right → top →
+/// left), joined at their shared corners by `Coincident` constraints, with `Horizontal`
+/// constraints on the two horizontal edges and `Vertical` on the two vertical edges — so
+/// the loop stays a rectangle under solving. This is the geometry a rectangle *is* now
+/// (SPEC §5.3): the four lines are auto-recognised as a `Polygon` face (#66). Corner `i`
+/// is the shared endpoint of `lines[i-1].End`/`lines[i].Start` (wrapping), matching the old
+/// `RectEdge`/corner numbering (0=BL, 1=BR, 2=TR, 3=TL; edges bottom,right,top,left).
+///
+/// Returns the four line indices in edge order. Does **not** add width/height dimensions or
+/// solve — callers add `DistanceTarget::LineLength` dims and solve as needed.
+pub fn add_line_rectangle(
+    doc: &mut Document,
+    sketch: SketchId,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    construction_edges: [bool; 4],
+) -> [usize; 4] {
+    use crate::model::{
+        Constraint, ConstraintEntity, ConstraintKind, ConstraintLine, ShapeKind,
+    };
+    let corners = [
+        (x, y),
+        (x + w, y),
+        (x + w, y + h),
+        (x, y + h),
+    ];
+    let base = doc.lines.len();
+    for i in 0..4 {
+        let (u0, v0) = corners[i];
+        let (u1, v1) = corners[(i + 1) % 4];
+        let mut line = Line::from_local_endpoints(sketch, u0, v0, u1, v1);
+        line.construction = construction_edges[i];
+        doc.lines.push(line);
+        doc.shape_order.push(ShapeKind::Line);
+    }
+    let idx = [base, base + 1, base + 2, base + 3];
+    let mut push = |kind: ConstraintKind| {
+        doc.constraints.push(Constraint {
+            sketch,
+            kind,
+            expression: String::new(),
+            dim_offset: None,
+            name: None,
+            deleted: false,
+        });
+        doc.shape_order.push(ShapeKind::Constraint);
+    };
+    // Coincident: each line's End meets the next line's Start, closing the loop.
+    for i in 0..4 {
+        push(ConstraintKind::Coincident {
+            a: ConstraintEntity::Point(ConstraintPoint::LineEndpoint {
+                line: idx[i],
+                end: LineEnd::End,
+            }),
+            b: ConstraintEntity::Point(ConstraintPoint::LineEndpoint {
+                line: idx[(i + 1) % 4],
+                end: LineEnd::Start,
+            }),
+        });
+    }
+    // Horizontal on bottom (0) & top (2); Vertical on right (1) & left (3).
+    push(ConstraintKind::Horizontal { line: ConstraintLine::Line(idx[0]) });
+    push(ConstraintKind::Horizontal { line: ConstraintLine::Line(idx[2]) });
+    push(ConstraintKind::Vertical { line: ConstraintLine::Line(idx[1]) });
+    push(ConstraintKind::Vertical { line: ConstraintLine::Line(idx[3]) });
+    idx
 }
 
 #[cfg(test)]
@@ -2606,5 +2465,81 @@ mod tests {
 
         let child_origin_after = doc.construction_planes[1].origin.z;
         assert!((child_origin_after - child_origin_before - 15.0).abs() < 1e-3);
+    }
+
+    // ---- Rectangle-as-four-lines (#66) ----
+
+    #[test]
+    fn add_line_rectangle_drops_four_lines_and_hv_coincident_constraints() {
+        use crate::model::{ConstraintKind, ConstraintLine, Document, FaceId};
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        let lines = add_line_rectangle(&mut doc, sketch, 0.0, 0.0, 10.0, 5.0, [false; 4]);
+        // Four plain lines forming a closed loop (bottom, right, top, left).
+        assert_eq!(doc.lines.len(), 4);
+        assert_eq!(lines, [0, 1, 2, 3]);
+        let horizontal = doc
+            .constraints
+            .iter()
+            .filter(|c| matches!(c.kind, ConstraintKind::Horizontal { .. }))
+            .count();
+        let vertical = doc
+            .constraints
+            .iter()
+            .filter(|c| matches!(c.kind, ConstraintKind::Vertical { .. }))
+            .count();
+        let coincident = doc
+            .constraints
+            .iter()
+            .filter(|c| matches!(c.kind, ConstraintKind::Coincident { .. }))
+            .count();
+        assert_eq!(horizontal, 2, "bottom + top are horizontal");
+        assert_eq!(vertical, 2, "left + right are vertical");
+        assert_eq!(coincident, 4, "four shared corners join the loop");
+        // Horizontal is on the bottom (0) and top (2) edges.
+        assert!(doc.constraints.iter().any(|c| matches!(
+            &c.kind,
+            ConstraintKind::Horizontal { line: ConstraintLine::Line(0) }
+        )));
+        assert!(doc.constraints.iter().any(|c| matches!(
+            &c.kind,
+            ConstraintKind::Vertical { line: ConstraintLine::Line(1) }
+        )));
+    }
+
+    #[test]
+    fn add_line_rectangle_forms_a_recognized_polygon_face() {
+        use crate::model::{Document, FaceId};
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        add_line_rectangle(&mut doc, sketch, 0.0, 0.0, 10.0, 5.0, [false; 4]);
+        let loops = crate::polygon::closed_line_loops(&doc, sketch);
+        assert_eq!(loops.len(), 1, "the four lines are one closed loop");
+        let mut sorted = loops[0].clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn typed_width_height_drive_the_rectangle_under_solving() {
+        use crate::constraints::{add_distance_constraint, solve_document_constraints};
+        use crate::model::{DistanceTarget, Document, FaceId};
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        // Start off-size, then lock width (bottom edge) and height (right edge).
+        let lines = add_line_rectangle(&mut doc, sketch, 0.0, 0.0, 3.0, 3.0, [false; 4]);
+        add_distance_constraint(&mut doc, sketch, DistanceTarget::LineLength(lines[0]), "20mm".into())
+            .unwrap();
+        add_distance_constraint(&mut doc, sketch, DistanceTarget::LineLength(lines[1]), "8mm".into())
+            .unwrap();
+        solve_document_constraints(&mut doc).unwrap();
+        let loop_lines = crate::polygon::closed_line_loops(&doc, sketch);
+        let verts = crate::polygon::loop_vertices_uv(&doc, sketch, &loop_lines[0]).unwrap();
+        let min_u = verts.iter().map(|v| v.0).fold(f32::INFINITY, f32::min);
+        let max_u = verts.iter().map(|v| v.0).fold(f32::NEG_INFINITY, f32::max);
+        let min_v = verts.iter().map(|v| v.1).fold(f32::INFINITY, f32::min);
+        let max_v = verts.iter().map(|v| v.1).fold(f32::NEG_INFINITY, f32::max);
+        assert!((max_u - min_u - 20.0).abs() < 1e-2, "width solved to 20mm");
+        assert!((max_v - min_v - 8.0).abs() < 1e-2, "height solved to 8mm");
     }
 }

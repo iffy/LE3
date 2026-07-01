@@ -11,7 +11,7 @@ use crate::document_lifecycle::constraint_kind_applicable;
 use crate::geometric_constraints::point_uv;
 use crate::model::{
     ConstraintEntity, ConstraintKind, ConstraintLine, ConstraintPoint, DistanceTarget, Document,
-    LineEnd, RectEdge, SketchId,
+    LineEnd, SketchId,
 };
 use crate::value::{eval_angle_rad_in_doc, eval_length_mm_in_doc};
 use std::collections::{HashMap, HashSet};
@@ -185,18 +185,6 @@ impl SketchBridge {
             }
         }
 
-        let mut rect_corners: HashMap<usize, [(f64, f64); 4]> = HashMap::new();
-        for (point, (u_id, v_id)) in &self.point_vars {
-            if let ConstraintPoint::RectCorner { rect, corner } = point {
-                let entry = rect_corners.entry(*rect).or_insert([(0.0, 0.0); 4]);
-                entry[*corner as usize] =
-                    (self.system.value(*u_id), self.system.value(*v_id));
-            }
-        }
-        for (rect, corners) in rect_corners {
-            apply_rect_corners(doc, rect, corners)?;
-        }
-
         for (circle, radius_var) in &self.circle_radius {
             let center = ConstraintPoint::CircleCenter(*circle);
             if let Some((u_id, v_id)) = self.point_vars.get(&center) {
@@ -224,15 +212,6 @@ impl SketchBridge {
             }
             self.ensure_line_endpoint(doc, index, LineEnd::Start)?;
             self.ensure_line_endpoint(doc, index, LineEnd::End)?;
-        }
-        for (index, rect) in doc.rects.iter().enumerate() {
-            if rect.deleted || rect.sketch != self.sketch {
-                continue;
-            }
-            for corner in 0..4u8 {
-                self.ensure_rect_corner(doc, index, corner)?;
-            }
-            self.add_rect_rigidity(doc, index)?;
         }
         for (index, circle) in doc.circles.iter().enumerate() {
             if circle.deleted || circle.sketch != self.sketch {
@@ -263,52 +242,6 @@ impl SketchBridge {
         let (u, v) = point_uv(doc, self.sketch, point.clone())?;
         let (u_id, v_id) = self.system.add_point(u as f64, v as f64, false);
         self.point_vars.insert(point, (u_id, v_id));
-        Ok(())
-    }
-
-    fn ensure_rect_corner(&mut self, doc: &Document, rect: usize, corner: u8) -> Result<(), String> {
-        let point = ConstraintPoint::RectCorner { rect, corner };
-        if self.point_vars.contains_key(&point) {
-            return Ok(());
-        }
-        let (u, v) = point_uv(doc, self.sketch, point.clone())?;
-        let (u_id, v_id) = self.system.add_point(u as f64, v as f64, false);
-        self.point_vars.insert(point, (u_id, v_id));
-        Ok(())
-    }
-
-    /// A `Rect` is stored axis-aligned (x, y, w, h), so its four solver corners must stay a
-    /// rigid axis-aligned rectangle: bottom/top edges horizontal, left/right edges vertical.
-    /// Without this the corners drift independently — a corner moved by a constraint detaches
-    /// from the rest of the rectangle, and `apply_rect_corners`' bounding box collapses it.
-    fn add_rect_rigidity(&mut self, doc: &Document, rect: usize) -> Result<(), String> {
-        let corner_vars = |corner: u8| ConstraintPoint::RectCorner { rect, corner };
-        let (c0x, c0y) = self.point_vars(doc, corner_vars(0))?;
-        let (c1x, c1y) = self.point_vars(doc, corner_vars(1))?;
-        let (c2x, c2y) = self.point_vars(doc, corner_vars(2))?;
-        let (c3x, c3y) = self.point_vars(doc, corner_vars(3))?;
-        // Bottom and top edges horizontal.
-        self.system.add_equation(Equation::Horizontal {
-            y0: c0y,
-            y1: c1y,
-            weight: DEFAULT_WEIGHT,
-        });
-        self.system.add_equation(Equation::Horizontal {
-            y0: c3y,
-            y1: c2y,
-            weight: DEFAULT_WEIGHT,
-        });
-        // Left and right edges vertical.
-        self.system.add_equation(Equation::Vertical {
-            x0: c0x,
-            x1: c3x,
-            weight: DEFAULT_WEIGHT,
-        });
-        self.system.add_equation(Equation::Vertical {
-            x0: c1x,
-            x1: c2x,
-            weight: DEFAULT_WEIGHT,
-        });
         Ok(())
     }
 
@@ -503,71 +436,6 @@ impl SketchBridge {
                     weight: DEFAULT_WEIGHT,
                 });
             }
-            DistanceTarget::RectWidth(index) => {
-                self.anchor_point(
-                    doc,
-                    ConstraintPoint::RectCorner { rect: index, corner: 0 },
-                    REFERENCE_HOLD_WEIGHT,
-                )?;
-                let bottom = ConstraintLine::RectEdge {
-                    rect: index,
-                    edge: RectEdge::Bottom,
-                };
-                let left = ConstraintLine::RectEdge {
-                    rect: index,
-                    edge: RectEdge::Left,
-                };
-                let ((bx0, by0), (bx1, by1)) = self.line_vars(doc, bottom)?;
-                let ((lx0, _ly0), (lx1, _ly1)) = self.line_vars(doc, left)?;
-                self.system.add_equation(Equation::Horizontal {
-                    y0: by0,
-                    y1: by1,
-                    weight: DEFAULT_WEIGHT,
-                });
-                self.system.add_equation(Equation::Vertical {
-                    x0: lx0,
-                    x1: lx1,
-                    weight: DEFAULT_WEIGHT,
-                });
-                self.system.add_equation(Equation::LineLength {
-                    x0: bx0,
-                    y0: by0,
-                    x1: bx1,
-                    y1: by1,
-                    length: value,
-                    weight: DEFAULT_WEIGHT,
-                });
-            }
-            DistanceTarget::RectHeight(index) => {
-                self.anchor_point(
-                    doc,
-                    ConstraintPoint::RectCorner { rect: index, corner: 0 },
-                    REFERENCE_HOLD_WEIGHT,
-                )?;
-                self.anchor_point_v(
-                    doc,
-                    ConstraintPoint::RectCorner { rect: index, corner: 1 },
-                    REFERENCE_HOLD_WEIGHT,
-                )?;
-                let right = ConstraintLine::RectEdge {
-                    rect: index,
-                    edge: RectEdge::Right,
-                };
-                let ((rx0, ry0), (rx1, ry1)) = self.line_vars(doc, right)?;
-                self.system.add_equation(Equation::Vertical {
-                    x0: rx0,
-                    x1: rx1,
-                    weight: DEFAULT_WEIGHT,
-                });
-                self.system.add_equation(Equation::LineLength {
-                    x0: rx0,
-                    y0: ry0,
-                    x1: rx1,
-                    y1: ry1,
-                    length: value,
-                    weight: DEFAULT_WEIGHT,
-                });
-            }
             DistanceTarget::CircleDiameter(index) => {
                 self.anchor_point(doc, ConstraintPoint::CircleCenter(index), REFERENCE_HOLD_WEIGHT)?;
                 let radius = self
@@ -664,12 +532,6 @@ impl SketchBridge {
     fn anchor_point(&mut self, doc: &Document, point: ConstraintPoint, weight: f64) -> Result<(), String> {
         let (u, v) = self.point_vars(doc, point)?;
         self.hold_var(u, weight);
-        self.hold_var(v, weight);
-        Ok(())
-    }
-
-    fn anchor_point_v(&mut self, doc: &Document, point: ConstraintPoint, weight: f64) -> Result<(), String> {
-        let (_, v) = self.point_vars(doc, point)?;
         self.hold_var(v, weight);
         Ok(())
     }
@@ -826,12 +688,6 @@ impl SketchBridge {
                 )?;
                 Ok((start, end))
             }
-            ConstraintLine::RectEdge { rect, edge } => {
-                let (c0, c1) = edge.corner_indices();
-                let start = self.point_vars(doc, ConstraintPoint::RectCorner { rect, corner: c0 })?;
-                let end = self.point_vars(doc, ConstraintPoint::RectCorner { rect, corner: c1 })?;
-                Ok((start, end))
-            }
             // A face's own edge runs between two of its boundary loop's vertices (#26/#27);
             // each resolves (and lazily seeds, if new) through the same `FaceVertex` path above.
             ConstraintLine::FaceEdge { face, index } => {
@@ -968,13 +824,6 @@ fn line_endpoint_points(doc: &Document, line: ConstraintLine) -> Vec<ConstraintP
                 end: LineEnd::End,
             },
         ],
-        ConstraintLine::RectEdge { rect, edge } => {
-            let (c0, c1) = edge.corner_indices();
-            vec![
-                ConstraintPoint::RectCorner { rect, corner: c0 },
-                ConstraintPoint::RectCorner { rect, corner: c1 },
-            ]
-        }
         ConstraintLine::FaceEdge { face, index } => {
             let Some(boundary) = crate::extrude::face_boundary_loop_world(doc, &face) else {
                 return Vec::new();
@@ -1000,7 +849,6 @@ fn line_endpoint_points(doc: &Document, line: ConstraintLine) -> Vec<ConstraintP
 fn point_sketch(doc: &Document, point: ConstraintPoint) -> Option<SketchId> {
     match point {
         ConstraintPoint::LineEndpoint { line, .. } => doc.lines.get(line).map(|l| l.sketch),
-        ConstraintPoint::RectCorner { rect, .. } => doc.rects.get(rect).map(|r| r.sketch),
         ConstraintPoint::CircleCenter(circle) => doc.circles.get(circle).map(|c| c.sketch),
         // A face's own vertex has no owning sketch — it's referenced *from* whichever sketch a
         // constraint projects it into, not owned by one (mirrors `construction::point_sketch`).
@@ -1037,34 +885,6 @@ fn set_point_uv_from_solver(
     // it anyway) — every point this is actually called with (`LineEndpoint`/`RectCorner`/
     // `CircleCenter`) ignores it.
     crate::geometric_constraints::set_point_uv(doc, sketch, point, u as f32, v as f32)
-}
-
-fn apply_rect_corners(doc: &mut Document, rect: usize, corners: [(f64, f64); 4]) -> Result<(), String> {
-    let entity = doc
-        .rects
-        .get_mut(rect)
-        .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-    let min_u = corners
-        .iter()
-        .map(|(u, _)| *u as f32)
-        .fold(f32::INFINITY, f32::min);
-    let max_u = corners
-        .iter()
-        .map(|(u, _)| *u as f32)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let min_v = corners
-        .iter()
-        .map(|(_, v)| *v as f32)
-        .fold(f32::INFINITY, f32::min);
-    let max_v = corners
-        .iter()
-        .map(|(_, v)| *v as f32)
-        .fold(f32::NEG_INFINITY, f32::max);
-    entity.x = min_u;
-    entity.y = min_v;
-    entity.w = (max_u - min_u).max(1e-3);
-    entity.h = (max_v - min_v).max(1e-3);
-    Ok(())
 }
 
 #[cfg(test)]

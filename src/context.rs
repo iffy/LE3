@@ -4,7 +4,7 @@ use crate::actions::{ExtrudeBodyMode, Tool};
 use crate::document_health::{health_status_label, selection_frozen_summary, DocumentHealth, HealthStatus};
 use crate::geometric_constraints::{constraint_pane_rows, ConstraintPaneRow};
 use crate::hierarchy::SceneElement;
-use crate::model::{Document, RectEdge, SketchId};
+use crate::model::{Document, SketchId};
 use crate::names::{element_name, single_nameable_from_selection};
 use crate::selection::SceneSelection;
 use crate::icons::icon_for_constraint;
@@ -267,17 +267,7 @@ pub fn construction_targets_from_selection(selection: &SceneSelection) -> Vec<Sc
     let mut targets = Vec::new();
     for element in selection.iter() {
         match element {
-            SceneElement::Line(_)
-            | SceneElement::Circle(_)
-            | SceneElement::RectEdge(_, _) => targets.push(element),
-            SceneElement::Rect(index) => {
-                for edge_index in 0..4 {
-                    targets.push(SceneElement::RectEdge(
-                        index,
-                        RectEdge::from_index(edge_index),
-                    ));
-                }
-            }
+            SceneElement::Line(_) | SceneElement::Circle(_) => targets.push(element),
             _ => {}
         }
     }
@@ -290,17 +280,12 @@ fn scene_element_sort_key(element: SceneElement) -> (u8, usize, u8) {
     match element {
         SceneElement::Line(i) => (0, i, 0),
         SceneElement::Circle(i) => (1, i, 0),
-        SceneElement::RectEdge(i, edge) => (2, i, edge.index() as u8),
         _ => (2, 0, 0),
     }
 }
 
 pub fn edge_construction_for_element(doc: &Document, element: SceneElement) -> Option<bool> {
     match element {
-        SceneElement::RectEdge(index, edge) => doc
-            .rects
-            .get(index)
-            .map(|rect| rect.edge_construction(edge)),
         SceneElement::Line(index) => doc.lines.get(index).map(|line| line.construction),
         SceneElement::Circle(index) => doc.circles.get(index).map(|circle| circle.construction),
         _ => None,
@@ -351,14 +336,6 @@ pub fn set_edge_construction(
     construction: bool,
 ) -> Result<(), String> {
     match element {
-        SceneElement::RectEdge(index, edge) => {
-            let rect = doc
-                .rects
-                .get_mut(index)
-                .ok_or_else(|| format!("Rectangle {index} not found"))?;
-            rect.set_edge_construction(edge, construction);
-            Ok(())
-        }
         SceneElement::Line(index) => {
             let line = doc
                 .lines

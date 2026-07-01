@@ -8,10 +8,8 @@ use crate::value::format_length_display_in;
 /// Map a selected element to the object that owns a user-visible name.
 pub fn nameable_element(element: SceneElement) -> Option<SceneElement> {
     match element {
-        SceneElement::RectEdge(index, _) => Some(SceneElement::Rect(index)),
         SceneElement::ConstructionPlane(_)
         | SceneElement::Sketch(_)
-        | SceneElement::Rect(_)
         | SceneElement::Line(_)
         | SceneElement::Circle(_)
         | SceneElement::Constraint(_)
@@ -59,14 +57,6 @@ pub fn find_element_by_name(doc: &Document, name: &str) -> Option<SceneElement> 
             return Some(SceneElement::Line(index));
         }
     }
-    for (index, rect) in doc.rects.iter().enumerate() {
-        if rect.deleted {
-            continue;
-        }
-        if name_matches(rect.name.as_deref(), query) {
-            return Some(SceneElement::Rect(index));
-        }
-    }
     for (index, circle) in doc.circles.iter().enumerate() {
         if circle.deleted {
             continue;
@@ -98,13 +88,12 @@ pub fn element_name(doc: &Document, element: SceneElement) -> Option<&str> {
     let name = match element {
         SceneElement::ConstructionPlane(index) => doc.construction_planes.get(index)?.name.as_deref(),
         SceneElement::Sketch(index) => doc.sketches.get(index)?.name.as_deref(),
-        SceneElement::Rect(index) => doc.rects.get(index)?.name.as_deref(),
         SceneElement::Line(index) => doc.lines.get(index)?.name.as_deref(),
         SceneElement::Circle(index) => doc.circles.get(index)?.name.as_deref(),
         SceneElement::Constraint(index) => doc.constraints.get(index)?.name.as_deref(),
         SceneElement::Extrusion(index) => doc.extrusions.get(index)?.name.as_deref(),
         SceneElement::Body(index) => doc.bodies.get(index)?.name.as_deref(),
-        SceneElement::RectEdge(_, _) | SceneElement::Point(_) | SceneElement::FaceEdge(_) => None,
+        SceneElement::Point(_) | SceneElement::FaceEdge(_) => None,
     }?;
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -137,13 +126,6 @@ pub fn set_element_name(doc: &mut Document, element: SceneElement, name: String)
                 .get_mut(index)
                 .ok_or_else(|| format!("sketch {index} not found"))?;
             sketch.name = stored;
-        }
-        SceneElement::Rect(index) => {
-            let rect = doc
-                .rects
-                .get_mut(index)
-                .ok_or_else(|| format!("rectangle {index} not found"))?;
-            rect.name = stored;
         }
         SceneElement::Line(index) => {
             let line = doc
@@ -180,9 +162,6 @@ pub fn set_element_name(doc: &mut Document, element: SceneElement, name: String)
                 .ok_or_else(|| format!("body {index} not found"))?;
             body.name = stored;
         }
-        SceneElement::RectEdge(_, _) => {
-            return Err("rectangle edges cannot be renamed".to_string());
-        }
         SceneElement::Point(_) => {
             return Err("points cannot be renamed".to_string());
         }
@@ -206,15 +185,6 @@ pub fn default_node_label(doc: &Document, node: HierarchyNode) -> String {
             }
         }
         HierarchyNode::Sketch(i) => format!("Sketch {i}"),
-        HierarchyNode::Rect(i) => {
-            let rect = &doc.rects[i];
-            let unit = effective_length_unit(doc, rect.sketch);
-            format!(
-                "Rectangle {i} ({} × {})",
-                format_length_display_in(rect.w, unit),
-                format_length_display_in(rect.h, unit)
-            )
-        }
         HierarchyNode::Line(i) => {
             let line = &doc.lines[i];
             let len = line.length();

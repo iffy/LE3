@@ -32,12 +32,6 @@ impl SceneSelection {
         self.elements.clear();
     }
 
-    pub fn has_rect_edge_selected(&self, rect_index: usize) -> bool {
-        self.elements.iter().any(|element| {
-            matches!(element, SceneElement::RectEdge(index, _) if *index == rect_index)
-        })
-    }
-
     /// The sole selected element, if exactly one is selected.
     pub fn single(&self) -> Option<SceneElement> {
         let mut iter = self.iter();

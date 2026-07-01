@@ -2,7 +2,7 @@
 
 use crate::model::{
     Circle, ConstructionPlane, ConstructionPlaneParent, Document, FaceId, Line, PlaneAnchor,
-    PlaneDefinition, Rect, SketchId,
+    PlaneDefinition, SketchId,
 };
 use glam::Vec3;
 
@@ -52,18 +52,6 @@ pub fn sketch_frame(doc: &Document, face: FaceId) -> Option<SketchFrame> {
                 u_axis: plane.u_axis,
                 v_axis: plane.v_axis,
                 normal: plane.normal,
-            })
-        }
-        FaceId::Rect(i) => {
-            let rect = doc.rects.get(i)?;
-            let face = doc.sketch_face(rect.sketch)?;
-            let parent = sketch_frame(doc, face)?;
-            let origin = local_to_world(&parent, rect.x, rect.y);
-            Some(SketchFrame {
-                origin,
-                u_axis: parent.u_axis,
-                v_axis: parent.v_axis,
-                normal: parent.normal,
             })
         }
         FaceId::Circle(i) => {
@@ -360,34 +348,6 @@ pub fn sketch_view_up(
     up
 }
 
-pub fn rect_world_corners(doc: &Document, rect: &Rect) -> Option<[Vec3; 4]> {
-    let frame = sketch_geometry_frame(doc, rect.sketch)?;
-    Some(rect_world_corners_in_frame(&frame, rect))
-}
-
-pub fn rect_world_corners_in_frame(frame: &SketchFrame, rect: &Rect) -> [Vec3; 4] {
-    [
-        local_to_world(frame, rect.x, rect.y),
-        local_to_world(frame, rect.x + rect.w, rect.y),
-        local_to_world(frame, rect.x + rect.w, rect.y + rect.h),
-        local_to_world(frame, rect.x, rect.y + rect.h),
-    ]
-}
-
-/// Rectangle corners when the sketch frame is missing (legacy XY fallback).
-pub fn rect_world_corners_legacy(rect: &Rect) -> [Vec3; 4] {
-    [
-        Vec3::new(rect.x, rect.y, 0.0),
-        Vec3::new(rect.x + rect.w, rect.y, 0.0),
-        Vec3::new(rect.x + rect.w, rect.y + rect.h, 0.0),
-        Vec3::new(rect.x, rect.y + rect.h, 0.0),
-    ]
-}
-
-pub fn rect_world_corners_resolved(doc: &Document, rect: &Rect) -> [Vec3; 4] {
-    rect_world_corners(doc, rect).unwrap_or_else(|| rect_world_corners_legacy(rect))
-}
-
 pub fn line_world_endpoints(doc: &Document, line: &Line) -> Option<(Vec3, Vec3)> {
     let frame = sketch_geometry_frame(doc, line.sketch)?;
     Some((
@@ -409,14 +369,6 @@ pub fn line_world_polyline(doc: &Document, line: &Line) -> Option<Vec<Vec3>> {
     )
 }
 
-pub fn rect_center_world(doc: &Document, rect: &Rect) -> Option<Vec3> {
-    let frame = sketch_geometry_frame(doc, rect.sketch)?;
-    Some(local_to_world(
-        &frame,
-        rect.x + rect.w * 0.5,
-        rect.y + rect.h * 0.5,
-    ))
-}
 
 pub fn circle_world_center(doc: &Document, circle: &Circle) -> Option<Vec3> {
     let frame = sketch_geometry_frame(doc, circle.sketch)?;
@@ -524,14 +476,9 @@ fn extend_sketch_bounds(bounds: &mut Option<SketchZoomBounds>, u0: f32, v0: f32,
     });
 }
 
-/// Axis-aligned zoom bounds for all geometry in a sketch (rects, lines, and circles).
+/// Axis-aligned zoom bounds for all geometry in a sketch (lines and circles).
 fn sketch_local_bounds(doc: &Document, sketch: SketchId) -> Option<SketchZoomBounds> {
     let mut bounds = None;
-    for rect in &doc.rects {
-        if rect.sketch == sketch {
-            extend_sketch_bounds(&mut bounds, rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
-        }
-    }
     for line in &doc.lines {
         if line.sketch == sketch {
             extend_sketch_bounds(&mut bounds, line.x0, line.y0, line.x1, line.y1);
@@ -573,24 +520,6 @@ pub fn sketch_camera_target(doc: &Document, sketch: SketchId) -> Option<SketchCa
                     zoom: None,
                 })
             }
-        }
-        FaceId::Rect(i) => {
-            let rect = doc.rects.get(i)?;
-            let mut zoom = SketchZoomBounds::from_uv_rect(
-                rect.x,
-                rect.y,
-                rect.x + rect.w,
-                rect.y + rect.h,
-            );
-            if let Some(children) = sketch_local_bounds(doc, sketch) {
-                zoom = SketchZoomBounds::union(zoom, children);
-            }
-            let target = local_to_world(&frame, zoom.center_u, zoom.center_v);
-            Some(SketchCameraTarget {
-                target,
-                face_normal,
-                zoom: Some(zoom),
-            })
         }
         FaceId::Circle(i) => {
             let circle = doc.circles.get(i)?;
@@ -694,7 +623,6 @@ pub fn sketch_label(doc: &Document, sketch: SketchId) -> String {
 pub fn face_label(_doc: &Document, face: FaceId) -> String {
     match face {
         FaceId::ConstructionPlane(i) => format!("Construction plane {i}"),
-        FaceId::Rect(i) => format!("Rectangle face {i}"),
         FaceId::Circle(i) => format!("Circle face {i}"),
         FaceId::Polygon(lines) => format!("Polygon face ({} lines)", lines.len()),
         FaceId::ExtrudeCap {
@@ -774,14 +702,6 @@ pub fn pick_sketch_face(
 ) -> Option<FaceId> {
     let mut best: Option<(FaceId, f32, f32)> = None;
     let depth = |p: Vec3| (p - eye).length();
-
-    for (i, rect) in doc.rects.iter().enumerate().rev() {
-        if let Some(corners) = rect_world_corners(doc, rect) {
-            if let Some((dist, c)) = quad_face_pick_distance(screen, project, corners) {
-                consider_face_pick(&mut best, FaceId::Rect(i), dist, depth(c));
-            }
-        }
-    }
 
     for (i, circle) in doc.circles.iter().enumerate().rev() {
         if let Some((dist, c)) = circle_face_pick_distance(screen, doc, circle, project) {

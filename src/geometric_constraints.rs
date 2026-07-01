@@ -6,7 +6,7 @@
 use crate::hierarchy::SceneElement;
 use crate::model::{
     Constraint, ConstraintEntity, ConstraintKind, ConstraintLine, ConstraintPoint, Document,
-    LineEnd, RectEdge, SketchId,
+    LineEnd, SketchId,
 };
 use crate::selection::SceneSelection;
 use glam::Vec3;
@@ -293,10 +293,6 @@ pub fn selected_constraint_refs(selection: &SceneSelection) -> Vec<ConstraintRef
 pub fn scene_element_to_constraint_ref(element: SceneElement) -> Option<ConstraintRef> {
     match element {
         SceneElement::Line(index) => Some(ConstraintRef::Line(ConstraintLine::Line(index))),
-        SceneElement::RectEdge(rect, edge) => Some(ConstraintRef::Line(ConstraintLine::RectEdge {
-            rect,
-            edge,
-        })),
         SceneElement::Point(point) => Some(ConstraintRef::Point(point)),
         SceneElement::Circle(index) => Some(ConstraintRef::Circle(index)),
         // A face's own edge (#26/#27) — picked in the viewport via `SceneElement::FaceEdge`,
@@ -309,13 +305,9 @@ pub fn scene_element_to_constraint_ref(element: SceneElement) -> Option<Constrai
 fn constraint_ref_sort_key(reference: ConstraintRef) -> (u8, usize, u8, u8) {
     match reference {
         ConstraintRef::Line(ConstraintLine::Line(i)) => (0, i, 0, 0),
-        ConstraintRef::Line(ConstraintLine::RectEdge { rect, edge }) => {
-            (1, rect, edge.index() as u8, 0)
-        }
         ConstraintRef::Point(ConstraintPoint::LineEndpoint { line, end }) => {
             (2, line, end as u8, 0)
         }
-        ConstraintRef::Point(ConstraintPoint::RectCorner { rect, corner }) => (3, rect, corner, 0),
         ConstraintRef::Point(ConstraintPoint::CircleCenter(i)) => (4, i, 0, 0),
         ConstraintRef::Circle(i) => (5, i, 0, 0),
         ConstraintRef::Point(ConstraintPoint::FaceVertex { index, .. }) => (6, index, 0, 0),
@@ -525,15 +517,6 @@ fn validate_line_ref(doc: &Document, sketch: SketchId, line: &ConstraintLine) ->
                 return Err(format!("Line {index} is not in sketch {sketch}"));
             }
         }
-        ConstraintLine::RectEdge { rect, edge: _ } => {
-            let entity = doc
-                .rects
-                .get(*rect)
-                .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-            if entity.sketch != sketch {
-                return Err(format!("Rectangle {rect} is not in sketch {sketch}"));
-            }
-        }
         // A face's own edge has no owning sketch — it's valid for any sketch, as long as the
         // underlying extrusion/face still resolves (mirrors `ConstraintEntity::Origin`, which
         // is likewise valid regardless of `sketch`).
@@ -580,18 +563,6 @@ fn validate_point_ref(doc: &Document, sketch: SketchId, point: &ConstraintPoint)
                 return Err(format!("Line {line} is not in sketch {sketch}"));
             }
         }
-        ConstraintPoint::RectCorner { rect, corner } => {
-            if *corner > 3 {
-                return Err(format!("Invalid rect corner {corner}"));
-            }
-            let entity = doc
-                .rects
-                .get(*rect)
-                .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-            if entity.sketch != sketch {
-                return Err(format!("Rectangle {rect} is not in sketch {sketch}"));
-            }
-        }
         ConstraintPoint::CircleCenter(circle) => {
             let entity = doc
                 .circles
@@ -617,15 +588,7 @@ pub fn parallel_reference_and_movable(
     line_a: ConstraintLine,
     line_b: ConstraintLine,
 ) -> (ConstraintLine, ConstraintLine) {
-    match (line_a, line_b) {
-        (reference @ ConstraintLine::RectEdge { .. }, movable @ ConstraintLine::Line(_)) => {
-            (reference, movable)
-        }
-        (movable @ ConstraintLine::Line(_), reference @ ConstraintLine::RectEdge { .. }) => {
-            (reference, movable)
-        }
-        (line_a, line_b) => (line_a, line_b),
-    }
+    (line_a, line_b)
 }
 
 /// Prefer moving free line/circle points over rectangle corners, which reshape the rect.
@@ -647,7 +610,6 @@ pub fn coincident_mover_and_anchor(
 fn coincident_point_mobility(point: &ConstraintPoint) -> u8 {
     match point {
         ConstraintPoint::LineEndpoint { .. } | ConstraintPoint::CircleCenter(_) => 2,
-        ConstraintPoint::RectCorner { .. } => 1,
         // Fixed by the body's own geometry: never the mover, so it always ranks below every
         // draggable sketch-native point (mirrors `ConstraintEntity::Origin`'s fixed treatment).
         ConstraintPoint::FaceVertex { .. } => 0,
@@ -704,29 +666,6 @@ pub fn line_uv_endpoints(
                 .get(index)
                 .ok_or_else(|| format!("Line {index} not found"))?;
             Ok(((entity.x0, entity.y0), (entity.x1, entity.y1)))
-        }
-        ConstraintLine::RectEdge { rect, edge } => {
-            let entity = doc
-                .rects
-                .get(rect)
-                .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-            let (u0, v0, u1, v1) = match edge {
-                RectEdge::Bottom => (entity.x, entity.y, entity.x + entity.w, entity.y),
-                RectEdge::Right => (
-                    entity.x + entity.w,
-                    entity.y,
-                    entity.x + entity.w,
-                    entity.y + entity.h,
-                ),
-                RectEdge::Top => (
-                    entity.x + entity.w,
-                    entity.y + entity.h,
-                    entity.x,
-                    entity.y + entity.h,
-                ),
-                RectEdge::Left => (entity.x, entity.y + entity.h, entity.x, entity.y),
-            };
-            Ok(((u0, v0), (u1, v1)))
         }
         // A face's own edge has no stored local coordinate: it's a body-space 3D segment
         // resolved from the extrusion's analytic boundary and projected into `sketch`'s frame.
@@ -787,36 +726,6 @@ pub fn set_line_uv_endpoints(
             entity.y1 = end.1;
             Ok(())
         }
-        ConstraintLine::RectEdge { rect, edge } => {
-            let entity = doc
-                .rects
-                .get_mut(rect)
-                .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-            let corners = [
-                (entity.x, entity.y),
-                (entity.x + entity.w, entity.y),
-                (entity.x + entity.w, entity.y + entity.h),
-                (entity.x, entity.y + entity.h),
-            ];
-            let (c0, c1) = match edge {
-                RectEdge::Bottom => (0, 1),
-                RectEdge::Right => (1, 2),
-                RectEdge::Top => (2, 3),
-                RectEdge::Left => (3, 0),
-            };
-            let mut next = corners;
-            next[c0] = start;
-            next[c1] = end;
-            let min_u = next.iter().map(|(x, _)| *x).fold(f32::INFINITY, f32::min);
-            let max_u = next.iter().map(|(x, _)| *x).fold(f32::NEG_INFINITY, f32::max);
-            let min_v = next.iter().map(|(_, y)| *y).fold(f32::INFINITY, f32::min);
-            let max_v = next.iter().map(|(_, y)| *y).fold(f32::NEG_INFINITY, f32::max);
-            entity.x = min_u;
-            entity.y = min_v;
-            entity.w = (max_u - min_u).max(1e-3);
-            entity.h = (max_v - min_v).max(1e-3);
-            Ok(())
-        }
         // Fixed by the body's own geometry, not by the sketch — mirrors how
         // `ConstraintEntity::Origin` is treated as a fixed, undraggable reference.
         ConstraintLine::FaceEdge { .. } => Err("Face edges are fixed and cannot be moved".to_string()),
@@ -833,19 +742,6 @@ pub fn point_uv(doc: &Document, sketch: SketchId, point: ConstraintPoint) -> Res
             Ok(match end {
                 LineEnd::Start => (entity.x0, entity.y0),
                 LineEnd::End => (entity.x1, entity.y1),
-            })
-        }
-        ConstraintPoint::RectCorner { rect, corner } => {
-            let entity = doc
-                .rects
-                .get(rect)
-                .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-            Ok(match corner {
-                0 => (entity.x, entity.y),
-                1 => (entity.x + entity.w, entity.y),
-                2 => (entity.x + entity.w, entity.y + entity.h),
-                3 => (entity.x, entity.y + entity.h),
-                _ => return Err(format!("Invalid rect corner {corner}")),
             })
         }
         ConstraintPoint::CircleCenter(circle) => {
@@ -894,39 +790,6 @@ pub fn set_point_uv(
                     entity.y1 = v;
                 }
             }
-            Ok(())
-        }
-        ConstraintPoint::RectCorner { rect, corner } => {
-            let entity = doc
-                .rects
-                .get_mut(rect)
-                .ok_or_else(|| format!("Rectangle {rect} not found"))?;
-            // A rect corner drag pivots about the diagonally opposite corner, which stays
-            // fixed. The two adjacent corners are derived from the edges this corner moves,
-            // so they must not anchor the new extents (doing so pins the rect and lets it
-            // only grow, never shrink). Corners 0/3 are on the min-u (left) side and 1/2 on
-            // the max-u (right) side; 0/1 are min-v (bottom) and 2/3 max-v (top). Clamp so
-            // the dragged corner cannot cross the anchor and invert the rectangle.
-            const MIN_EXTENT: f32 = 1e-3;
-            let (anchor_u, anchor_v) = match corner {
-                0 => (entity.x + entity.w, entity.y + entity.h),
-                1 => (entity.x, entity.y + entity.h),
-                2 => (entity.x, entity.y),
-                3 => (entity.x + entity.w, entity.y),
-                _ => return Err(format!("Invalid rect corner {corner}")),
-            };
-            let (min_u, max_u) = match corner {
-                0 | 3 => (u.min(anchor_u - MIN_EXTENT), anchor_u),
-                _ => (anchor_u, u.max(anchor_u + MIN_EXTENT)),
-            };
-            let (min_v, max_v) = match corner {
-                0 | 1 => (v.min(anchor_v - MIN_EXTENT), anchor_v),
-                _ => (anchor_v, v.max(anchor_v + MIN_EXTENT)),
-            };
-            entity.x = min_u;
-            entity.y = min_v;
-            entity.w = max_u - min_u;
-            entity.h = max_v - min_v;
             Ok(())
         }
         ConstraintPoint::CircleCenter(circle) => {

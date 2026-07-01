@@ -71,12 +71,6 @@ pub enum ElementSnapshot {
         x1: f32,
         y1: f32,
     },
-    Rect {
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-    },
     Circle {
         cx: f32,
         cy: f32,
@@ -159,9 +153,6 @@ pub fn selection_frozen_summary(
 fn scene_element_for_distance_target(target: &DistanceTarget) -> SceneElement {
     match target {
         DistanceTarget::LineLength(index) => SceneElement::Line(*index),
-        DistanceTarget::RectWidth(index) | DistanceTarget::RectHeight(index) => {
-            SceneElement::Rect(*index)
-        }
         DistanceTarget::CircleDiameter(index) => SceneElement::Circle(*index),
         DistanceTarget::LineLineDistance { line_a, .. } => scene_element_for_line(line_a),
         DistanceTarget::PointPointDistance { anchor, .. } => scene_element_for_point(anchor),
@@ -172,7 +163,6 @@ fn scene_element_for_distance_target(target: &DistanceTarget) -> SceneElement {
 fn scene_element_for_line(line: &ConstraintLine) -> SceneElement {
     match line {
         ConstraintLine::Line(index) => SceneElement::Line(*index),
-        ConstraintLine::RectEdge { rect, .. } => SceneElement::Rect(*rect),
         // A face's own edge depends on the extrusion that produced the face — same
         // relationship `hierarchy::face_element` tracks for sketches placed on a body face.
         ConstraintLine::FaceEdge { face, .. } => scene_element_for_face(face),
@@ -182,7 +172,6 @@ fn scene_element_for_line(line: &ConstraintLine) -> SceneElement {
 fn scene_element_for_point(point: &ConstraintPoint) -> SceneElement {
     match point {
         ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(*line),
-        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(*rect),
         ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(*circle),
         ConstraintPoint::FaceVertex { face, .. } => scene_element_for_face(face),
     }
@@ -295,7 +284,6 @@ pub fn recompute_document_health(doc: &Document) -> DocumentHealth {
 fn geometry_elements_for_line(line: &ConstraintLine) -> Vec<SceneElement> {
     match line {
         ConstraintLine::Line(index) => vec![SceneElement::Line(*index)],
-        ConstraintLine::RectEdge { rect, edge } => vec![SceneElement::RectEdge(*rect, *edge)],
         // A face's own edge isn't owned by anything markable-unstable in the usual sense (it
         // can't move); surface it via the extrusion instead, same as `scene_element_for_line`.
         ConstraintLine::FaceEdge { face, .. } => vec![scene_element_for_face(face)],
@@ -479,7 +467,6 @@ fn geometry_elements_for_entity(entity: &ConstraintEntity) -> Vec<SceneElement> 
 fn point_owner_element(point: &ConstraintPoint) -> SceneElement {
     match point {
         ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(*line),
-        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(*rect),
         ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(*circle),
         ConstraintPoint::FaceVertex { face, .. } => scene_element_for_face(face),
     }
@@ -627,22 +614,10 @@ fn capture_geometry_snapshot(doc: &Document, element: SceneElement) -> Option<El
             x1: line.x1,
             y1: line.y1,
         }),
-        SceneElement::Rect(index) => doc.rects.get(index).map(|rect| ElementSnapshot::Rect {
-            x: rect.x,
-            y: rect.y,
-            w: rect.w,
-            h: rect.h,
-        }),
         SceneElement::Circle(index) => doc.circles.get(index).map(|circle| ElementSnapshot::Circle {
             cx: circle.cx,
             cy: circle.cy,
             r: circle.r,
-        }),
-        SceneElement::RectEdge(index, _) => doc.rects.get(index).map(|rect| ElementSnapshot::Rect {
-            x: rect.x,
-            y: rect.y,
-            w: rect.w,
-            h: rect.h,
         }),
         _ => None,
     }

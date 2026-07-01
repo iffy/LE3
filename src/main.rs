@@ -84,11 +84,11 @@ use construction::{
     nearest_sketch_line_in_sketch, nearest_sketch_point_in_sketch, offset_from_normal_drag,
     offset_gizmo_hit, offset_handle,
     parent_from_pick_target, plane_corners, point_world_position, preview_plane_edit_dependents,
-    rect_edge_segments, resolve_pick_target, scene_element_from_pick, AxisGizmoDrag,
+    resolve_pick_target, scene_element_from_pick, AxisGizmoDrag,
     AxisGizmoHit, PlaneDim, PlaneReference, AXIS_GIZMO_HANDLE_HIT_RADIUS_PX, PLANE_DISPLAY_HALF,
 };
 use document_health::{health_tint_color, DocumentHealth, HealthStatus};
-use document_lifecycle::{circle_alive, constraint_alive, line_alive, rect_alive};
+use document_lifecycle::{circle_alive, constraint_alive, line_alive};
 use constraints::{
     angle_constraint_display, angle_dimension_hover_sign, angle_rad_from_sketch_hit,
     constraint_evaluated_angle, default_angle_expression, AngleConstraintDisplay,
@@ -105,12 +105,12 @@ use dimensions::{
 };
 use face::{
     circle_world_diameter_endpoints, circle_world_perimeter,
-    line_world_polyline, pick_sketch_face, rect_world_corners, sketch_frame,
+    line_world_polyline, pick_sketch_face, sketch_frame,
     sketch_geometry_frame, sketch_label, world_to_local,
 };
 use model::SketchId;
 use model::{
-    Circle, ConstraintKind, ConstraintPoint, DistanceTarget, FaceId, Line, Rect, RectEdge,
+    Circle, ConstraintKind, ConstraintPoint, DistanceTarget, FaceId, Line,
 };
 use eframe::egui;
 use native_menu::{MenuCommand, NativeMenu};
@@ -2308,13 +2308,20 @@ fn build_viewport_scene_input<'a>(
         let end = cr.end_point(&frame, doc);
         let (ou, ov) = world_to_local(&frame, cr.origin);
         let (eu, ev) = world_to_local(&frame, end);
-        let mut preview = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
-        if cr.construction {
-            for edge_index in 0..4 {
-                preview.set_edge_construction(RectEdge::from_index(edge_index), true);
-            }
-        }
-        Some(preview)
+        let x = ou.min(eu);
+        let y = ov.min(ev);
+        let xr = ou.max(eu);
+        let yt = ov.max(ev);
+        let corners = [
+            crate::face::local_to_world(&frame, x, y),
+            crate::face::local_to_world(&frame, xr, y),
+            crate::face::local_to_world(&frame, xr, yt),
+            crate::face::local_to_world(&frame, x, yt),
+        ];
+        Some(gpu_viewport::PreviewRect {
+            corners,
+            construction: cr.construction,
+        })
     });
     let preview_line = creating_line.and_then(|cl| {
         let session = sketch_session?;
@@ -3213,19 +3220,6 @@ fn build_committed_dim_layouts(
                 let (ub, vb) = world_to_local(&frame, b);
                 preferred_outward_uv(ua, va, ub, vb)
             }
-            DistanceTarget::RectWidth(i) | DistanceTarget::RectHeight(i) => {
-                let Some(rect) = doc.rects.get(i) else {
-                    continue;
-                };
-                let Some(corners) = rect_world_corners(doc, rect) else {
-                    continue;
-                };
-                let interior = corners.iter().fold(Vec3::ZERO, |acc, c| acc + *c) / 4.0;
-                let (iu, iv) = world_to_local(&frame, interior);
-                let (ua, va) = world_to_local(&frame, a);
-                let (ub, vb) = world_to_local(&frame, b);
-                outward_perpendicular_uv(ua, va, ub, vb, iu, iv)
-            }
             DistanceTarget::CircleDiameter(_) => unreachable!("handled above"),
             DistanceTarget::LineLineDistance { .. }
             | DistanceTarget::PointPointDistance { .. }
@@ -3592,7 +3586,6 @@ fn pick_extrude_face(
     vp: &glam::Mat4,
 ) -> Option<model::ExtrudeFace> {
     let base = match pick_sketch_face(pp, project, doc, eye)? {
-        FaceId::Rect(i) => model::ExtrudeFace::Rect(i),
         FaceId::Circle(i) => model::ExtrudeFace::Circle(i),
         FaceId::Polygon(lines) => model::ExtrudeFace::Polygon(lines),
         FaceId::ConstructionPlane(_) | FaceId::ExtrudeCap { .. } | FaceId::ExtrudeSide { .. } => {
@@ -3743,9 +3736,6 @@ fn pick_extrude_target(
         t
     } else {
         match pick_sketch_face(pp, project, doc, eye)? {
-            FaceId::Rect(i) if !exclude.contains(&model::ExtrudeFace::Rect(i)) => {
-                ExtrudeTarget::Face(model::ExtrudeFace::Rect(i))
-            }
             FaceId::Circle(i) if !exclude.contains(&model::ExtrudeFace::Circle(i)) => {
                 ExtrudeTarget::Face(model::ExtrudeFace::Circle(i))
             }
@@ -4339,13 +4329,6 @@ fn draw_face_highlight(
                 draw_quad_face_highlight(painter, project, corners, color);
             }
         }
-        FaceId::Rect(i) => {
-            if let Some(rect) = doc.rects.get(i) {
-                if let Some(corners) = rect_world_corners(doc, rect) {
-                    draw_quad_face_highlight(painter, project, corners, color);
-                }
-            }
-        }
         FaceId::Circle(i) => {
             if let Some(circle) = doc.circles.get(i) {
                 draw_circle_face_highlight(painter, project, doc, circle, color);
@@ -4913,8 +4896,7 @@ impl App {
                         let end = cr.end_point(&frame, &self.state.doc);
                         let (ou, ov) = world_to_local(&frame, cr.origin);
                         let (eu, ev) = world_to_local(&frame, end);
-                        let preview = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
-                        let corners = rect_world_corners(&self.state.doc, &preview).unwrap();
+                        let corners = preview_rect_world_corners(&frame, ou, ov, eu, ev);
                         let dim_layouts = rectangle_dim_layout_from_corners(
                             &project,
                             corners,
@@ -5643,17 +5625,6 @@ impl App {
 
             let visibility = &self.state.element_visibility;
             let health = &self.state.document_health;
-            for (ri, r) in doc.rects.iter().enumerate() {
-                if !rect_alive(doc, ri)
-                    || !visibility.effective_visible(doc, SceneElement::Rect(ri))
-                {
-                    continue;
-                }
-                let dim = sketch_session
-                    .is_some_and(|s| !sketch_rect_is_active(doc, s, ri, r.sketch));
-                let element_health = health.element_status(SceneElement::Rect(ri));
-                draw_rect_edges(&painter, &project, doc, r, dim, element_health);
-            }
             for (li, line) in doc.lines.iter().enumerate() {
                 if !line_alive(doc, li)
                     || !visibility.effective_visible(doc, SceneElement::Line(li))
@@ -5982,21 +5953,18 @@ impl App {
                     let end = cr.end_point(&frame, &self.state.doc);
                     let (ou, ov) = world_to_local(&frame, cr.origin);
                     let (eu, ev) = world_to_local(&frame, end);
-                    let mut preview = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
+                    let corners = preview_rect_world_corners(&frame, ou, ov, eu, ev);
                     if cr.construction {
-                        for edge_index in 0..4 {
-                            preview.set_edge_construction(RectEdge::from_index(edge_index), true);
-                        }
                         draw_rect_edges(
                             &painter,
                             &project,
-                            &self.state.doc,
-                            &preview,
+                            corners,
+                            true,
                             false,
                             HealthStatus::Healthy,
                         );
                     } else {
-                        draw_rect(&painter, &project, &self.state.doc, &preview, col::PREVIEW, false);
+                        draw_rect(&painter, &project, corners, col::PREVIEW, false);
                     }
                 }
                 let anchor_color = if cr.construction {
@@ -6105,9 +6073,6 @@ impl App {
                                 false,
                             );
                         }
-                        for corners in &dependent.rects {
-                            draw_world_quad(&painter, &project, *corners, col::PREVIEW, false);
-                        }
                         for &(a, b) in &dependent.lines {
                             draw_world_segment(&painter, &project, a, b, col::PREVIEW, 2.0);
                         }
@@ -6168,8 +6133,7 @@ impl App {
             let end = cr.end_point(&frame, &self.state.doc);
             let (ou, ov) = world_to_local(&frame, cr.origin);
             let (eu, ev) = world_to_local(&frame, end);
-            let preview = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
-            let corners = rect_world_corners(&self.state.doc, &preview).unwrap();
+            let corners = preview_rect_world_corners(&frame, ou, ov, eu, ev);
             if let Some((width_layout, height_layout)) = rectangle_dim_layout_from_corners(
                 &project,
                 corners,
@@ -6997,50 +6961,58 @@ fn draw_circle_edges(
     }
 }
 
+/// World-space corners of a rectangle-tool drag preview (BL, BR, TR, TL) from its two
+/// local placed corners, in the sketch frame.
+fn preview_rect_world_corners(
+    frame: &face::SketchFrame,
+    ou: f32,
+    ov: f32,
+    eu: f32,
+    ev: f32,
+) -> [Vec3; 4] {
+    let x = ou.min(eu);
+    let y = ov.min(ev);
+    let xr = ou.max(eu);
+    let yt = ov.max(ev);
+    [
+        face::local_to_world(frame, x, y),
+        face::local_to_world(frame, xr, y),
+        face::local_to_world(frame, xr, yt),
+        face::local_to_world(frame, x, yt),
+    ]
+}
+
+/// Draw a rectangle preview's four edges (dashed when construction) in the egui-painter path.
 fn draw_rect_edges(
     painter: &egui::Painter,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
-    doc: &model::Document,
-    r: &Rect,
+    corners: [Vec3; 4],
+    construction: bool,
     dim: bool,
     health: HealthStatus,
 ) {
-    let Some(corners) = rect_world_corners(doc, r) else {
-        return;
-    };
     let solid_color = health_tint_color(sketch_color(col::RECT_LINE, dim), health);
     let construction_color = health_tint_color(sketch_color(col::CONSTRUCTION, dim), health);
-    let all_construction = r.all_edges_construction();
-    let has_solid_edge = r.construction_edges.iter().any(|&c| !c);
-
-    if all_construction {
-        let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
-        if let Some(pts) = pts {
+    if construction {
+        if let Some(pts) = corners
+            .iter()
+            .map(|&c| project(c))
+            .collect::<Option<Vec<egui::Pos2>>>()
+        {
             painter.add(egui::Shape::convex_polygon(
-                pts.clone(),
+                pts,
                 construction_color.gamma_multiply(0.18),
                 egui::Stroke::NONE,
             ));
         }
-    } else if has_solid_edge && r.has_mixed_edge_construction() {
-        let pts: Option<Vec<egui::Pos2>> = corners.iter().map(|&c| project(c)).collect();
-        if let Some(pts) = pts {
-            painter.add(egui::Shape::convex_polygon(
-                pts,
-                solid_color.gamma_multiply(0.25),
-                egui::Stroke::NONE,
-            ));
-        }
-    } else if has_solid_edge {
+    } else {
         draw_world_quad(painter, project, corners, solid_color, true);
     }
-
-    for (edge_index, (a, b)) in rect_edge_segments(doc, r).into_iter().enumerate() {
-        let edge = RectEdge::from_index(edge_index);
-        if r.edge_construction(edge) {
-            draw_world_segment_dashed(painter, project, a, b, construction_color, 1.5);
+    for (i, j) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+        if construction {
+            draw_world_segment_dashed(painter, project, corners[i], corners[j], construction_color, 1.5);
         } else {
-            draw_world_segment(painter, project, a, b, solid_color, 1.5);
+            draw_world_segment(painter, project, corners[i], corners[j], solid_color, 1.5);
         }
     }
 }
@@ -7070,42 +7042,6 @@ fn draw_scene_selection_highlights(
                         draw_construction_line_segment(painter, project, doc, line, color, width);
                     } else {
                         draw_line_segment(painter, project, doc, line, color, width);
-                    }
-                }
-            }
-            SceneElement::RectEdge(index, edge) => {
-                if !rect_alive(doc, index) {
-                    continue;
-                }
-                if let Some(rect) = doc.rects.get(index) {
-                    let segments = rect_edge_segments(doc, rect);
-                    let (a, b) = segments[edge.index()];
-                    if dashed {
-                        draw_world_segment_dashed(painter, project, a, b, color, width);
-                    } else {
-                        draw_world_segment(painter, project, a, b, color, width);
-                    }
-                }
-            }
-            SceneElement::Rect(index) => {
-                if !rect_alive(doc, index) {
-                    continue;
-                }
-                if let Some(rect) = doc.rects.get(index) {
-                    for (edge_index, (a, b)) in
-                        rect_edge_segments(doc, rect).into_iter().enumerate()
-                    {
-                        let edge = RectEdge::from_index(edge_index);
-                        let stroke = if rect.edge_construction(edge) {
-                            color.gamma_multiply(0.85)
-                        } else {
-                            color
-                        };
-                        if dashed && rect.edge_construction(edge) {
-                            draw_world_segment_dashed(painter, project, a, b, stroke, width);
-                        } else {
-                            draw_world_segment(painter, project, a, b, stroke, width);
-                        }
                     }
                 }
             }
@@ -7299,14 +7235,10 @@ fn draw_construction_plane(
 fn draw_rect(
     painter: &egui::Painter,
     project: &impl Fn(Vec3) -> Option<egui::Pos2>,
-    doc: &model::Document,
-    r: &Rect,
+    corners: [Vec3; 4],
     color: egui::Color32,
     fill: bool,
 ) {
-    let Some(corners) = rect_world_corners(doc, &r) else {
-        return;
-    };
     draw_world_quad(painter, project, corners, color, fill);
 }
 
@@ -7367,21 +7299,6 @@ fn sketch_color(color: egui::Color32, dim: bool) -> egui::Color32 {
     } else {
         color
     }
-}
-
-fn sketch_rect_is_active(
-    doc: &model::Document,
-    session: SketchSession,
-    rect_index: usize,
-    rect_sketch: SketchId,
-) -> bool {
-    if rect_sketch == session.sketch {
-        return true;
-    }
-    if let Some(FaceId::Rect(face_index)) = doc.sketch_face(session.sketch) {
-        return rect_index == face_index;
-    }
-    false
 }
 
 fn sketch_circle_is_active(

@@ -42,7 +42,7 @@ use crate::model::{
     independent_corner_handle, smooth_joint_bezier, vertex_treatment_geometry, Circle,
     ConstraintEntity, ConstraintLine, ConstraintKind, ConstructionPlane, ConstraintPoint,
     DimensionTarget, DistanceTarget, Document, EdgeTreatment, ExtrudeFace, Extrusion,
-    ExtrusionEdgeRef, FaceId, Line, LineEnd, Rect, RectEdge, ShapeKind, VertexTreatmentKind,
+    ExtrusionEdgeRef, FaceId, Line, LineEnd, ShapeKind, VertexTreatmentKind,
 };
 use crate::vertex_drag;
 use crate::face::SketchFrame;
@@ -836,21 +836,10 @@ pub fn dim_label_target_in_sketch(
     sketch: SketchId,
     axis: DimLabelAxis,
 ) -> Option<DimLabelTarget> {
+    // Rectangle width/height are now ordinary line-length dimensions (#66); only the
+    // `Length` axis resolves to a committed dimension.
     let target = match axis {
-        DimLabelAxis::Width => doc
-            .rects
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, r)| r.sketch == sketch)
-            .map(|(index, _)| DistanceTarget::RectWidth(index)),
-        DimLabelAxis::Height => doc
-            .rects
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, r)| r.sketch == sketch)
-            .map(|(index, _)| DistanceTarget::RectHeight(index)),
+        DimLabelAxis::Width | DimLabelAxis::Height => None,
         DimLabelAxis::Length => doc
             .lines
             .iter()
@@ -864,27 +853,6 @@ pub fn dim_label_target_in_sketch(
 
 /// A committed sketch dimension label the user can reposition.
 pub type DimLabelTarget = ConstraintId;
-
-/// Whether a constraint edit applies to a rectangle axis.
-pub fn constraint_matches_rect_axis(doc: &Document, target: DimLabelTarget, axis: RectAxis) -> bool {
-    let Some(constraint) = doc.constraints.get(target) else {
-        return false;
-    };
-    matches!(
-        (&constraint.kind, axis),
-        (
-            crate::model::ConstraintKind::Distance {
-                target: DistanceTarget::RectWidth(_)
-            },
-            RectAxis::Width
-        ) | (
-            crate::model::ConstraintKind::Distance {
-                target: DistanceTarget::RectHeight(_)
-            },
-            RectAxis::Height
-        )
-    )
-}
 
 pub fn constraint_is_line_length(doc: &Document, target: DimLabelTarget) -> bool {
     doc.constraints.get(target).is_some_and(|c| {
@@ -915,11 +883,7 @@ pub fn constraint_is_angle(doc: &Document, target: DimLabelTarget) -> bool {
 }
 
 pub fn dim_label_axis_for_target(doc: &Document, target: DimLabelTarget) -> Option<DimLabelAxis> {
-    if constraint_matches_rect_axis(doc, target, RectAxis::Width) {
-        Some(DimLabelAxis::Width)
-    } else if constraint_matches_rect_axis(doc, target, RectAxis::Height) {
-        Some(DimLabelAxis::Height)
-    } else if constraint_is_line_length(doc, target) {
+    if constraint_is_line_length(doc, target) {
         Some(DimLabelAxis::Length)
     } else {
         None
@@ -1426,7 +1390,6 @@ pub const DEFAULT_EXTRUDE_DISTANCE: f32 = 10.0;
 /// The sketch a face (rect/circle/polygon profile) belongs to.
 pub(crate) fn extrude_face_sketch(doc: &Document, face: &ExtrudeFace) -> Option<SketchId> {
     match face {
-        ExtrudeFace::Rect(i) => doc.rects.get(*i).map(|r| r.sketch),
         ExtrudeFace::Circle(i) => doc.circles.get(*i).map(|c| c.sketch),
         ExtrudeFace::Polygon(lines) => lines.first().and_then(|&i| doc.lines.get(i)).map(|l| l.sketch),
         // `a`/`b` always share the same sketch (that's the whole premise of combining them),
@@ -1448,12 +1411,14 @@ fn extrude_merge_candidate(doc: &Document, sketch: SketchId) -> Option<usize> {
 }
 
 /// Corner index (0–3) of `rect` nearest to local point `(u, v)`.
-fn rect_corner_index_at(rect: &Rect, u: f32, v: f32) -> u8 {
+/// Nearest rectangle corner (0=BL, 1=BR, 2=TR, 3=TL, matching `add_line_rectangle`) to a
+/// local point, used to map a snapped placement onto the shared line endpoint at that corner.
+fn rect_corner_index_at(x: f32, y: f32, w: f32, h: f32, u: f32, v: f32) -> u8 {
     let corners = [
-        (rect.x, rect.y),
-        (rect.x + rect.w, rect.y),
-        (rect.x + rect.w, rect.y + rect.h),
-        (rect.x, rect.y + rect.h),
+        (x, y),
+        (x + w, y),
+        (x + w, y + h),
+        (x, y + h),
     ];
     let mut best = 0u8;
     let mut best_d = f32::INFINITY;
@@ -1571,8 +1536,6 @@ fn draw_mode_status(tool: &str, construction: bool) -> String {
 fn distance_target_status_label(target: DistanceTarget) -> String {
     match target {
         DistanceTarget::LineLength(i) => format!("line {i}"),
-        DistanceTarget::RectWidth(i) => format!("rectangle {i} width"),
-        DistanceTarget::RectHeight(i) => format!("rectangle {i} height"),
         DistanceTarget::CircleDiameter(i) => format!("circle {i} diameter"),
         DistanceTarget::LineLineDistance { .. } => "parallel line spacing".to_string(),
         DistanceTarget::PointPointDistance { .. } => "point distance".to_string(),
@@ -1591,12 +1554,8 @@ fn element_label(element: SceneElement) -> String {
     match element {
         SceneElement::ConstructionPlane(i) => format!("Construction plane {i}"),
         SceneElement::Sketch(i) => format!("Sketch {i}"),
-        SceneElement::Rect(i) => format!("Rectangle {i}"),
         SceneElement::Line(i) => format!("Line {i}"),
         SceneElement::Circle(i) => format!("Circle {i}"),
-        SceneElement::RectEdge(i, edge) => {
-            format!("Rectangle {i} {} edge", edge.script_name())
-        }
         SceneElement::Constraint(i) => format!("Constraint {i}"),
         SceneElement::Point(_) => "Point".to_string(),
         SceneElement::Extrusion(i) => format!("Extrusion {i}"),
@@ -1792,17 +1751,13 @@ impl AppState {
                         self.status = format!("Open failed: {e}");
                         return ActionResult::Err(e);
                     }
-                    let n_rects = doc.rects.len();
                     let n_lines = doc.lines.len();
                     self.doc = doc;
                     self.sketch_session = None;
                     self.cam.set_view_up(None);
                     self.refresh_document_health();
                     self.path = Some(path.clone());
-                    self.status = format!(
-                        "Opened {} ({} rectangle(s), {} line(s))",
-                        path, n_rects, n_lines
-                    );
+                    self.status = format!("Opened {} ({} line(s))", path, n_lines);
                     ActionResult::Ok
                 }
                 Err(e) => {
@@ -1966,11 +1921,6 @@ impl AppState {
                             self.status = "Undid last sketch".to_string();
                             undone = true;
                         }
-                    }
-                    Some(ShapeKind::Rect) => {
-                        self.doc.rects.pop();
-                        self.status = "Undid last rectangle".to_string();
-                        undone = true;
                     }
                     Some(ShapeKind::Line) => {
                         self.doc.lines.pop();
@@ -2238,28 +2188,37 @@ impl AppState {
                 let (ou, ov) = world_to_local(&frame, cr.origin);
                 let end = cr.end_point(&frame, &self.doc);
                 let (eu, ev) = world_to_local(&frame, end);
-                let mut rect = Rect::from_local_corners(session.sketch, ou, ov, eu, ev);
-                if cr.construction {
-                    for edge_index in 0..4 {
-                        rect.set_edge_construction(RectEdge::from_index(edge_index), true);
-                    }
-                }
-                if rect.w > 0.5 && rect.h > 0.5 {
-                    self.doc.rects.push(rect);
-                    self.doc.shape_order.push(ShapeKind::Rect);
-                    let rect_index = self.doc.rects.len() - 1;
-                    // Map each snapped placement to its corner before width/height solving shifts
-                    // positions (corner indices are stable labels regardless).
-                    let origin_corner =
-                        rect_corner_index_at(&self.doc.rects[rect_index], ou, ov);
-                    let opposite_corner =
-                        rect_corner_index_at(&self.doc.rects[rect_index], eu, ev);
+                let x = ou.min(eu);
+                let y = ov.min(ev);
+                let w = (eu - ou).abs();
+                let h = (ev - ov).abs();
+                if w > 0.5 && h > 0.5 {
+                    let construction_edges = if cr.construction { [true; 4] } else { [false; 4] };
+                    // Snapshot for rollback if a typed width/height constraint fails to apply.
+                    let lines_before = self.doc.lines.len();
+                    let constraints_before = self.doc.constraints.len();
+                    let shape_order_before = self.doc.shape_order.len();
+                    // A rectangle is now four plain lines (bottom, right, top, left) forming a
+                    // closed loop with Horizontal/Vertical/Coincident constraints (#66 polygon).
+                    let lines = crate::construction::add_line_rectangle(
+                        &mut self.doc,
+                        session.sketch,
+                        x,
+                        y,
+                        w,
+                        h,
+                        construction_edges,
+                    );
+                    // Corners are shared line endpoints: corner `i` is `lines[i]`'s start.
+                    let origin_corner = rect_corner_index_at(x, y, w, h, ou, ov);
+                    let opposite_corner = rect_corner_index_at(x, y, w, h, eu, ev);
                     let mut constraint_err = None;
+                    // Width drives the bottom edge (lines[0]); height the right edge (lines[1]).
                     if cr.user_edited[0] {
                         if let Err(e) = add_distance_constraint(
                             &mut self.doc,
                             session.sketch,
-                            DistanceTarget::RectWidth(rect_index),
+                            DistanceTarget::LineLength(lines[0]),
                             cr.texts[0].clone(),
                         ) {
                             constraint_err = Some(e);
@@ -2269,19 +2228,16 @@ impl AppState {
                         if let Err(e) = add_distance_constraint(
                             &mut self.doc,
                             session.sketch,
-                            DistanceTarget::RectHeight(rect_index),
+                            DistanceTarget::LineLength(lines[1]),
                             cr.texts[1].clone(),
                         ) {
                             constraint_err = Some(e);
                         }
                     }
                     if let Some(e) = constraint_err {
-                        while self.doc.shape_order.last() == Some(&ShapeKind::Constraint) {
-                            self.doc.shape_order.pop();
-                            self.doc.constraints.pop();
-                        }
-                        self.doc.rects.pop();
-                        self.doc.shape_order.pop();
+                        self.doc.constraints.truncate(constraints_before);
+                        self.doc.lines.truncate(lines_before);
+                        self.doc.shape_order.truncate(shape_order_before);
                         self.rect_origin_snap = None;
                         self.rect_opposite_snap = None;
                         self.creating_rect = Some(cr);
@@ -2292,9 +2248,9 @@ impl AppState {
                     if let Some(target) = self.rect_origin_snap.take() {
                         let _ = self.add_snap_constraint(
                             session.sketch,
-                            ConstraintPoint::RectCorner {
-                                rect: rect_index,
-                                corner: origin_corner,
+                            ConstraintPoint::LineEndpoint {
+                                line: lines[origin_corner as usize],
+                                end: LineEnd::Start,
                             },
                             target,
                         );
@@ -2302,15 +2258,13 @@ impl AppState {
                     if let Some(target) = self.rect_opposite_snap.take() {
                         let _ = self.add_snap_constraint(
                             session.sketch,
-                            ConstraintPoint::RectCorner {
-                                rect: rect_index,
-                                corner: opposite_corner,
+                            ConstraintPoint::LineEndpoint {
+                                line: lines[opposite_corner as usize],
+                                end: LineEnd::Start,
                             },
                             target,
                         );
                     }
-                    let rect = self.doc.rects.last().unwrap();
-                    let (w, h) = (rect.w, rect.h);
                     let unit = crate::model::effective_length_unit(&self.doc, session.sketch);
                     self.status = format!(
                         "Added rectangle ({} × {})",
@@ -2327,23 +2281,9 @@ impl AppState {
                 }
             }
             Action::SetRectDimension { axis, value } => {
-                if let Some(edit) = &mut self.editing_committed_dim {
-                    let matches = match &edit.target {
-                        DimEditTarget::Constraint(id) => {
-                            constraint_matches_rect_axis(&self.doc, *id, axis)
-                        }
-                        DimEditTarget::New(DimensionTarget::Distance(target)) => matches!(
-                            (target, axis),
-                            (DistanceTarget::RectWidth(_), RectAxis::Width)
-                                | (DistanceTarget::RectHeight(_), RectAxis::Height)
-                        ),
-                        DimEditTarget::New(_) => false,
-                    };
-                    if matches {
-                        edit.text = value;
-                        return ActionResult::Ok;
-                    }
-                }
+                // A committed rectangle's width/height are now ordinary line-length dimensions,
+                // edited through the line-dimension path; this action only drives the width/height
+                // fields while the rectangle is still being drawn.
                 let Some(cr) = &mut self.creating_rect else {
                     return ActionResult::Err("No rectangle in progress".to_string());
                 };
@@ -2353,23 +2293,6 @@ impl AppState {
                 ActionResult::Ok
             }
             Action::FocusRectDimension { axis } => {
-                if let Some(edit) = &mut self.editing_committed_dim {
-                    let matches = match &edit.target {
-                        DimEditTarget::Constraint(id) => {
-                            constraint_matches_rect_axis(&self.doc, *id, axis)
-                        }
-                        DimEditTarget::New(DimensionTarget::Distance(target)) => matches!(
-                            (target, axis),
-                            (DistanceTarget::RectWidth(_), RectAxis::Width)
-                                | (DistanceTarget::RectHeight(_), RectAxis::Height)
-                        ),
-                        DimEditTarget::New(_) => false,
-                    };
-                    if matches {
-                        edit.pending_focus = true;
-                        return ActionResult::Ok;
-                    }
-                }
                 let Some(cr) = &mut self.creating_rect else {
                     return ActionResult::Err("No rectangle in progress".to_string());
                 };
@@ -3441,23 +3364,34 @@ impl AppState {
                         "Rectangle needs positive width and height".to_string(),
                     );
                 }
-                let rect =
-                    Rect::from_local_corners(session.sketch, x, y, x + width, y + height);
-                self.doc.rects.push(rect);
-                self.doc.shape_order.push(ShapeKind::Rect);
-                let rect_index = self.doc.rects.len() - 1;
-                let mut add_dim = |target, value: f32| {
-                    add_distance_constraint(&mut self.doc, session.sketch, target, value.to_string())
+                let lines_before = self.doc.lines.len();
+                let constraints_before = self.doc.constraints.len();
+                let shape_order_before = self.doc.shape_order.len();
+                // A rectangle is four plain lines forming a closed loop (#66 polygon); width
+                // drives the bottom edge, height the right edge, as length dimensions.
+                let lines = crate::construction::add_line_rectangle(
+                    &mut self.doc,
+                    session.sketch,
+                    x,
+                    y,
+                    width,
+                    height,
+                    [false; 4],
+                );
+                let mut add_dim = |line: usize, value: f32| {
+                    add_distance_constraint(
+                        &mut self.doc,
+                        session.sketch,
+                        DistanceTarget::LineLength(line),
+                        value.to_string(),
+                    )
                 };
-                if let Err(e) = add_dim(DistanceTarget::RectWidth(rect_index), width)
-                    .and_then(|_| add_dim(DistanceTarget::RectHeight(rect_index), height))
+                if let Err(e) = add_dim(lines[0], width)
+                    .and_then(|_| add_dim(lines[1], height))
                 {
-                    while self.doc.shape_order.last() == Some(&ShapeKind::Constraint) {
-                        self.doc.shape_order.pop();
-                        self.doc.constraints.pop();
-                    }
-                    self.doc.rects.pop();
-                    self.doc.shape_order.pop();
+                    self.doc.constraints.truncate(constraints_before);
+                    self.doc.lines.truncate(lines_before);
+                    self.doc.shape_order.truncate(shape_order_before);
                     self.status = e.clone();
                     return ActionResult::Err(e);
                 }
@@ -4505,8 +4439,7 @@ impl AppState {
             Ok(()) => {
                 self.path = Some(path.to_string());
                 self.status = format!(
-                    "Saved {} rectangle(s), {} line(s) to {}",
-                    self.doc.rects.len(),
+                    "Saved {} line(s) to {}",
                     self.doc.lines.len(),
                     path
                 );

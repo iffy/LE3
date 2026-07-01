@@ -107,7 +107,6 @@ fn pane_element_for_constraint_line(line: crate::model::ConstraintLine) -> crate
     use crate::model::ConstraintLine;
     match line {
         ConstraintLine::Line(index) => SceneElement::Line(index),
-        ConstraintLine::RectEdge { rect, .. } => SceneElement::Rect(rect),
         // A face's own edge tracks the extrusion that produced its face, same as elsewhere.
         ConstraintLine::FaceEdge { face, .. } => {
             SceneElement::Extrusion(face.extrusion_index().unwrap_or(usize::MAX))
@@ -122,7 +121,6 @@ fn pane_element_for_constraint_point(
     use crate::model::ConstraintPoint;
     match point {
         ConstraintPoint::LineEndpoint { line, .. } => SceneElement::Line(line),
-        ConstraintPoint::RectCorner { rect, .. } => SceneElement::Rect(rect),
         ConstraintPoint::CircleCenter(circle) => SceneElement::Circle(circle),
         ConstraintPoint::FaceVertex { face, .. } => {
             SceneElement::Extrusion(face.extrusion_index().unwrap_or(usize::MAX))
@@ -151,9 +149,6 @@ pub fn elements_using_parameter(
             ConstraintKind::Distance { target } => match target {
                 DistanceTarget::LineLength(i) => {
                     elements.insert(SceneElement::Line(i));
-                }
-                DistanceTarget::RectWidth(i) | DistanceTarget::RectHeight(i) => {
-                    elements.insert(SceneElement::Rect(i));
                 }
                 DistanceTarget::CircleDiameter(i) => {
                     elements.insert(SceneElement::Circle(i));
@@ -423,14 +418,6 @@ pub fn propagate_parameter_rename(doc: &mut Document, old: &str, new: &str) {
     }
     for param in &mut doc.parameters {
         param.expression = substitute_parameter_name(&param.expression, old, new);
-    }
-    for rect in &mut doc.rects {
-        if let Some(expr) = &mut rect.width_expr {
-            *expr = substitute_parameter_name(expr, old, new);
-        }
-        if let Some(expr) = &mut rect.height_expr {
-            *expr = substitute_parameter_name(expr, old, new);
-        }
     }
     for line in &mut doc.lines {
         if let Some(expr) = &mut line.length_expr {
