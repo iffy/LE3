@@ -14,10 +14,10 @@
 # OCCT_DIR to an install prefix containing include/opencascade and lib/libTK*.a
 # and skip this script entirely.
 #
-# Only the modeling toolkits are built (FoundationClasses, ModelingData,
-# ModelingAlgorithms). Visualization, DataExchange, ApplicationFramework, Draw and
-# the FreeType/TCL/TK/VTK dependencies are all disabled — they aren't needed for
-# the current kernel surface (solids, booleans, mass properties).
+# Modeling toolkits (FoundationClasses, ModelingData, ModelingAlgorithms) plus
+# DataExchange (STEP read/write for #65/#71). Visualization, ApplicationFramework,
+# Draw and the FreeType/TCL/TK/VTK dependencies stay disabled — not needed for the
+# current kernel surface (solids, booleans, mass properties, STEP I/O).
 
 set -euo pipefail
 
@@ -52,7 +52,7 @@ cmake -S "$occt_src" -B "$occt_build" \
   -DBUILD_MODULE_ModelingAlgorithms=ON \
   -DBUILD_MODULE_Visualization=OFF \
   -DBUILD_MODULE_ApplicationFramework=OFF \
-  -DBUILD_MODULE_DataExchange=OFF \
+  -DBUILD_MODULE_DataExchange=ON \
   -DBUILD_MODULE_Draw=OFF \
   -DBUILD_MODULE_DETools=OFF \
   -DUSE_FREETYPE=OFF \

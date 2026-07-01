@@ -67,5 +67,5 @@ bearcad.fillet_edge{
 ```
 
 `point` uses the same `ConstraintPoint`-style table as
-[point-level selection](/scripting/point-selection) — a line endpoint, a rect corner, etc. `edge`
+[point-level selection](/docs/scripting/point-selection) — a line endpoint, a rect corner, etc. `edge`
 is `{ kind = "vertical", face =, edge = }` or `{ kind = "cap", face =, edge =, top = }`.

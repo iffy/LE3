@@ -270,15 +270,19 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
     preview reflects the snapped target immediately while still dragging (not just after
     release), so extruding to a slanted or irregular target shows the actual resulting shape —
     e.g. a slanted top cap — rather than a generic blind/rectangular extrude (#63).
-  - **Body target (#32)**: a `Body`'s source is one or more extrusions (`BodySource::Extrusion`
-    for one, `BodySource::Extrusions` for several). Extruding from a sketch on an existing body's
-    face (a cap or side face) defaults to joining that body instead of creating a new one; the
-    context pane shows "Add to `<body>`" vs. "New body" while extruding or editing an extrusion
-    to override the choice (editing can also split a merged extrusion back out into its own
-    body). Deleting one extrusion of a multi-extrusion body only drops that extrusion's
-    contribution — the body survives as long as it still has at least one. Scriptable via
-    `bearcad.extrude{ ..., body = "merge" }` (joins the face's body if there is one; omitted or
-    any other value always creates a new body, matching the declarative/OpenSCAD-style default).
+  - **Body target (#32/#35)**: a `Body`'s source is one or more extrusions (`BodySource::Extrusion`
+    for one, `BodySource::Extrusions` for several; `BodySource::Solid { add, cut }` once some of
+    its extrusions are subtracted rather than added — see §3.3). Extruding from a sketch on an
+    existing body's face (a cap or side face) defaults to joining that body instead of creating a
+    new one; the context pane shows three (icon-labelled) choices while extruding or editing an
+    extrusion — **New body**, **Add to `<body>`**, and **Cut `<body>`** — to override the choice
+    (editing can also split a merged/cut extrusion back out into its own body). The **Cut** option
+    is only offered when the OCCT kernel is compiled in, since a non-kernel build can't perform
+    the subtraction (see §3.3). Deleting one extrusion of a multi-extrusion body only drops that
+    extrusion's contribution — the body survives as long as it still has at least one added
+    extrusion. Scriptable via `bearcad.extrude{ ..., body = "merge" | "cut" }` (`"merge"` joins,
+    `"cut"` subtracts from, the face's body if there is one; omitted or any other value always
+    creates a new body, matching the declarative/OpenSCAD-style default).
   - **Boolean-region face picking (#16/#62)**: when exactly two coplanar sketch shapes overlap
     with nonzero area (and no third shape also overlaps that pair — see scope below), clicking
     inside their combined footprint with the Extrude tool resolves to the specific atomic region
@@ -311,29 +315,46 @@ All geometry is B-rep via OCCT. The following operations are **in scope for v1**
 
 ### 3.3 Combining solids
 - **Boolean**: union, cut (subtract), intersect.
+- **Extrude body modes (#32/#35)**: an extrusion commits into a body one of three ways — **New
+  body** (its own body), **Add to body** (fused into an existing body's solid), or **Cut body**
+  (subtracted from an existing body's solid). A body records its additive vs. subtracted
+  extrusions in `BodySource::Solid { add, cut }`; `body_solid_mesh` fuses the added extrusions
+  into one solid and then subtracts each cut extrusion via the kernel's `Shape::boolean(_,
+  BoolOp::Cut)`, producing one watertight result instead of overlapping triangle soup. **Cut
+  requires the OCCT kernel**: the hand-rolled non-kernel mesher can't subtract solids, so in a
+  non-`occt` build a body with cut extrusions renders its additive geometry only (the cut is
+  ignored) and the GUI doesn't offer the Cut option — a known limitation resolved once the kernel
+  is the default (#89). The cut list round-trips through save/load regardless of build.
 
 ### 3.4 Modifying solids
 - **Fillet** and **Chamfer**, 2D sketch vertices: the tools described in §3.1 (#37/#38) —
   truncate-and-bridge on a sketch vertex where two lines meet, with the fillet arc approximated
   by a single bezier segment on the bridging `Line`.
-- **Fillet** and **Chamfer**, 3D solid edges (#77): a **mesh-bevel approximation**, not a true
-  BREP fillet — BearCAD has no BREP/NURBS kernel (see §10), so this doesn't attempt a
-  tangent-continuous curved surface, correct face trimming, or vertex-miter blending where 3+
-  edges meet; it directly reshapes the extrusion's own triangle mesh instead. Scoped to bodies
-  whose source is one or more `Extrusion`s with a `Rect` or `Polygon` profile, and to the two
-  edge families that have a clean analytic definition there (see `crate::extrude::side_quad_
-  world`/`cap_polygon_world`):
+- **Fillet** and **Chamfer**, 3D solid edges (#77): with the OCCT kernel linked (`--features
+  occt`, see §10) these are **true BREP fillets/chamfers** — the extrusion builds a real OCCT
+  solid and `BRepFilletAPI_MakeFillet`/`MakeChamfer` is applied to the matched edges (matched by
+  their analytic world-space endpoints), producing genuine tangent-continuous rounded / flat
+  beveled surfaces, then tessellated for the viewport. In the default build (no kernel) the same
+  edges get a **mesh-bevel approximation** instead: it doesn't attempt a tangent-continuous
+  curved surface, correct face trimming, or vertex-miter blending where 3+ edges meet; it
+  directly reshapes the extrusion's own triangle mesh. If the kernel can't place a treatment (an
+  edge it can't match, or an OCCT error) that extrusion falls back to the mesh-bevel path, so
+  broken geometry never ships. Both paths are scoped to bodies whose source is one or more
+  `Extrusion`s with a `Rect` or `Polygon` profile, and to the two edge families that have a clean
+  analytic definition there (see `crate::extrude::side_quad_world`/`cap_polygon_world`):
   - a **vertical side edge**, where two adjacent flat side walls of the profile meet, and
   - a **side/cap edge**, where a side wall meets the top or bottom cap.
 
-  **Chamfer** replaces the edge with a single flat bevel quad connecting the two originally
-  adjacent faces, offset back from the edge by the chamfer distance on each side (the same
-  truncate-by-`amount` math as the 2D vertex case, `crate::model::vertex_treatment_geometry`,
-  generalized to arbitrary 3D corners via `crate::extrude::corner_bevel_3d` — any two rays from
-  a shared point span a flat 2D subspace, so this is an exact, not approximated, embedding).
-  **Fillet** replaces it with an N-segment faceted rounded bevel instead of a true curved
-  surface, sampling the same cubic-bezier arc approximation the 2D fillet uses, faceted at
-  `EDGE_TREATMENT_FILLET_SEGMENTS` (= `BEZIER_SEGMENTS`, the existing curve-faceting precedent).
+  In the mesh-bevel fallback, **Chamfer** replaces the edge with a single flat bevel quad
+  connecting the two originally adjacent faces, offset back from the edge by the chamfer distance
+  on each side (the same truncate-by-`amount` math as the 2D vertex case,
+  `crate::model::vertex_treatment_geometry`, generalized to arbitrary 3D corners via
+  `crate::extrude::corner_bevel_3d` — any two rays from a shared point span a flat 2D subspace,
+  so this is an exact, not approximated, embedding). **Fillet** replaces it with an N-segment
+  faceted rounded bevel instead of a true curved surface, sampling the same cubic-bezier arc
+  approximation the 2D fillet uses, faceted at `EDGE_TREATMENT_FILLET_SEGMENTS` (= `BEZIER_
+  SEGMENTS`, the existing curve-faceting precedent). The `occt` build instead produces the true
+  BREP fillet/chamfer surface described above.
   - **Explicitly out of scope**: `Circle`-profile edges (curved, no discrete side walls to
     bevel — `side_face_count` is 0); STL/STEP-imported bodies (pure triangle soup, no analytic
     profile to derive an edge from — #31's generic mesh-feature-edge extraction still works for
@@ -792,14 +813,20 @@ explicit exception that lets us drive "mouse/keyboard" flows for testing purpose
   visibility, renaming, and deletion exactly like any other body, but — since it has no
   sketch/distance parameters — can't be edited or merged into by a further extrude the way
   an extrusion-backed body can (#32).
-- **STEP import (#71):** **File → Import STEP…** reads a STEP (ISO-10303-21) document's
-  `FACETED_BREP` geometry — the same `POLY_LOOP`-bounded planar `FACE_SURFACE` subset BearCAD's
-  own STEP export produces — and adds it as a new **Body**, the same way STL import does
-  (nests directly under the Elements pane's Document root, named after the file). Scriptable via
-  `bearcad.import_step(path)`. STEP files using full BREP geometry (`ADVANCED_FACE` with
-  curved/NURBS surfaces, as most CAD tools export) are rejected with a clear error rather than
-  approximated: BearCAD has no NURBS/curve kernel yet (§10 is still **TBD**), so only the
-  triangulated subset round-trips.
+- **STEP export/import (#65/#71):** **File → Export STEP…** / **Import STEP…** (and the
+  per-body Elements-pane export). With the OCCT kernel compiled in (`--features occt`, §10),
+  a single-body STEP export writes **real BREP** (planar *and* curved surfaces) straight from
+  the body's OCCT solid via `STEPControl_Writer`, and import reads **real BREP incl.
+  curved/NURBS surfaces** via `STEPControl_Reader`, tessellating the result into a new **Body**
+  (nests under the Document root, named after the file). Scriptable via `bearcad.import_step`
+  / `bearcad.export_step`.
+  - **No-kernel fallback:** builds without OCCT (and the whole-document/multi-body export path,
+    plus any body whose geometry isn't kernel-representable) use the hand-rolled `step.rs`
+    path — export writes an AP203 `FACETED_BREP` (tessellated triangles), and import reads only
+    that same `POLY_LOOP`-bounded planar `FACE_SURFACE` subset. In this mode, STEP files using
+    full BREP geometry (`ADVANCED_FACE` with curved/NURBS surfaces, as most CAD tools export)
+    are rejected with a clear error rather than approximated. Imported bodies behave like STL
+    imports (no analytic face/edge structure to sketch or edit against).
 - **Export session commands:** **Help → Export Session Commands…** (also a command-palette
   entry, "Export Session Commands…") writes everything done since the app opened as a
   timestamped, replayable Lua script (the same instructions as `--show-commands`, §9). Useful

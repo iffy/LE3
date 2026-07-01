@@ -126,10 +126,14 @@ bearcad.import_stl("part.stl")
 bearcad.import_step("part.step")
 ```
 
-STEP import only round-trips the triangulated `FACETED_BREP` subset BearCAD's own STEP export
-produces (`POLY_LOOP`-bounded planar `FACE_SURFACE`s) — files using curved/NURBS `ADVANCED_FACE`
-geometry, as most CAD tools export, are rejected with a clear error rather than approximated,
-since BearCAD has no NURBS/curve kernel yet.
+With the OCCT kernel compiled in (`--features occt`), STEP export writes **real BREP** (planar
+and curved surfaces) from a body's OCCT solid, and STEP import reads **real BREP including
+curved/NURBS surfaces**, tessellating it into a new body — so files from other CAD tools round-trip.
+
+Without the kernel (the default build), export/import use the hand-rolled faceted path: export
+writes a triangulated `FACETED_BREP`, and import only round-trips that same subset
+(`POLY_LOOP`-bounded planar `FACE_SURFACE`s) — files using curved/NURBS `ADVANCED_FACE`
+geometry are rejected with a clear error rather than approximated.
 
 ## Document lifecycle
 

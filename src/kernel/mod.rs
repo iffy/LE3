@@ -40,6 +40,18 @@ mod ffi {
             b: *const BearcadShape,
             op: c_int,
         ) -> *mut BearcadShape;
+        pub fn bearcad_shape_fillet(
+            s: *const BearcadShape,
+            edges: *const f64,
+            radii: *const f64,
+            n: c_ulong,
+        ) -> *mut BearcadShape;
+        pub fn bearcad_shape_chamfer(
+            s: *const BearcadShape,
+            edges: *const f64,
+            dists: *const f64,
+            n: c_ulong,
+        ) -> *mut BearcadShape;
         pub fn bearcad_shape_volume(shape: *const BearcadShape) -> f64;
         pub fn bearcad_shape_tessellate(
             shape: *const BearcadShape,
@@ -48,6 +60,9 @@ mod ffi {
         ) -> *mut f64;
         pub fn bearcad_tri_free(tris: *mut f64);
         pub fn bearcad_shape_free(shape: *mut BearcadShape);
+
+        pub fn bearcad_shape_write_step(s: *const BearcadShape, path: *const c_char) -> c_int;
+        pub fn bearcad_read_step(path: *const c_char) -> *mut BearcadShape;
     }
 }
 
@@ -197,6 +212,57 @@ impl Shape {
         (!raw.is_null()).then_some(Shape { raw })
     }
 
+    /// Apply true BREP fillets (rounded edges) of the given per-edge `radii` to the
+    /// edges of `self` whose two world-space endpoints match each `(a, b)` pair in
+    /// `edges` (either order, within a bbox-scaled tolerance). All requested edges go
+    /// into one fillet operation. `None` on length mismatch, an unmatched edge, or a
+    /// kernel failure — the caller then falls back to the hand-rolled mesher (#77).
+    pub fn fillet(&self, edges: &[(glam::Vec3, glam::Vec3)], radii: &[f32]) -> Option<Shape> {
+        self.edge_treatment(edges, radii, ffi::bearcad_shape_fillet)
+    }
+
+    /// Apply true BREP chamfers (flat symmetric bevels) of the given per-edge `dists`
+    /// to the matching edges of `self`. Same matching/fallback contract as
+    /// [`Shape::fillet`] (#77).
+    pub fn chamfer(&self, edges: &[(glam::Vec3, glam::Vec3)], dists: &[f32]) -> Option<Shape> {
+        self.edge_treatment(edges, dists, ffi::bearcad_shape_chamfer)
+    }
+
+    /// Shared marshalling for [`Shape::fillet`]/[`Shape::chamfer`]: flatten the edge
+    /// endpoint pairs to `[ax,ay,az,bx,by,bz, ...]` (as `prism`/`loft` flatten points)
+    /// and the amounts to `f64`, then call the given FFI entry point.
+    fn edge_treatment(
+        &self,
+        edges: &[(glam::Vec3, glam::Vec3)],
+        amounts: &[f32],
+        f: unsafe extern "C" fn(
+            *const ffi::BearcadShape,
+            *const f64,
+            *const f64,
+            std::os::raw::c_ulong,
+        ) -> *mut ffi::BearcadShape,
+    ) -> Option<Shape> {
+        if edges.is_empty() || edges.len() != amounts.len() {
+            return None;
+        }
+        let mut flat = Vec::with_capacity(edges.len() * 6);
+        for (a, b) in edges {
+            flat.extend_from_slice(&[
+                a.x as f64, a.y as f64, a.z as f64, b.x as f64, b.y as f64, b.z as f64,
+            ]);
+        }
+        let amt: Vec<f64> = amounts.iter().map(|&r| r as f64).collect();
+        let raw = unsafe {
+            f(
+                self.raw,
+                flat.as_ptr(),
+                amt.as_ptr(),
+                edges.len() as std::os::raw::c_ulong,
+            )
+        };
+        (!raw.is_null()).then_some(Shape { raw })
+    }
+
     /// Solid volume, or `None` on a kernel error (negative sentinel).
     /// (Kernel API; exercised by tests, consumed by app code incrementally.)
     #[allow(dead_code)]
@@ -229,6 +295,30 @@ impl Shape {
         }
         unsafe { ffi::bearcad_tri_free(ptr) };
         tris
+    }
+
+    /// Write this shape to `path` as a real BREP AP214 STEP file (planar + curved
+    /// surfaces), via OCCT's `STEPControl_Writer` (#65). `true` on success; `false`
+    /// on a kernel/write error or a path that isn't valid UTF-8 or contains a NUL.
+    pub fn write_step(&self, path: &std::path::Path) -> bool {
+        let Some(s) = path.to_str() else {
+            return false;
+        };
+        let Ok(c) = std::ffi::CString::new(s) else {
+            return false;
+        };
+        let rc = unsafe { ffi::bearcad_shape_write_step(self.raw, c.as_ptr()) };
+        rc == 0
+    }
+
+    /// Read the first/combined shape from a STEP file at `path` via OCCT's
+    /// `STEPControl_Reader` (#71) — real BREP, curved surfaces included. `None` on a
+    /// read failure, an empty file, or a path that isn't valid UTF-8 / contains a NUL.
+    pub fn read_step(path: &std::path::Path) -> Option<Shape> {
+        let s = path.to_str()?;
+        let c = std::ffi::CString::new(s).ok()?;
+        let raw = unsafe { ffi::bearcad_read_step(c.as_ptr()) };
+        (!raw.is_null()).then_some(Shape { raw })
     }
 }
 
@@ -303,6 +393,68 @@ mod tests {
         ];
         let sh = Shape::loft(&bottom, &top).expect("loft built");
         assert!((sh.volume().unwrap() - 1.5).abs() < 1e-4, "vol {:?}", sh.volume());
+    }
+
+    #[test]
+    fn fillet_of_a_cube_vertical_edge_removes_expected_volume() {
+        // Unit cube [0,1]^3 as a prism; fillet the vertical edge at corner (1,1).
+        let cube = Shape::prism(&square(0.0, 0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, 1.0)).unwrap();
+        let r = 0.2_f32;
+        let edge = (Vec3::new(1.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        let filleted = cube.fillet(&[edge], &[r]).expect("fillet applied");
+        let v = filleted.volume().unwrap();
+        // Rounding a right-angle vertical edge of radius r over height h removes the
+        // square-minus-quarter-circle corner: (1 - pi/4) * r^2 * h.
+        let removed = (1.0 - std::f64::consts::FRAC_PI_4) * (r as f64).powi(2) * 1.0;
+        assert!((v - (1.0 - removed)).abs() < 1e-3, "filleted volume {v}, expected {}", 1.0 - removed);
+    }
+
+    #[test]
+    fn chamfer_of_a_cube_vertical_edge_removes_expected_volume() {
+        let cube = Shape::prism(&square(0.0, 0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, 1.0)).unwrap();
+        let d = 0.2_f32;
+        let edge = (Vec3::new(1.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        let chamfered = cube.chamfer(&[edge], &[d]).expect("chamfer applied");
+        let v = chamfered.volume().unwrap();
+        // A symmetric chamfer of distance d cuts a right-triangle prism: (d^2 / 2) * h.
+        let removed = (d as f64).powi(2) / 2.0 * 1.0;
+        assert!((v - (1.0 - removed)).abs() < 1e-3, "chamfered volume {v}, expected {}", 1.0 - removed);
+    }
+
+    #[test]
+    fn fillet_returns_none_for_unmatched_edge() {
+        let cube = Shape::prism(&square(0.0, 0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, 1.0)).unwrap();
+        // No edge runs between these two points, so matching fails -> None (fallback).
+        let bogus = (Vec3::new(5.0, 5.0, 0.0), Vec3::new(6.0, 6.0, 0.0));
+        assert!(cube.fillet(&[bogus], &[0.1]).is_none());
+        // Length mismatch is also rejected up front.
+        let edge = (Vec3::new(1.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        assert!(cube.fillet(&[edge], &[0.1, 0.2]).is_none());
+    }
+
+    #[test]
+    fn write_step_then_read_step_round_trips_a_box_by_volume() {
+        // Build a 2×3×4 box (volume 24), write it to a temp STEP file, read it back,
+        // and assert the re-read solid's volume matches — proving the STEP writer +
+        // reader round-trip real BREP.
+        let sh = Shape::prism(&square(0.0, 0.0, 2.0, 3.0), Vec3::new(0.0, 0.0, 4.0))
+            .expect("prism built");
+        let path = std::env::temp_dir()
+            .join(format!("bearcad_kernel_step_{}.step", std::process::id()));
+        assert!(sh.write_step(&path), "write_step failed");
+        let read = Shape::read_step(&path).expect("read_step returned None");
+        let v = read.volume().expect("volume");
+        assert!((v - 24.0).abs() < 1e-3, "re-read volume {v} != 24");
+        // Its tessellation is watertight (divergence-theorem volume matches the box).
+        let tris = read.tessellate(0.01);
+        assert!(!tris.is_empty());
+        assert!((mesh_volume(&tris) - 24.0).abs() < 1e-2, "mesh vol {}", mesh_volume(&tris));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_step_on_a_nonexistent_path_is_none() {
+        assert!(Shape::read_step(std::path::Path::new("/nonexistent/bearcad-no.step")).is_none());
     }
 
     #[test]

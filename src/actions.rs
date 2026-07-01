@@ -253,11 +253,28 @@ impl CreatingCircle {
     }
 }
 
-/// Whether a committed extrusion creates a new body row or merges into an existing one.
+/// Whether a committed extrusion creates a new body row, merges into (adds to) an existing
+/// one, or is subtracted (cut) from one (#35). `Cut` is only *offered* in the GUI when the
+/// OCCT kernel is present (a non-kernel build can't perform the subtraction), but the variant
+/// and its attach logic exist in every build so documents round-trip regardless.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtrudeBodyMode {
     NewBody,
     MergeInto(usize),
+    Cut(usize),
+}
+
+/// How a scripted / [`Action::CreateExtrusion`] extrude attaches to bodies, resolved against
+/// the extrusion's merge candidate at commit time (#35). Mirrors the Lua `body =` argument:
+/// omitted / `"new"` → [`New`](Self::New), `"merge"` → [`Merge`](Self::Merge),
+/// `"cut"` → [`Cut`](Self::Cut). When there's no candidate body, `Merge`/`Cut` fall back to a
+/// new body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ExtrudeBodyChoice {
+    #[default]
+    New,
+    Merge,
+    Cut,
 }
 
 /// In-progress (or being-edited) extrusion: selected faces + live signed distance.
@@ -677,9 +694,9 @@ pub enum Action {
         sketch: SketchId,
         faces: Vec<ExtrudeFace>,
         distance: f32,
-        /// Join the body of the face being extruded from, if any, instead of creating a new
-        /// body (#32) — mirrors the context pane's "Add to body" choice for the GUI flow.
-        merge_into_body: bool,
+        /// How the extrusion attaches to bodies (#32/#35) — mirrors the context pane's
+        /// New / Add-to-body / Cut choice for the GUI flow.
+        body: ExtrudeBodyChoice,
     },
     /// Add/remove a face from the in-progress extrusion (starts one if needed).
     ToggleExtrudeFace { face: ExtrudeFace },
@@ -1205,13 +1222,24 @@ impl AppState {
     /// when the new home differs and attach it to the new one.
     fn apply_extrude_body_mode(&mut self, ei: usize, mode: ExtrudeBodyMode) {
         let current = crate::model::body_index_for_extrusion(&self.doc, ei);
+        // The body is solely `ei`'s home (a lone added extrusion, no cuts) — removing `ei`
+        // would leave it empty, so it should be tombstoned rather than emptied.
         let solely_owns = |doc: &Document, bi: usize| {
+            doc.bodies.get(bi).is_some_and(|b| {
+                b.source.extrusion_indices() == [ei] && b.source.cut_extrusion_indices().is_empty()
+            })
+        };
+        // Whether `ei` is currently a *cut* of body `bi` (vs an added extrusion).
+        let is_cut_in = |doc: &Document, bi: usize| {
             doc.bodies
                 .get(bi)
-                .is_some_and(|b| b.source.extrusion_indices() == [ei])
+                .is_some_and(|b| b.source.cut_extrusion_indices().contains(&ei))
         };
         let already_there = match (current, mode) {
-            (Some(bi), ExtrudeBodyMode::MergeInto(target)) => bi == target,
+            (Some(bi), ExtrudeBodyMode::MergeInto(target)) => {
+                bi == target && !is_cut_in(&self.doc, bi)
+            }
+            (Some(bi), ExtrudeBodyMode::Cut(target)) => bi == target && is_cut_in(&self.doc, bi),
             (Some(bi), ExtrudeBodyMode::NewBody) => solely_owns(&self.doc, bi),
             (None, _) => true,
         };
@@ -1249,17 +1277,38 @@ impl AppState {
                     self.doc.shape_order.push(ShapeKind::Body);
                 }
             }
+            ExtrudeBodyMode::Cut(bi) => {
+                if let Some(body) = self.doc.bodies.get_mut(bi).filter(|b| !b.deleted) {
+                    body.source.append_cut_extrusion(ei);
+                } else {
+                    self.doc.bodies.push(crate::model::Body {
+                        source: crate::model::BodySource::single(ei),
+                        name: None,
+                        deleted: false,
+                    });
+                    self.doc.shape_order.push(ShapeKind::Body);
+                }
+            }
         }
     }
 
     /// Attach freshly-created extrusion `ei` (just pushed, owned by no body yet) to a body
     /// per `mode`, creating a new body if needed. Returns the resulting body's index.
     fn attach_new_extrusion_to_body(&mut self, ei: usize, mode: ExtrudeBodyMode) -> usize {
-        if let ExtrudeBodyMode::MergeInto(bi) = mode {
-            if let Some(body) = self.doc.bodies.get_mut(bi).filter(|b| !b.deleted) {
-                body.source.append_extrusion(ei);
-                return bi;
+        match mode {
+            ExtrudeBodyMode::MergeInto(bi) => {
+                if let Some(body) = self.doc.bodies.get_mut(bi).filter(|b| !b.deleted) {
+                    body.source.append_extrusion(ei);
+                    return bi;
+                }
             }
+            ExtrudeBodyMode::Cut(bi) => {
+                if let Some(body) = self.doc.bodies.get_mut(bi).filter(|b| !b.deleted) {
+                    body.source.append_cut_extrusion(ei);
+                    return bi;
+                }
+            }
+            ExtrudeBodyMode::NewBody => {}
         }
         self.doc.bodies.push(crate::model::Body {
             source: crate::model::BodySource::single(ei),
@@ -1312,6 +1361,26 @@ impl AppState {
         mesh: Option<crate::extrude::SolidMesh>,
     ) -> ActionResult {
         self.write_mesh_file(path, name, mesh, MeshExportFormat::Step)
+    }
+
+    /// Export a single body (by index) to `path` as STEP (#65). In `occt` builds, when the
+    /// body has a kernel-representable OCCT solid, write **real BREP** (planar + curved
+    /// surfaces) straight to the file via `STEPControl_Writer`; otherwise (non-`occt`, an
+    /// imported-mesh body, non-representable geometry, or a kernel write failure) fall back
+    /// to the hand-rolled faceted-BREP mesh path.
+    fn write_step_body_file(&mut self, path: &str, name: &str, body: usize) -> ActionResult {
+        #[cfg(feature = "occt")]
+        {
+            if let Some(shape) = crate::extrude::occt_body_shape(&self.doc, body) {
+                if shape.write_step(std::path::Path::new(path)) {
+                    self.status = format!("Exported body '{name}' to {path} (STEP BREP)");
+                    return ActionResult::Ok;
+                }
+                // Kernel write failed — fall through to the faceted mesh path below.
+            }
+        }
+        let mesh = crate::extrude::body_solid_mesh(&self.doc, body);
+        self.write_step_file(path, name, mesh)
     }
 
     fn write_mesh_file(
@@ -1782,28 +1851,31 @@ impl AppState {
                 let mesh = crate::extrude::body_solid_mesh(&self.doc, body);
                 self.write_stl_file(&path, &name, mesh)
             }
-            Action::ExportStep { path, body } => {
-                let (name, mesh) = match &body {
-                    Some(name) => {
-                        match self.doc.bodies.iter().position(|b| {
-                            !b.deleted && b.name.as_deref() == Some(name.as_str())
-                        }) {
-                            Some(bi) => {
-                                (name.clone(), crate::extrude::body_solid_mesh(&self.doc, bi))
-                            }
-                            None => {
-                                self.status = format!("Export failed: no body named '{name}'");
-                                return ActionResult::Err(self.status.clone());
-                            }
+            Action::ExportStep { path, body } => match &body {
+                Some(name) => {
+                    match self
+                        .doc
+                        .bodies
+                        .iter()
+                        .position(|b| !b.deleted && b.name.as_deref() == Some(name.as_str()))
+                    {
+                        Some(bi) => {
+                            let name = name.clone();
+                            self.write_step_body_file(&path, &name, bi)
+                        }
+                        None => {
+                            self.status = format!("Export failed: no body named '{name}'");
+                            ActionResult::Err(self.status.clone())
                         }
                     }
-                    None => (
-                        "bearcad".to_string(),
-                        Some(crate::extrude::document_solid_mesh(&self.doc)),
-                    ),
-                };
-                self.write_step_file(&path, &name, mesh)
-            }
+                }
+                // Whole-document export concatenates every body; keep the hand-rolled faceted
+                // path (OCCT export is per single body — see `write_step_body_file`).
+                None => {
+                    let mesh = Some(crate::extrude::document_solid_mesh(&self.doc));
+                    self.write_step_file(&path, "bearcad", mesh)
+                }
+            },
             Action::ExportStepBody { path, body } => {
                 let Some(b) = self.doc.bodies.get(body).filter(|b| !b.deleted) else {
                     self.status = format!("Export failed: no body {body}");
@@ -1813,8 +1885,7 @@ impl AppState {
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("body-{body}"));
-                let mesh = crate::extrude::body_solid_mesh(&self.doc, body);
-                self.write_step_file(&path, &name, mesh)
+                self.write_step_body_file(&path, &name, body)
             }
             Action::ImportStl { path } => {
                 let bytes = match std::fs::read(&path) {
@@ -1836,6 +1907,20 @@ impl AppState {
                 }
             }
             Action::ImportStep { path } => {
+                // In `occt` builds, read real BREP (curved surfaces included) via
+                // STEPControl_Reader and tessellate it (#71). Falls back to the hand-rolled
+                // faceted-subset parser when the kernel isn't compiled in or can't read the
+                // file (e.g. missing/empty/not-a-solid).
+                #[cfg(feature = "occt")]
+                {
+                    if let Some(shape) = crate::kernel::Shape::read_step(std::path::Path::new(&path))
+                    {
+                        let tris = shape.tessellate(crate::extrude::OCCT_DEFLECTION as f64);
+                        if !tris.is_empty() {
+                            return self.import_mesh_body(&path, tris);
+                        }
+                    }
+                }
                 let text = match std::fs::read_to_string(&path) {
                     Ok(t) => t,
                     Err(e) => {
@@ -3460,16 +3545,21 @@ impl AppState {
                 sketch,
                 faces,
                 distance,
-                merge_into_body,
+                body,
             } => {
                 if faces.is_empty() {
                     return ActionResult::Err("Extrusion needs at least one face".to_string());
                 }
-                let body_mode = merge_into_body
-                    .then(|| extrude_merge_candidate(&self.doc, sketch))
-                    .flatten()
-                    .map(ExtrudeBodyMode::MergeInto)
-                    .unwrap_or(ExtrudeBodyMode::NewBody);
+                let candidate = extrude_merge_candidate(&self.doc, sketch);
+                let body_mode = match body {
+                    ExtrudeBodyChoice::New => ExtrudeBodyMode::NewBody,
+                    ExtrudeBodyChoice::Merge => candidate
+                        .map(ExtrudeBodyMode::MergeInto)
+                        .unwrap_or(ExtrudeBodyMode::NewBody),
+                    ExtrudeBodyChoice::Cut => candidate
+                        .map(ExtrudeBodyMode::Cut)
+                        .unwrap_or(ExtrudeBodyMode::NewBody),
+                };
                 self.doc.extrusions.push(Extrusion {
                     sketch,
                     faces,
@@ -3560,7 +3650,9 @@ impl AppState {
                 // arbitrary body index could point at an unrelated or deleted body.
                 let allowed = match mode {
                     ExtrudeBodyMode::NewBody => true,
-                    ExtrudeBodyMode::MergeInto(bi) => ce.merge_candidate == Some(bi),
+                    ExtrudeBodyMode::MergeInto(bi) | ExtrudeBodyMode::Cut(bi) => {
+                        ce.merge_candidate == Some(bi)
+                    }
                 };
                 if !allowed {
                     return ActionResult::Err("Not a valid body for this extrusion".to_string());
@@ -3576,9 +3668,17 @@ impl AppState {
                     return ActionResult::Err("Extrusion was deleted".to_string());
                 }
                 let merge_candidate = crate::model::body_index_for_extrusion(&self.doc, index);
-                let body_mode = merge_candidate
-                    .map(ExtrudeBodyMode::MergeInto)
-                    .unwrap_or(ExtrudeBodyMode::NewBody);
+                // Preserve the extrusion's current role: an extrusion already subtracted from
+                // its body opens in Cut mode (#35), not MergeInto — otherwise re-committing
+                // without touching the choice would silently re-fuse it.
+                let is_cut = merge_candidate.is_some_and(|bi| {
+                    self.doc.bodies[bi].source.cut_extrusion_indices().contains(&index)
+                });
+                let body_mode = match merge_candidate {
+                    Some(bi) if is_cut => ExtrudeBodyMode::Cut(bi),
+                    Some(bi) => ExtrudeBodyMode::MergeInto(bi),
+                    None => ExtrudeBodyMode::NewBody,
+                };
                 self.creating_extrusion = Some(CreatingExtrusion {
                     sketch: extrusion.sketch,
                     faces: extrusion.faces.clone(),
@@ -4672,6 +4772,37 @@ mod tests {
     }
 
     #[test]
+    fn set_extrude_body_mode_to_cut_records_the_extrusion_as_a_cut() {
+        // Cut mode (#35) subtracts the new extrusion from the candidate body instead of
+        // fusing it: no new body row, and the target body's source becomes `Solid`.
+        let mut state = AppState::default();
+        let face_sketch = extrude_then_sketch_on_top_cap(&mut state);
+        state.doc.rects.push(Rect::from_local_corners(face_sketch, 1.0, 1.0, 4.0, 2.0));
+        state.doc.shape_order.push(ShapeKind::Rect);
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace { face: ExtrudeFace::Rect(1) });
+        state.apply(Action::SetExtrudeDistance { distance: 3.0 });
+        assert_eq!(
+            state.apply(Action::SetExtrudeBodyMode { mode: ExtrudeBodyMode::Cut(0) }),
+            ActionResult::Ok
+        );
+        state.apply(Action::CommitExtrusion);
+
+        assert_eq!(state.doc.bodies.len(), 1);
+        assert_eq!(state.doc.bodies[0].source.extrusion_indices(), [0]);
+        assert_eq!(state.doc.bodies[0].source.cut_extrusion_indices(), [1]);
+
+        // Undo removes the cut extrusion and collapses the body back to purely additive.
+        state.apply(Action::UndoLast);
+        assert_eq!(state.doc.extrusions.len(), 1);
+        assert_eq!(state.doc.bodies.len(), 1);
+        assert_eq!(
+            state.doc.bodies[0].source,
+            crate::model::BodySource::Extrusion(0)
+        );
+    }
+
+    #[test]
     fn deleting_one_extrusion_of_a_merged_body_keeps_the_body() {
         let mut state = AppState::default();
         let face_sketch = extrude_then_sketch_on_top_cap(&mut state);
@@ -4831,6 +4962,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // Faceted-BREP export is the hand-rolled path used in the default (no-kernel) build. In
+    // `occt` builds a single-body STEP export writes *real* BREP instead (see the `occt`
+    // variant below), so this faceted-structure assertion only holds without the kernel.
+    #[cfg(not(feature = "occt"))]
     #[test]
     fn export_step_body_by_index_writes_a_valid_faceted_brep_file() {
         let mut state = AppState::default();
@@ -4859,6 +4994,58 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("read exported step");
         let summary = crate::step::validate_step(&text).expect("validate exported step");
         assert_eq!(summary.face_surfaces, 12, "a box has 12 triangles");
+
+        let missing = state.apply(Action::ExportStepBody {
+            path: path_str.clone(),
+            body: 9,
+        });
+        assert!(matches!(missing, ActionResult::Err(_)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // `occt` counterpart: a single-body STEP export writes real BREP (`ADVANCED_BREP_...`,
+    // no FACETED_BREP), and re-importing it round-trips to a watertight box body (#65/#71).
+    #[cfg(feature = "occt")]
+    #[test]
+    fn export_step_body_by_index_writes_real_brep_that_reimports() {
+        let mut state = AppState::default();
+        let sketch = begin_default_sketch(&mut state);
+        state
+            .doc
+            .rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 5.0));
+        state.doc.shape_order.push(ShapeKind::Rect);
+        state.apply(Action::SetTool(Tool::Extrude));
+        state.apply(Action::ToggleExtrudeFace {
+            face: ExtrudeFace::Rect(0),
+        });
+        state.apply(Action::SetExtrudeDistance { distance: 7.0 });
+        state.apply(Action::CommitExtrusion);
+        assert_eq!(state.doc.bodies.len(), 1);
+
+        let path =
+            std::env::temp_dir().join(format!("bearcad_export_brep_{}.step", std::process::id()));
+        let path_str = path.to_string_lossy().to_string();
+        let result = state.apply(Action::ExportStepBody {
+            path: path_str.clone(),
+            body: 0,
+        });
+        assert_eq!(result, ActionResult::Ok, "status: {}", state.status);
+        let text = std::fs::read_to_string(&path).expect("read exported step");
+        assert!(!text.contains("FACETED_BREP"), "occt export should be real BREP");
+
+        // Re-import the real-BREP file: OCCT tessellates it back to a watertight box.
+        let mut importer = AppState::default();
+        let imported = importer.apply(Action::ImportStep { path: path_str.clone() });
+        assert_eq!(imported, ActionResult::Ok, "status: {}", importer.status);
+        let mesh = crate::extrude::body_solid_mesh(&importer.doc, 0).expect("imported mesh");
+        let vol = mesh
+            .triangles
+            .iter()
+            .map(|[a, b, c]| a.dot(b.cross(*c)) / 6.0)
+            .sum::<f32>()
+            .abs();
+        assert!((vol - 350.0).abs() < 1.0, "re-imported box volume {vol} != 350");
 
         let missing = state.apply(Action::ExportStepBody {
             path: path_str.clone(),
@@ -4984,7 +5171,7 @@ mod tests {
             sketch,
             faces: vec![ExtrudeFace::Rect(0)],
             distance: 6.0,
-            merge_into_body: false,
+            body: crate::actions::ExtrudeBodyChoice::New,
         });
 
         state.apply(Action::EditExtrusion { index: 0 });
@@ -5448,7 +5635,7 @@ mod tests {
             sketch,
             faces: vec![ExtrudeFace::Rect(0)],
             distance: 6.0,
-            merge_into_body: false,
+            body: crate::actions::ExtrudeBodyChoice::New,
         });
         assert_eq!(state.doc.extrusions.len(), 1);
         assert_eq!(state.doc.bodies.len(), 1);
@@ -6473,7 +6660,7 @@ mod tests {
             sketch,
             faces: vec![ExtrudeFace::Rect(0)],
             distance: 5.0,
-            merge_into_body: false,
+            body: crate::actions::ExtrudeBodyChoice::New,
         });
         state
     }
@@ -6592,7 +6779,7 @@ mod tests {
             sketch,
             faces: vec![ExtrudeFace::Circle(0)],
             distance: 6.0,
-            merge_into_body: false,
+            body: crate::actions::ExtrudeBodyChoice::New,
         });
         let result = state.apply(Action::CommitEdgeTreatment {
             extrusion: 0,

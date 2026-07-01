@@ -929,6 +929,59 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_body_with_cut_extrusion() {
+        // A `Solid { add, cut }` body (#35): the cut list must survive save/load, and old
+        // files (which never carried one) still load as the additive `Extrusion`/`Extrusions`
+        // forms thanks to `#[serde(default)]`.
+        use crate::model::{Body, BodySource, ExtrudeFace, Extrusion};
+        let dir = std::env::temp_dir();
+        let path = dir.join("bearcad_cut_body_roundtrip.bearcad");
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut doc = Document::default();
+        let sketch = doc.add_sketch(FaceId::ConstructionPlane(0));
+        doc.rects.push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
+        doc.rects.push(Rect::from_local_corners(sketch, 3.0, 3.0, 7.0, 7.0));
+        for face in [ExtrudeFace::Rect(0), ExtrudeFace::Rect(1)] {
+            doc.extrusions.push(Extrusion {
+                sketch,
+                faces: vec![face],
+                distance: 5.0,
+                target: None,
+                expression: String::new(),
+                name: None,
+                deleted: false,
+                edge_treatments: Vec::new(),
+            });
+            doc.shape_order.push(ShapeKind::Extrusion);
+        }
+        doc.bodies.push(Body {
+            source: BodySource::Solid {
+                add: vec![0],
+                cut: vec![1],
+            },
+            name: None,
+            deleted: false,
+        });
+        doc.shape_order.push(ShapeKind::Body);
+
+        save(&path, &doc).unwrap();
+        let loaded = open(&path).unwrap();
+        assert_eq!(
+            loaded.bodies[0].source,
+            BodySource::Solid {
+                add: vec![0],
+                cut: vec![1],
+            }
+        );
+        assert_eq!(loaded.bodies[0].source.extrusion_indices(), [0]);
+        assert_eq!(loaded.bodies[0].source.cut_extrusion_indices(), [1]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn save_rejects_circular_parameters() {
         let dir = std::env::temp_dir();
         let path = dir.join("bearcad_circular_params_test.bearcad");

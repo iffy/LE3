@@ -52,6 +52,19 @@ BearcadShape* bearcad_shape_loft(const double* bottom_xyz, const double* top_xyz
 // 0 = fuse (a ∪ b), 1 = cut (a − b), 2 = common (a ∩ b). NULL on failure.
 BearcadShape* bearcad_shape_boolean(const BearcadShape* a, const BearcadShape* b, int op);
 
+// Apply fillets of the given radii to the shape's edges whose two endpoints match
+// each (ax,ay,az,bx,by,bz) 6-tuple in `edges` (n edges, radii[n]). Edge match =
+// both endpoints within tol of the OCCT edge's two vertices (either order). All
+// requested edges are added to one BRepFilletAPI_MakeFillet before building.
+// Returns a new owned shape, or NULL on failure (an edge not found, OCCT error).
+BearcadShape* bearcad_shape_fillet(const BearcadShape* s, const double* edges,
+                                   const double* radii, unsigned long n);
+
+// Same as bearcad_shape_fillet, but a symmetric chamfer of the given distances via
+// BRepFilletAPI_MakeChamfer::Add(dist, edge). NULL on failure.
+BearcadShape* bearcad_shape_chamfer(const BearcadShape* s, const double* edges,
+                                    const double* dists, unsigned long n);
+
 // Solid volume via BRepGProp mass properties. Negative on error.
 double bearcad_shape_volume(const BearcadShape* shape);
 
@@ -64,6 +77,19 @@ double* bearcad_shape_tessellate(const BearcadShape* shape, double deflection,
 void bearcad_tri_free(double* tris);
 
 void bearcad_shape_free(BearcadShape* shape);
+
+// ---------------------------------------------------------------------------
+// STEP (ISO 10303-21) data exchange via OCCT (#65/#71): real BREP, including
+// curved surfaces, not just the hand-rolled faceted subset.
+// ---------------------------------------------------------------------------
+
+// Write `s` to `path` as an AP214 STEP file. Returns 0 on success, nonzero on
+// failure (OCCT error, write failure).
+int bearcad_shape_write_step(const BearcadShape* s, const char* path);
+
+// Read the first/combined shape from a STEP file at `path` (curved surfaces
+// included). Returns a new owned shape, or NULL on failure / an empty file.
+BearcadShape* bearcad_read_step(const char* path);
 
 #ifdef __cplusplus
 }

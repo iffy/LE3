@@ -78,23 +78,23 @@ pub fn extrusion_mesh(doc: &Document, extrusion: &Extrusion) -> Option<SolidMesh
     (!mesh.is_empty()).then_some(mesh)
 }
 
-/// OCCT BREP solid for the extrusions the kernel currently handles (#86): a
-/// single profile face, no edge treatments, extruded by a pure translation (no
-/// slanted target). `None` for anything else, so callers fall back to the
-/// hand-rolled mesher — the migration is incremental.
+/// OCCT BREP solid for the extrusions the kernel currently handles (#86/#77): a
+/// single profile face extruded by a pure translation (prism) or to a slanted
+/// target (ruled loft), with any 3D edge chamfer/fillet edge treatments applied as
+/// *real* `BRepFilletAPI` fillets/chamfers on the built solid (#77). `None` for
+/// anything else — a multi-face extrusion, a degenerate profile, or any edge
+/// treatment the kernel can't place (see [`edge_ref_world_endpoints`]) — so callers
+/// fall back to the hand-rolled mesher and we never ship broken geometry.
 #[cfg(feature = "occt")]
 fn occt_extrusion_shape(
     doc: &Document,
     extrusion: &Extrusion,
     distance: f32,
 ) -> Option<crate::kernel::Shape> {
-    // Exactly one face, and no chamfer/fillet edge treatments on it.
+    // Exactly one face.
     let [face] = extrusion.faces.as_slice() else {
         return None;
     };
-    if extrusion.edge_treatments.iter().any(|t| t.amount > 0.0) {
-        return None;
-    }
     let (profile, normal) = face_profile_world(doc, face)?;
     if profile.len() < 3 {
         return None;
@@ -111,10 +111,89 @@ fn occt_extrusion_shape(
         .iter()
         .zip(&top)
         .all(|(p, t)| (*t - *p - dir).length() <= 1e-4);
-    if is_translation {
+    let base_shape = if is_translation {
         crate::kernel::Shape::prism(&profile, dir)
     } else {
         crate::kernel::Shape::loft(&profile, &top)
+    }?;
+
+    // Real BREP edge fillets/chamfers (#77). Split the active treatments into fillet
+    // and chamfer groups (each applied in one batched kernel call), matching each
+    // edge to the built solid by its analytic world-space endpoints. Any missing edge
+    // or kernel error returns `None` -> the whole extrusion falls back to the mesher.
+    let mut fillet_edges: Vec<(Vec3, Vec3)> = Vec::new();
+    let mut fillet_radii: Vec<f32> = Vec::new();
+    let mut chamfer_edges: Vec<(Vec3, Vec3)> = Vec::new();
+    let mut chamfer_dists: Vec<f32> = Vec::new();
+    for t in &extrusion.edge_treatments {
+        if t.amount <= 0.0 {
+            continue;
+        }
+        let endpoints = edge_ref_world_endpoints(doc, extrusion, &t.edge)?;
+        match t.kind {
+            VertexTreatmentKind::Fillet => {
+                fillet_edges.push(endpoints);
+                fillet_radii.push(t.amount);
+            }
+            VertexTreatmentKind::Chamfer => {
+                chamfer_edges.push(endpoints);
+                chamfer_dists.push(t.amount);
+            }
+        }
+    }
+    if fillet_edges.is_empty() && chamfer_edges.is_empty() {
+        return Some(base_shape);
+    }
+    let mut shape = base_shape;
+    if !fillet_edges.is_empty() {
+        shape = shape.fillet(&fillet_edges, &fillet_radii)?;
+    }
+    if !chamfer_edges.is_empty() {
+        shape = shape.chamfer(&chamfer_edges, &chamfer_dists)?;
+    }
+    Some(shape)
+}
+
+/// World-space endpoints of one analytic extrusion edge (#77), derived from the very
+/// same analytic geometry [`treatable_edges`] and the hand-rolled mesh-bevel builder
+/// use — so the OCCT edge-matching in [`occt_extrusion_shape`] keys off the identical
+/// coordinates the picking/preview code does. A `Vertical` edge runs from a bottom
+/// profile vertex to the corresponding top vertex; a `Cap` edge is the boundary
+/// between consecutive vertices of the chosen (base/top) ring. `None` if the face is
+/// missing/degenerate or the edge index is out of range for its profile loop.
+#[cfg(feature = "occt")]
+fn edge_ref_world_endpoints(
+    doc: &Document,
+    extrusion: &Extrusion,
+    edge: &ExtrusionEdgeRef,
+) -> Option<(Vec3, Vec3)> {
+    let face = extrusion.faces.get(edge.face())?;
+    let (base, normal) = face_profile_world(doc, face)?;
+    let n = base.len();
+    if n < 3 {
+        return None;
+    }
+    let distance = effective_distance(doc, extrusion);
+    let top = |i: usize| extruded_top_point(doc, extrusion, normal, base[i], distance);
+    match *edge {
+        ExtrusionEdgeRef::Vertical { edge, .. } => {
+            if edge >= n {
+                return None;
+            }
+            let v = (edge + 1) % n;
+            Some((base[v], top(v)))
+        }
+        ExtrusionEdgeRef::Cap { edge, top: is_top, .. } => {
+            if edge >= n {
+                return None;
+            }
+            let e2 = (edge + 1) % n;
+            if is_top {
+                Some((top(edge), top(e2)))
+            } else {
+                Some((base[edge], base[e2]))
+            }
+        }
     }
 }
 
@@ -126,18 +205,18 @@ fn occt_extrusion_mesh(doc: &Document, extrusion: &Extrusion, distance: f32) -> 
     (!tris.is_empty()).then_some(SolidMesh { triangles: tris })
 }
 
-/// OCCT-backed mesh for a whole body whose every extrusion the kernel can
-/// represent: the per-extrusion prisms are **fused** into one real unioned solid
-/// (#86) — so overlapping add-to-body extrusions merge into a single watertight
-/// shape instead of concatenated triangle soup with internal walls. `None` if any
-/// extrusion isn't kernel-representable, so [`body_solid_mesh`] falls back to the
-/// hand-rolled per-extrusion concatenation.
+/// OCCT solid fusing every kernel-representable extrusion in `indices` into one real unioned
+/// shape. `None` if any listed extrusion isn't kernel-representable; the outer `Option`-of-
+/// -`Option` collapses to `Some(None)` when the list contributes no geometry at all (all
+/// deleted/degenerate).
 #[cfg(feature = "occt")]
-fn occt_body_mesh(doc: &Document, extrusion_indices: &[usize]) -> Option<SolidMesh> {
+fn occt_fused_extrusions(
+    doc: &Document,
+    indices: &[usize],
+) -> Option<Option<crate::kernel::Shape>> {
     use crate::kernel::BoolOp;
     let mut fused: Option<crate::kernel::Shape> = None;
-    let mut any = false;
-    for &ei in extrusion_indices {
+    for &ei in indices {
         let extrusion = doc.extrusions.get(ei)?;
         if extrusion.deleted {
             continue;
@@ -147,22 +226,82 @@ fn occt_body_mesh(doc: &Document, extrusion_indices: &[usize]) -> Option<SolidMe
             continue;
         }
         let shape = occt_extrusion_shape(doc, extrusion, distance)?;
-        any = true;
         fused = Some(match fused {
             None => shape,
             Some(acc) => acc.boolean(&shape, BoolOp::Fuse)?,
         });
     }
-    let fused = fused.filter(|_| any)?;
-    let tris = fused.tessellate(OCCT_DEFLECTION as f64);
+    Some(fused)
+}
+
+/// OCCT-backed mesh for a whole body whose every extrusion the kernel can
+/// represent: the per-extrusion prisms are **fused** into one real unioned solid
+/// (#86), then any **cut** extrusions are subtracted from that solid (#35) — so
+/// overlapping add-to-body extrusions merge into a single watertight shape and cuts
+/// carve real holes, instead of concatenated triangle soup with internal walls.
+/// `None` if any add/cut extrusion isn't kernel-representable, so [`body_solid_mesh`]
+/// falls back to the hand-rolled per-extrusion concatenation.
+#[cfg(feature = "occt")]
+fn occt_body_mesh(
+    doc: &Document,
+    add_indices: &[usize],
+    cut_indices: &[usize],
+) -> Option<SolidMesh> {
+    let solid = occt_body_shape_from_indices(doc, add_indices, cut_indices)?;
+    let tris = solid.tessellate(OCCT_DEFLECTION as f64);
     (!tris.is_empty()).then_some(SolidMesh { triangles: tris })
+}
+
+/// Build the fused/cut OCCT solid for the extrusions in `add_indices`/`cut_indices` — the
+/// real BREP shape *before* tessellation (see [`occt_body_mesh`]). `None` if any add/cut
+/// extrusion isn't kernel-representable, or the adds contribute no geometry at all.
+#[cfg(feature = "occt")]
+fn occt_body_shape_from_indices(
+    doc: &Document,
+    add_indices: &[usize],
+    cut_indices: &[usize],
+) -> Option<crate::kernel::Shape> {
+    use crate::kernel::BoolOp;
+    let mut solid = occt_fused_extrusions(doc, add_indices)??;
+    // Subtract each cut extrusion's solid. A cut that isn't kernel-representable aborts to the
+    // fallback (returns None); a cut contributing no geometry is a no-op.
+    for &ei in cut_indices {
+        let extrusion = doc.extrusions.get(ei)?;
+        if extrusion.deleted {
+            continue;
+        }
+        let distance = effective_distance(doc, extrusion);
+        if extrusion.faces.is_empty() || distance.abs() < 1e-4 {
+            continue;
+        }
+        let cut = occt_extrusion_shape(doc, extrusion, distance)?;
+        solid = solid.boolean(&cut, BoolOp::Cut)?;
+    }
+    Some(solid)
+}
+
+/// The body's real OCCT BREP solid (adds fused, cuts subtracted), *before* tessellation —
+/// used by STEP export (#65) to write genuine BREP rather than tessellated triangles. `None`
+/// for a deleted/missing body, an imported-mesh body (no kernel solid), or a body whose
+/// geometry isn't fully kernel-representable (the caller then falls back to the mesh path).
+#[cfg(feature = "occt")]
+pub fn occt_body_shape(doc: &Document, body_index: usize) -> Option<crate::kernel::Shape> {
+    let body = doc.bodies.get(body_index)?;
+    if body.deleted || body.source.imported_mesh_index().is_some() {
+        return None;
+    }
+    occt_body_shape_from_indices(
+        doc,
+        body.source.extrusion_indices(),
+        body.source.cut_extrusion_indices(),
+    )
 }
 
 /// Linear tessellation deflection (mm) for OCCT meshing (#86). Flat prism faces
 /// triangulate exactly regardless; this only bounds the chord error on curved
 /// faces once those go through the kernel.
 #[cfg(feature = "occt")]
-const OCCT_DEFLECTION: f32 = 0.05;
+pub const OCCT_DEFLECTION: f32 = 0.05;
 
 /// Build the solid mesh for a single body (by index), or `None` if the body is deleted,
 /// missing, or its source feature produces no geometry.
@@ -177,10 +316,20 @@ pub fn body_solid_mesh(doc: &Document, body_index: usize) -> Option<SolidMesh> {
             triangles: imported.triangles.clone(),
         });
     }
-    // Fuse the body's extrusions into one real solid via OCCT when they're all
-    // kernel-representable (#86); otherwise fall back to per-extrusion meshing.
+    // Fuse the body's added extrusions into one real solid via OCCT and subtract its cut
+    // extrusions (#86/#35) when they're all kernel-representable; otherwise fall back to
+    // per-extrusion meshing below.
+    //
+    // KNOWN LIMITATION (non-`occt` build): the hand-rolled fallback below cannot perform a
+    // solid subtraction, so a body with cut extrusions renders its additive geometry only —
+    // the cut is silently ignored. This is resolved once the kernel is the default (#89);
+    // until then, cut mode is only *offered* in the GUI when `occt` is compiled in.
     #[cfg(feature = "occt")]
-    if let Some(mesh) = occt_body_mesh(doc, body.source.extrusion_indices()) {
+    if let Some(mesh) = occt_body_mesh(
+        doc,
+        body.source.extrusion_indices(),
+        body.source.cut_extrusion_indices(),
+    ) {
         return Some(mesh);
     }
     let mut mesh = SolidMesh::default();
@@ -1516,6 +1665,60 @@ mod tests {
         assert!(body_solid_mesh(&doc, 0).is_none());
     }
 
+    /// A body built from a 10x10x5 box (extrusion 0) with a 4x4 column (extrusion 1, centered)
+    /// cut through it (#35): source `Solid { add: [0], cut: [1] }`.
+    fn cut_body_doc() -> Document {
+        let (mut doc, sketch) = sketch_doc();
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 0.0, 0.0, 10.0, 10.0));
+        doc.rects
+            .push(Rect::from_local_corners(sketch, 3.0, 3.0, 7.0, 7.0));
+        doc.extrusions
+            .push(extrusion(sketch, vec![ExtrudeFace::Rect(0)], 5.0));
+        doc.extrusions
+            .push(extrusion(sketch, vec![ExtrudeFace::Rect(1)], 5.0));
+        doc.bodies.push(crate::model::Body {
+            source: crate::model::BodySource::Solid {
+                add: vec![0],
+                cut: vec![1],
+            },
+            name: None,
+            deleted: false,
+        });
+        doc
+    }
+
+    #[cfg(not(feature = "occt"))]
+    #[test]
+    fn cut_body_renders_additive_geometry_only_without_kernel() {
+        // KNOWN LIMITATION (#35/#89): a non-kernel build can't subtract solids, so a body with
+        // a cut extrusion falls back to the additive geometry (the 10x10x5 box). It must still
+        // produce a mesh (not panic / not return None).
+        let doc = cut_body_doc();
+        let mesh = body_solid_mesh(&doc, 0).expect("additive fallback mesh");
+        assert!(!mesh.is_empty());
+        // Just the box: 12 triangles, occupying the full 10x10x5 footprint (the cut is ignored).
+        assert_eq!(mesh.triangles.len(), 12);
+        let (min, max) = mesh.bounds().unwrap();
+        assert!((max.x - min.x - 10.0).abs() < 1e-4 && (max.y - min.y - 10.0).abs() < 1e-4);
+        assert!((max.z - min.z - 5.0).abs() < 1e-4);
+    }
+
+    #[cfg(feature = "occt")]
+    #[test]
+    fn occt_cut_body_subtracts_overlapping_extrusion_volume() {
+        // A 10x10x5 box (500 mm^3) with a 4x4 column cut clean through it removes 4*4*5 = 80,
+        // leaving ~420. The result is meshed via the kernel's Cut boolean (#35); its
+        // divergence-theorem volume should match.
+        let doc = cut_body_doc();
+        let mesh = body_solid_mesh(&doc, 0).expect("occt cut-body mesh");
+        let volume = mesh_signed_volume(&mesh).abs();
+        assert!(
+            (volume - 420.0).abs() < 5.0,
+            "cut-body volume {volume}, expected ~420"
+        );
+    }
+
     #[test]
     fn negative_distance_extrudes_the_other_way() {
         let (mut doc, sketch) = sketch_doc();
@@ -1631,6 +1834,7 @@ mod tests {
     /// watertight solid) — the strongest generic check available for a hand-derived mesh-bevel
     /// algorithm without visualizing it. Coordinates are snapped to a millimetre/1000 grid so
     /// two triangles' shared edge compares equal despite unrelated floating-point paths.
+    #[cfg(not(feature = "occt"))]
     fn assert_watertight(mesh: &SolidMesh) {
         use std::collections::HashMap;
         let key = |p: Vec3| {
@@ -1707,6 +1911,12 @@ mod tests {
         .is_none());
     }
 
+    // The next several tests assert mesh-bevel-specific triangle counts and removed
+    // volumes — only valid for the hand-rolled mesher. Under `--features occt` these
+    // extrusions build true BREP fillets/chamfers (#77), a different tessellation and
+    // a different (true-arc vs faceted-bezier) removed volume, so they're scoped to
+    // the default build; the OCCT path has its own watertightness tests below.
+    #[cfg(not(feature = "occt"))]
     #[test]
     fn vertical_edge_chamfer_is_watertight_and_adds_expected_triangles() {
         let (doc, _sketch, mut ext) = box_doc();
@@ -1727,6 +1937,7 @@ mod tests {
         assert!(mesh.triangles.iter().flatten().all(|p| (*p - cut_corner).length() > 1e-3));
     }
 
+    #[cfg(not(feature = "occt"))]
     #[test]
     fn vertical_edge_fillet_is_watertight_and_adds_expected_triangles() {
         let (doc, _sketch, mut ext) = box_doc();
@@ -1757,6 +1968,7 @@ mod tests {
             .sum()
     }
 
+    #[cfg(not(feature = "occt"))]
     #[test]
     fn cap_edge_chamfer_is_watertight_and_removes_expected_volume() {
         let (doc, _sketch, mut ext) = box_doc();
@@ -1784,6 +1996,7 @@ mod tests {
         assert!((volume - 480.0).abs() < 1.0, "volume {volume}");
     }
 
+    #[cfg(not(feature = "occt"))]
     #[test]
     fn cap_edge_fillet_on_top_is_watertight_and_removes_expected_volume() {
         let (doc, _sketch, mut ext) = box_doc();
@@ -1801,6 +2014,7 @@ mod tests {
         assert!((volume - (500.0 - removed)).abs() < 0.5, "volume {volume}, removed ~{removed}");
     }
 
+    #[cfg(not(feature = "occt"))]
     #[test]
     fn multiple_non_conflicting_treatments_combine_and_stay_watertight() {
         let (doc, _sketch, mut ext) = box_doc();
@@ -1819,6 +2033,69 @@ mod tests {
         assert_watertight(&mesh);
         let volume = mesh_signed_volume(&mesh);
         assert!(volume > 400.0 && volume < 500.0, "volume {volume}");
+    }
+
+    // --- OCCT path (#77): true BREP fillets/chamfers replace the mesh-bevel above. ---
+    // These don't hard-code triangle counts (OCCT tessellation differs); instead they
+    // check the treated solid is watertight (its mesh's divergence-theorem volume
+    // matches OCCT's own exact solid volume) and that a treatment removed a sane, small
+    // amount of material. Roundness of a fillet can't be verified in a headless env.
+
+    #[cfg(feature = "occt")]
+    #[test]
+    fn occt_vertical_edge_fillet_is_watertight_and_removes_material() {
+        let (doc, _sketch, base) = box_doc();
+        let dist = effective_distance(&doc, &base);
+        let untreated = occt_extrusion_shape(&doc, &base, dist).unwrap().volume().unwrap();
+
+        let mut ext = base;
+        ext.edge_treatments.push(EdgeTreatment {
+            edge: ExtrusionEdgeRef::Vertical { face: 0, edge: 0 },
+            kind: VertexTreatmentKind::Fillet,
+            amount: 2.0,
+        });
+        let solid_vol = occt_extrusion_shape(&doc, &ext, dist).unwrap().volume().unwrap();
+        let mesh = extrusion_mesh(&doc, &ext).unwrap();
+        let mesh_vol = mesh_signed_volume(&mesh).abs() as f64;
+        assert!(mesh_vol.is_finite() && mesh_vol > 0.0, "mesh vol {mesh_vol}");
+        // Watertight: the closed mesh's divergence-theorem volume matches the exact solid.
+        assert!(
+            (mesh_vol - solid_vol).abs() < solid_vol * 2e-2,
+            "mesh vol {mesh_vol} vs solid vol {solid_vol}"
+        );
+        // A fillet removes only a small sliver of the 10x10x5 box.
+        assert!(
+            solid_vol < untreated && solid_vol > untreated * 0.9,
+            "solid {solid_vol}, untreated {untreated}"
+        );
+    }
+
+    #[cfg(feature = "occt")]
+    #[test]
+    fn occt_cap_edge_chamfer_is_watertight_and_removes_material() {
+        let (doc, _sketch, base) = box_doc();
+        let dist = effective_distance(&doc, &base);
+        let untreated = occt_extrusion_shape(&doc, &base, dist).unwrap().volume().unwrap();
+
+        let mut ext = base;
+        ext.edge_treatments.push(EdgeTreatment {
+            edge: ExtrusionEdgeRef::Cap { face: 0, edge: 0, top: false },
+            kind: VertexTreatmentKind::Chamfer,
+            amount: 2.0,
+        });
+        let solid_vol = occt_extrusion_shape(&doc, &ext, dist).unwrap().volume().unwrap();
+        let mesh = extrusion_mesh(&doc, &ext).unwrap();
+        let mesh_vol = mesh_signed_volume(&mesh).abs() as f64;
+        assert!(mesh_vol.is_finite() && mesh_vol > 0.0, "mesh vol {mesh_vol}");
+        assert!(
+            (mesh_vol - solid_vol).abs() < solid_vol * 2e-2,
+            "mesh vol {mesh_vol} vs solid vol {solid_vol}"
+        );
+        // A 2mm chamfer off one 10mm bottom edge removes a ~20mm^3 triangular prism.
+        assert!(
+            solid_vol < untreated && solid_vol > untreated * 0.9,
+            "solid {solid_vol}, untreated {untreated}"
+        );
     }
 
     #[test]

@@ -14,15 +14,30 @@ Local-first, parametric CAD. Built by robots.
 | Windows (x86_64) | [bearcad.exe](https://github.com/iffy/BearCAD/releases/latest/download/bearcad.exe) |
 | Linux (x86_64) | [bearcad-linux-x86_64.tar.gz](https://github.com/iffy/BearCAD/releases/latest/download/bearcad-linux-x86_64.tar.gz) |
 
-## Docs
+## Website & docs
 
-Full documentation — a tool-by-tool GUI/navigation reference and the Lua scripting API — lives in
-[`docs-site/`](docs-site/) (a [Docusaurus](https://docusaurus.io/) site) and publishes to
-[iffy.github.io/BearCAD](https://iffy.github.io/BearCAD/) via GitHub Pages once enabled in repo
-settings. Run it locally with:
+The project website and documentation are one [Docusaurus](https://docusaurus.io/) site in
+[`docs-site/`](docs-site/). It publishes to
+[iffy.github.io/BearCAD](https://iffy.github.io/BearCAD/) via GitHub Pages (see
+[`.github/workflows/docs.yml`](.github/workflows/docs.yml)) once Pages is enabled in repo
+settings. The site has two parts:
+
+- **Landing page** at the site root (`/`) — hero, download link, and doc entry points.
+- **Documentation** under `/docs/` — a tool-by-tool GUI/navigation reference and the Lua
+  scripting API.
+
+Build the whole site (landing page + docs together) locally:
 
 ```sh
-cd docs-site && npm install && npm start
+cd docs-site
+npm ci            # or: npm install
+npm run build     # static output in docs-site/build/ (build/index.html + build/docs/)
+```
+
+For a live-reloading dev server while editing:
+
+```sh
+cd docs-site && npm run start
 ```
 
 ## Status

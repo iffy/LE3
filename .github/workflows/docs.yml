@@ -1,4 +1,4 @@
-name: Docs
+name: Website
 
 on:
   push:
@@ -39,7 +39,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build Docusaurus site
+      - name: Build website (landing page + docs)
         run: npm run build
 
       - name: Configure Pages

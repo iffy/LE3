@@ -8,7 +8,7 @@ title: Point-level selection
 `bearcad.select` normally targets a whole element (a line, a rect, a circle). Point-level
 selection targets an individual **vertex** — a `ConstraintPoint` — instead: a line endpoint, a
 rectangle corner, or (with an explicit flag) a circle's center. This uses the same point
-numbering the interactive [Constraint](/tools/constraint) tool uses, so a script can drive exactly
+numbering the interactive [Constraint](/docs/tools/constraint) tool uses, so a script can drive exactly
 the same constraint flows a user would with the mouse.
 
 ## Selecting a line endpoint

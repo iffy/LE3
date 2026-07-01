@@ -18,9 +18,9 @@ vice versa.
 
 These docs are split into two sections:
 
-- **[Tools & Navigation](/tools)** — what each toolbar tool does, how sketching and dimensioning
+- **[Tools & Navigation](/docs/tools)** — what each toolbar tool does, how sketching and dimensioning
   work, and how to move around the 3D viewport (orbit/pan/zoom, the view-cube HUD, sketch mode).
-- **[Scripting](/scripting)** — the Lua API: the declarative `bearcad.*` modeling namespace, the
+- **[Scripting](/docs/scripting)** — the Lua API: the declarative `bearcad.*` modeling namespace, the
   `bearcad.ui.*` simulated-interaction namespace, and how to run a script from the command line.
 
 ## Quick start
@@ -32,7 +32,7 @@ cargo run
 Pick a face with the **Sketch** tool (or start on the default ground plane), then draw with
 **Rectangle**, **Line**, or **Circle**. Type dimensions while drawing, **Tab** cycles fields,
 **Enter** commits. **Right-drag** orbits the camera; **Shift+right-drag** pans; the mouse wheel
-zooms. See [Tools & Navigation](/tools) for the full tool-by-tool reference.
+zooms. See [Tools & Navigation](/docs/tools) for the full tool-by-tool reference.
 
 To drive the app from a script instead:
 
@@ -40,7 +40,7 @@ To drive the app from a script instead:
 cargo run -- --script examples/rectangle.lua --exit
 ```
 
-See [Scripting](/scripting) for the full API.
+See [Scripting](/docs/scripting) for the full API.
 
 ## Where this content comes from
 

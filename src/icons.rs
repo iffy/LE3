@@ -47,11 +47,15 @@ pub enum IconId {
     ViewList,
     ViewTree,
     ViewGraph,
+    /// Extrude body-mode picker icons (#35).
+    NewBody,
+    AddToBody,
+    CutBody,
 }
 
 impl IconId {
     #[cfg(test)]
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 37] = [
         Self::Select,
         Self::Rectangle,
         Self::Line,
@@ -86,6 +90,9 @@ impl IconId {
         Self::ViewList,
         Self::ViewTree,
         Self::ViewGraph,
+        Self::NewBody,
+        Self::AddToBody,
+        Self::CutBody,
     ];
 
     pub fn svg_source(self) -> &'static str {
@@ -124,6 +131,9 @@ impl IconId {
             Self::ViewList => include_str!("assets/icons/view_list.svg"),
             Self::ViewTree => include_str!("assets/icons/view_tree.svg"),
             Self::ViewGraph => include_str!("assets/icons/view_graph.svg"),
+            Self::NewBody => include_str!("assets/icons/new_body.svg"),
+            Self::AddToBody => include_str!("assets/icons/add_to_body.svg"),
+            Self::CutBody => include_str!("assets/icons/cut_body.svg"),
         }
     }
 
@@ -163,6 +173,9 @@ impl IconId {
             Self::ViewList => "List view",
             Self::ViewTree => "Tree view",
             Self::ViewGraph => "Graph view",
+            Self::NewBody => "New body",
+            Self::AddToBody => "Add to body",
+            Self::CutBody => "Cut body",
         }
     }
 }

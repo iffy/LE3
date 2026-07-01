@@ -67,5 +67,5 @@ Point-level selection (`bearcad.select{ kind = "line", index = 0, ["end"] = "end
 N`, `point = true`) targets an individual `ConstraintPoint` instead of a whole element, and
 `bearcad.select{ kind = "face", face = {...}, index }` (add `edge = true` for the edge instead of
 the vertex) targets the sketched-on face's own boundary — see
-[Scripting → point-level selection](/scripting/point-selection) for the full API and a worked
+[Scripting → point-level selection](/docs/scripting/point-selection) for the full API and a worked
 example of closing a polygon loop purely from a script.

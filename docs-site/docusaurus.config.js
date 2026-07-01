@@ -81,7 +81,9 @@ const config = {
       ({
         docs: {
           sidebarPath: './sidebars.js',
-          routeBasePath: '/',
+          // Docs live under /docs/ so the site root (/) is free for the
+          // landing page in src/pages/index.js.
+          routeBasePath: '/docs',
           editUrl: 'https://github.com/iffy/BearCAD/tree/master/docs-site/',
         },
         // No blog for this first draft — the docs site is purely reference
@@ -139,8 +141,8 @@ const config = {
           {
             title: 'Docs',
             items: [
-              {label: 'Tools & Navigation', to: '/tools'},
-              {label: 'Scripting', to: '/scripting'},
+              {label: 'Tools & Navigation', to: '/docs/tools'},
+              {label: 'Scripting', to: '/docs/scripting'},
             ],
           },
           {

@@ -101,9 +101,9 @@ yield until the next frame rather than blocking.
 
 ## Where to go next
 
-- **[Declarative modeling](/scripting/declarative-modeling)** — worked examples: sketch, draw,
+- **[Declarative modeling](/docs/scripting/declarative-modeling)** — worked examples: sketch, draw,
   extrude, export.
-- **[The `bearcad.ui.*` namespace](/scripting/ui-namespace)** — camera, panes, the palette, and
+- **[The `bearcad.ui.*` namespace](/docs/scripting/ui-namespace)** — camera, panes, the palette, and
   synthetic input.
-- **[Point-level selection](/scripting/point-selection)** — selecting a single vertex instead of a
+- **[Point-level selection](/docs/scripting/point-selection)** — selecting a single vertex instead of a
   whole element, for scripted constraint authoring.

@@ -1,41 +1,35 @@
-# Website
+# BearCAD website & docs
 
-This website is built using [Docusaurus](https://docusaurus.io/), a modern static website generator.
+The BearCAD website and documentation, built with [Docusaurus](https://docusaurus.io/).
 
-## Installation
+- The **landing page** is served at the site root (`/`) from `src/pages/index.js`.
+- The **documentation** is served under `/docs/` from the `docs/` folder.
 
-```bash
-yarn
-```
-
-## Local Development
+## Install
 
 ```bash
-yarn start
+npm ci
 ```
 
-This command starts a local development server and opens up a browser window. Most changes are reflected live without having to restart the server.
+## Local development
+
+```bash
+npm run start
+```
+
+Starts a local dev server and opens a browser window. Most changes reload live.
 
 ## Build
 
 ```bash
-yarn build
+npm run build
 ```
 
-This command generates static content into the `build` directory and can be served using any static contents hosting service.
+Generates the static site into `build/` — both `build/index.html` (landing page) and
+`build/docs/` (documentation). Serve it locally with `npm run serve`.
 
 ## Deployment
 
-Using SSH:
-
-```bash
-USE_SSH=true yarn deploy
-```
-
-Not using SSH:
-
-```bash
-GIT_USER=<Your GitHub username> yarn deploy
-```
-
-If you are using GitHub pages for hosting, this command is a convenient way to build the website and push to the `gh-pages` branch.
+Deployment is automated: pushes to `master` that touch `docs-site/**` trigger
+[`.github/workflows/docs.yml`](../.github/workflows/docs.yml), which runs `npm run build` and
+publishes `build/` to GitHub Pages.

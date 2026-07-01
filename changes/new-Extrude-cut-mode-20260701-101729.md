@@ -1,0 +1,1 @@
+Extrude cut mode (#35): subtract an extrusion from an existing body via the OCCT boolean cut, alongside New body / Add to body. New body-mode icons; scriptable via bearcad.extrude{ body = "cut" }. Cut is kernel-only; non-occt builds render additive geometry.

@@ -74,8 +74,9 @@ pub enum Instruction {
         sketch: SketchId,
         faces: Vec<crate::model::ExtrudeFace>,
         distance: f32,
-        /// Join the body of the face being extruded from instead of creating a new one (#32).
-        merge_into_body: bool,
+        /// How the extrusion attaches to bodies (#32/#35): new body, add to the extruded
+        /// face's body, or cut it from that body.
+        body: crate::actions::ExtrudeBodyChoice,
     },
     SetElementVisible {
         element: SceneElement,
@@ -265,10 +266,14 @@ impl Instruction {
             Instruction::Extrude {
                 faces,
                 distance,
-                merge_into_body,
+                body,
                 ..
             } => {
-                let body = if *merge_into_body { ", body = \"merge\"" } else { "" };
+                let body = match body {
+                    crate::actions::ExtrudeBodyChoice::New => "",
+                    crate::actions::ExtrudeBodyChoice::Merge => ", body = \"merge\"",
+                    crate::actions::ExtrudeBodyChoice::Cut => ", body = \"cut\"",
+                };
                 format!(
                     "bearcad.extrude{{ {}, distance = {distance}{body} }}",
                     extrude_face_args(faces)
@@ -859,14 +864,23 @@ pub fn instruction_from_action(action: &Action, doc: &crate::model::Document) ->
 pub fn instruction_for_new_extrusion(doc: &crate::model::Document) -> Option<Instruction> {
     let ei = doc.extrusions.len().checked_sub(1)?;
     let extrusion = doc.extrusions.get(ei)?;
-    let merge_into_body = crate::model::body_index_for_extrusion(doc, ei)
-        .and_then(|bi| doc.bodies.get(bi))
-        .is_some_and(|body| body.source.extrusion_indices().len() > 1);
+    let body = match crate::model::body_index_for_extrusion(doc, ei).and_then(|bi| doc.bodies.get(bi))
+    {
+        // Subtracted from its body → a cut (#35).
+        Some(body) if body.source.cut_extrusion_indices().contains(&ei) => {
+            crate::actions::ExtrudeBodyChoice::Cut
+        }
+        // Added alongside other extrusions → merged into an existing body (#32).
+        Some(body) if body.source.extrusion_indices().len() > 1 => {
+            crate::actions::ExtrudeBodyChoice::Merge
+        }
+        _ => crate::actions::ExtrudeBodyChoice::New,
+    };
     Some(Instruction::Extrude {
         sketch: extrusion.sketch,
         faces: extrusion.faces.clone(),
         distance: extrusion.distance,
-        merge_into_body,
+        body,
     })
 }
 
@@ -1837,13 +1851,13 @@ impl ScriptRunner {
                 sketch,
                 faces,
                 distance,
-                merge_into_body,
+                body,
             } => {
                 state.apply(Action::CreateExtrusion {
                     sketch,
                     faces,
                     distance,
-                    merge_into_body,
+                    body,
                 });
                 StepResult::Continue
             }
@@ -2464,7 +2478,7 @@ mod tests {
             sketch: 0,
             faces: vec![ExtrudeFace::Rect(2)],
             distance: 5.0,
-            merge_into_body: false,
+            body: crate::actions::ExtrudeBodyChoice::New,
         };
         assert_eq!(
             single_rect.as_lua(),
@@ -2475,7 +2489,7 @@ mod tests {
             sketch: 0,
             faces: vec![ExtrudeFace::Rect(0), ExtrudeFace::Circle(1), ExtrudeFace::Circle(2)],
             distance: 3.5,
-            merge_into_body: true,
+            body: crate::actions::ExtrudeBodyChoice::Merge,
         };
         assert_eq!(
             many.as_lua(),
@@ -2486,7 +2500,7 @@ mod tests {
             sketch: 0,
             faces: vec![ExtrudeFace::Polygon(vec![0, 1, 2])],
             distance: 6.0,
-            merge_into_body: false,
+            body: crate::actions::ExtrudeBodyChoice::New,
         };
         assert_eq!(
             polygon.as_lua(),

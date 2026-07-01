@@ -6,7 +6,7 @@ import styles from './styles.module.css';
 const FeatureList = [
   {
     title: 'Tools & Navigation',
-    to: '/tools',
+    to: '/docs/tools',
     description: (
       <>
         Tool-by-tool reference for Select, Sketch, Rectangle, Line, Circle, Fillet, Chamfer,
@@ -17,7 +17,7 @@ const FeatureList = [
   },
   {
     title: 'Scripting',
-    to: '/scripting',
+    to: '/docs/scripting',
     description: (
       <>
         The Lua API: declarative <code>bearcad.*</code> modeling, the{' '}
@@ -28,7 +28,7 @@ const FeatureList = [
   },
   {
     title: 'One model, two front ends',
-    to: '/intro',
+    to: '/docs/intro',
     description: (
       <>
         Everything achievable in the GUI is achievable by scripting, and vice versa — the same

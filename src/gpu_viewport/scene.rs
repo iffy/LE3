@@ -3861,7 +3861,7 @@ mod tests {
             sketch,
             faces: vec![crate::model::ExtrudeFace::Rect(0)],
             distance: 8.0,
-            merge_into_body: false,
+            body: crate::actions::ExtrudeBodyChoice::New,
         });
 
         let scene = build_scene_for_doc(&state);
@@ -3893,7 +3893,7 @@ mod tests {
             sketch,
             faces: vec![crate::model::ExtrudeFace::Rect(0)],
             distance: 6.0,
-            merge_into_body: false,
+            body: crate::actions::ExtrudeBodyChoice::New,
         });
         state.doc.extrusions[0].target = Some(crate::model::ExtrudeTarget::Plane(1));
 

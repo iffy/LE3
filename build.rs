@@ -109,7 +109,15 @@ fn build_occt_shim() {
 /// solids + booleans (TKBO/TKBool), shape healing they rely on (TKShHealing), and
 /// triangulation (TKMesh).
 const OCCT_TOOLKITS: &[&str] = &[
+    // STEP data exchange (STEPControl_Reader/Writer, #65/#71). Highest-level:
+    // depends on the modeling + foundation toolkits below, so links first.
+    "TKDESTEP",
+    "TKDE",
+    "TKXSBase",
     "TKMesh",
+    // Edge fillets/chamfers (BRepFilletAPI_*, #77). High-level: depends on
+    // TKTopAlgo/TKBRep/TKBO below, so it links first.
+    "TKFillet",
     "TKOffset",
     "TKBool",
     "TKBO",

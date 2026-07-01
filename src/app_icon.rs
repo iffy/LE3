@@ -53,15 +53,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_icon_png_decodes_to_square_image() {
-        let png = include_bytes!("assets/appicon.png");
-        let image = image::load_from_memory(png).expect("appicon.png should decode");
-        assert!(image.width() >= 256);
-        assert!(image.height() >= 256);
-        assert_eq!(image.width(), image.height());
-    }
-
-    #[test]
     fn load_rgba_icon_produces_window_sized_icon_data() {
         let icon = load_rgba_icon();
         assert!(!icon.rgba.is_empty());

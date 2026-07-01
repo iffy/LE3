@@ -101,7 +101,7 @@ bearcad.line{
 
 Reference a line's endpoints individually with `["end"] = "start"|"end"` — useful for closing a
 polygon loop purely from a script, see
-[Scripting → point-level selection](/scripting/point-selection):
+[Scripting → point-level selection](/docs/scripting/point-selection):
 
 ```lua
 bearcad.select{ kind = "line", index = 0, ["end"] = "end" }

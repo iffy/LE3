@@ -941,6 +941,16 @@ pub enum BodySource {
     /// A mesh body brought in via STL import (#70); indexes `Document::imported_meshes`
     /// rather than depending on a sketch-based feature.
     Imported(usize),
+    /// Additive extrusions with one or more extrusions **subtracted** (cut) from them (#35).
+    /// Purely-additive bodies stay in the `Extrusion`/`Extrusions` forms; a body only takes
+    /// this shape once it has a cut. `cut` is `#[serde(default)]` so any future add-only
+    /// `Solid` serialization stays readable (existing saved files never carry a cut list —
+    /// they load as `Extrusion`/`Extrusions` unchanged).
+    Solid {
+        add: Vec<usize>,
+        #[serde(default)]
+        cut: Vec<usize>,
+    },
 }
 
 impl BodySource {
@@ -948,23 +958,35 @@ impl BodySource {
         Self::Extrusion(extrusion)
     }
 
+    /// Extrusions **added** to (fused into) the body.
     pub fn extrusion_indices(&self) -> &[usize] {
         match self {
             Self::Extrusion(index) => std::slice::from_ref(index),
             Self::Extrusions(indices) => indices.as_slice(),
+            Self::Solid { add, .. } => add.as_slice(),
             Self::Imported(_) => &[],
+        }
+    }
+
+    /// Extrusions **subtracted** (cut) from the body (#35). Empty for every non-`Solid` form.
+    pub fn cut_extrusion_indices(&self) -> &[usize] {
+        match self {
+            Self::Solid { cut, .. } => cut.as_slice(),
+            Self::Extrusion(_) | Self::Extrusions(_) | Self::Imported(_) => &[],
         }
     }
 
     pub fn imported_mesh_index(&self) -> Option<usize> {
         match self {
             Self::Imported(index) => Some(*index),
-            Self::Extrusion(_) | Self::Extrusions(_) => None,
+            Self::Extrusion(_) | Self::Extrusions(_) | Self::Solid { .. } => None,
         }
     }
 
+    /// Whether the body is built from `extrusion` in any role (added or cut).
     pub fn owns_extrusion(&self, extrusion: usize) -> bool {
         self.extrusion_indices().contains(&extrusion)
+            || self.cut_extrusion_indices().contains(&extrusion)
     }
 
     pub fn append_extrusion(&mut self, extrusion: usize) {
@@ -973,27 +995,64 @@ impl BodySource {
                 *self = Self::Extrusions(vec![*existing, extrusion]);
             }
             Self::Extrusions(indices) => indices.push(extrusion),
+            Self::Solid { add, .. } => add.push(extrusion),
             // An imported mesh body has no extrusion to merge into; unreachable in practice
             // since merge candidates only ever come from extrusion-backed bodies.
             Self::Imported(_) => {}
         }
     }
 
-    /// Remove `extrusion` from this source (e.g. undoing a merge). Collapses back to the
-    /// single-extrusion form when only one index remains. No-op if `extrusion` isn't owned
-    /// or this is already a single-extrusion source (undo never removes a body's last/only
-    /// extrusion this way — that path tombstones the whole body instead).
-    pub fn remove_extrusion(&mut self, extrusion: usize) {
-        if let Self::Extrusions(indices) = self {
-            indices.retain(|&ei| ei != extrusion);
-            if let [only] = indices.as_slice() {
-                *self = Self::Extrusion(*only);
+    /// Register `extrusion` as a **cut** (subtraction) of this body (#35), moving the source
+    /// into the `Solid` form if it wasn't already.
+    pub fn append_cut_extrusion(&mut self, extrusion: usize) {
+        match self {
+            Self::Extrusion(existing) => {
+                *self = Self::Solid {
+                    add: vec![*existing],
+                    cut: vec![extrusion],
+                };
             }
+            Self::Extrusions(indices) => {
+                *self = Self::Solid {
+                    add: std::mem::take(indices),
+                    cut: vec![extrusion],
+                };
+            }
+            Self::Solid { cut, .. } => cut.push(extrusion),
+            // An imported mesh body has no solid feature to cut; unreachable in practice.
+            Self::Imported(_) => {}
+        }
+    }
+
+    /// Remove `extrusion` from this source in whatever role it plays (e.g. undoing a merge or
+    /// a cut). Collapses back to the simplest form once the cut list is empty (and to the
+    /// single-extrusion form when one added index remains). No-op if `extrusion` isn't owned.
+    /// Undo never removes a body's last/only *added* extrusion this way — that path tombstones
+    /// the whole body instead.
+    pub fn remove_extrusion(&mut self, extrusion: usize) {
+        match self {
+            Self::Extrusions(indices) => {
+                indices.retain(|&ei| ei != extrusion);
+                if let [only] = indices.as_slice() {
+                    *self = Self::Extrusion(*only);
+                }
+            }
+            Self::Solid { add, cut } => {
+                add.retain(|&ei| ei != extrusion);
+                cut.retain(|&ei| ei != extrusion);
+                if cut.is_empty() {
+                    *self = match add.as_slice() {
+                        [only] => Self::Extrusion(*only),
+                        _ => Self::Extrusions(std::mem::take(add)),
+                    };
+                }
+            }
+            Self::Extrusion(_) | Self::Imported(_) => {}
         }
     }
 }
 
-/// Body index whose source includes `extrusion`, if any.
+/// Body index whose source includes `extrusion` (added or cut), if any.
 pub fn body_index_for_extrusion(doc: &Document, extrusion: usize) -> Option<usize> {
     doc.bodies.iter().position(|body| {
         !body.deleted && body.source.owns_extrusion(extrusion)

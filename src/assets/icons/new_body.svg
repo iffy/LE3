@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- single isometric cube (a new, standalone body) -->
+  <path d="M12 6 L21 11 L12 16 L3 11 Z" fill="currentColor" fill-opacity="0.30" stroke="none" />
+  <path d="M21 11 L21 21 L12 26 L12 16 Z" fill="currentColor" fill-opacity="0.18" stroke="none" />
+  <path d="M3 11 L3 21 L12 26 L12 16 Z" fill="currentColor" fill-opacity="0.10" stroke="none" />
+  <path d="M12 6 L21 11 L21 21 L12 26 L3 21 L3 11 Z" stroke="currentColor" />
+  <line x1="12" y1="16" x2="12" y2="26" />
+  <line x1="12" y1="16" x2="21" y2="11" />
+  <line x1="12" y1="16" x2="3" y2="11" />
+  <!-- "+" badge marking a brand-new body -->
+  <g stroke-width="2.4">
+    <line x1="25" y1="4" x2="25" y2="12" />
+    <line x1="21" y1="8" x2="29" y2="8" />
+  </g>
+</svg>

@@ -36,7 +36,7 @@ bearcad.ui.toggle_projection()
 bearcad.ui.shading("solid_wireframe")   -- "wireframe" | "transparent" | "solid" | "solid_wireframe"
 ```
 
-See [Navigation](/tools/navigation) for what these correspond to in the GUI, including the
+See [Navigation](/docs/tools/navigation) for what these correspond to in the GUI, including the
 view-cube HUD's gear/shading-modes popup.
 
 ## Panes and the command palette

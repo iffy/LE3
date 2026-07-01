@@ -38,7 +38,7 @@ bearcad.rect{ x = 10, y = 10, width = 80, height = 50, name = "Main box" }
 ```
 
 The simulated-interaction equivalent (only needed when the UI interaction itself is the point —
-see [Scripting → declarative vs. UI](/scripting#namespace-split)):
+see [Scripting → declarative vs. UI](/docs/scripting#namespace-split)):
 
 ```lua
 bearcad.ui.tool("rectangle")

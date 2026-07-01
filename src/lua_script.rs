@@ -1436,10 +1436,15 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
                     "extrude requires a `rect`/`circle`/`polygon`/`boolean` or `rects`/`circles` face list",
                 ));
             }
-            // `body = "merge"` joins the body of the face being extruded from (if any) instead
-            // of creating a new one (#32); any other value (including the default, omitted)
-            // always creates a new body.
-            let merge_into_body = opts.get::<Option<String>>("body")?.as_deref() == Some("merge");
+            // `body = "merge"` joins the body of the face being extruded from (if any), and
+            // `body = "cut"` subtracts the extrusion from that body (#32/#35); any other value
+            // (including the default, omitted) creates a new body. A cut has no effect without
+            // a candidate body, and in a non-kernel build renders the additive geometry only.
+            let body = match opts.get::<Option<String>>("body")?.as_deref() {
+                Some("merge") => crate::actions::ExtrudeBodyChoice::Merge,
+                Some("cut") => crate::actions::ExtrudeBodyChoice::Cut,
+                _ => crate::actions::ExtrudeBodyChoice::New,
+            };
             // Sketch from the first face's geometry (all faces should be coplanar).
             let sketch = unsafe {
                 let doc = &tick.state().doc;
@@ -1451,7 +1456,7 @@ pub fn register_api(lua: &Lua) -> mlua::Result<()> {
                     sketch,
                     faces,
                     distance,
-                    merge_into_body,
+                    body,
                 })?;
             }
             let element = SceneElement::Extrusion(unsafe {
@@ -2182,6 +2187,27 @@ mod tests {
         assert_eq!(state.doc.extrusions.len(), 2);
         assert_eq!(state.doc.bodies.len(), 1, "the second extrusion should join body 0");
         assert_eq!(state.doc.bodies[0].source.extrusion_indices(), [0, 1]);
+    }
+
+    #[test]
+    fn lua_extrude_with_body_cut_subtracts_from_the_existing_body() {
+        // `body = "cut"` (#35) records the new extrusion as a subtraction of the extruded
+        // face's body rather than fusing it. The model records the cut in every build; the
+        // geometry only performs it under `--features occt`.
+        let state = run_lua(
+            r#"
+            bearcad.new()
+            bearcad.rect{ width = 80, height = 50 }
+            bearcad.extrude{ rect = 0, distance = 20 }
+            bearcad.begin_sketch{ kind = "extrude_cap", extrusion = 0, profile = "rect", profile_index = 0, top = true }
+            bearcad.rect{ x = 10, y = 10, width = 20, height = 10 }
+            bearcad.extrude{ rect = 1, distance = 5, body = "cut" }
+        "#,
+        );
+        assert_eq!(state.doc.extrusions.len(), 2);
+        assert_eq!(state.doc.bodies.len(), 1, "the cut should not create a new body");
+        assert_eq!(state.doc.bodies[0].source.extrusion_indices(), [0]);
+        assert_eq!(state.doc.bodies[0].source.cut_extrusion_indices(), [1]);
     }
 
     #[test]

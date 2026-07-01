@@ -52,5 +52,5 @@ bearcad.select{ kind = "line", index = 0, ["end"] = "end" }
 bearcad.select({ kind = "rect", index = 0, corner = 2 }, true) -- additive
 ```
 
-See [Scripting → Point-level selection](/scripting/point-selection) for the full picture,
+See [Scripting → Point-level selection](/docs/scripting/point-selection) for the full picture,
 including how this powers joining two line endpoints purely from a script.

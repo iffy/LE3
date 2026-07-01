@@ -35,7 +35,7 @@ bottom and orbiting still feels normal instead of rolling sideways.
 - Press **Esc** (with nothing in progress) to leave the sketch and return to Select.
 - **Sketching on a body's own cap/side face:** its corners and edges become valid
   [Constraint](./constraint#selecting) targets, so you can pin sketch geometry to that face
-  directly — see [Scripting → face vertex/edge selection](/scripting/point-selection#selecting-a-faces-own-vertex-or-edge).
+  directly — see [Scripting → face vertex/edge selection](/docs/scripting/point-selection#selecting-a-faces-own-vertex-or-edge).
 
 ## Re-opening and leaving sketches
 

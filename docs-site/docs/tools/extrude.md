@@ -35,14 +35,25 @@ plain unconstrained distance. The live ghost preview reflects the snapped target
 while still dragging, not just after release — so extruding to a slanted or irregular target
 shows the actual resulting shape (e.g. a slanted top cap) rather than a generic blind extrude.
 
-## Joining an existing body
+## Joining or cutting an existing body
 
 A `Body`'s source is one or more extrusions. Extruding from a sketch on an existing body's face
 (a cap or side face) **defaults to joining that body** instead of creating a new one — the
-context pane shows "Add to `<body>`" vs. "New body" while extruding, or while editing an
-extrusion, to override the choice (editing can also split a merged extrusion back out into its
-own body). Deleting one extrusion of a multi-extrusion body only drops that extrusion's
-contribution; the body survives as long as at least one extrusion remains.
+context pane shows three icon-labelled choices while extruding, or while editing an extrusion:
+
+- **New body** — the extrusion becomes its own standalone body.
+- **Add to `<body>`** — the extrusion is fused into the existing body's solid.
+- **Cut `<body>`** — the extrusion is **subtracted** from the existing body's solid, carving a
+  pocket or hole.
+
+Editing an extrusion can also split a merged/cut extrusion back out into its own body. Deleting
+one extrusion of a multi-extrusion body only drops that extrusion's contribution; the body
+survives as long as at least one added extrusion remains.
+
+**Cut requires the OCCT geometry kernel.** A build without the kernel can't subtract solids, so
+the Cut option isn't offered there, and if a document with a cut extrusion is opened in such a
+build the body renders its additive geometry only (the cut is ignored). The cut is saved either
+way, so it reappears once opened in a kernel build.
 
 ## Overlapping shapes: intersection and difference regions
 
@@ -73,6 +84,9 @@ bearcad.extrude{ polygon = {0, 1, 2}, distance = 6 }
 -- Multiple profiles, and joining an existing body explicitly:
 bearcad.extrude{ rects = {0, 1}, distance = 10, body = "merge" }
 
+-- Cutting (subtracting) the extrusion from the face's body (needs the OCCT kernel to render):
+bearcad.extrude{ rect = 2, distance = 10, body = "cut" }
+
 -- Extrude just the intersection of a rect and a circle:
 bearcad.extrude{ boolean = { op = "intersection", a = {rect = 0}, b = {circle = 0} }, distance = 5 }
 
@@ -80,9 +94,9 @@ bearcad.extrude{ boolean = { op = "intersection", a = {rect = 0}, b = {circle = 
 bearcad.extrude{ boolean = { op = "difference", a = {rect = 0}, b = {circle = 0} }, distance = 5 }
 ```
 
-`body = "merge"` joins the face's body if there is one; omitted (or any other value) always
-creates a new body, matching the declarative/OpenSCAD-style default of "each call produces new
-geometry unless you say otherwise."
+`body = "merge"` joins, and `body = "cut"` subtracts from, the face's body if there is one;
+omitted (or any other value) always creates a new body, matching the declarative/OpenSCAD-style
+default of "each call produces new geometry unless you say otherwise."
 
 See [Sketch → scripting](./sketch.md#scripting) for `bearcad.begin_sketch{ kind = "extrude_cap" |
 "extrude_side", ... }`, which lets a script sketch on a solid's face the same way a user could by

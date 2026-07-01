@@ -17,20 +17,20 @@ the command palette, the toolbar, a keyboard shortcut, and the Lua scripting API
 
 | Tool | Shortcut | What it does |
 |---|---|---|
-| [Select](/tools/select) | — | Orbit/pan/zoom and pick geometry; the default tool. |
-| [Sketch](/tools/sketch) | `S` | Pick a face (or the ground plane) to enter sketch mode. |
-| [Rectangle](/tools/rectangle) | `R` | Draw a rectangle by two corners. |
-| [Line](/tools/line) | `L` | Draw connected line segments (polylines), straight or curved. |
-| [Circle](/tools/circle) | `O` | Draw a circle by center and radius/diameter. |
-| [Construction Plane](/tools/construction-plane) | `P` | Create a datum plane from a face or axis. |
-| [Dimension](/tools/dimension) | `D` | Add or edit a distance/length/angle constraint. |
-| [Constraint](/tools/constraint) | `C` | Apply geometric constraints (parallel, coincident, …). |
-| [Extrude](/tools/extrude) | `E` | Turn one or more coplanar sketch faces into a solid body. |
-| [Chamfer](/tools/chamfer) | `K` | Truncate a sketch corner with a straight cut. |
-| [Fillet](/tools/fillet) | `F` | Round a sketch corner with a bezier-approximated arc. |
+| [Select](/docs/tools/select) | — | Orbit/pan/zoom and pick geometry; the default tool. |
+| [Sketch](/docs/tools/sketch) | `S` | Pick a face (or the ground plane) to enter sketch mode. |
+| [Rectangle](/docs/tools/rectangle) | `R` | Draw a rectangle by two corners. |
+| [Line](/docs/tools/line) | `L` | Draw connected line segments (polylines), straight or curved. |
+| [Circle](/docs/tools/circle) | `O` | Draw a circle by center and radius/diameter. |
+| [Construction Plane](/docs/tools/construction-plane) | `P` | Create a datum plane from a face or axis. |
+| [Dimension](/docs/tools/dimension) | `D` | Add or edit a distance/length/angle constraint. |
+| [Constraint](/docs/tools/constraint) | `C` | Apply geometric constraints (parallel, coincident, …). |
+| [Extrude](/docs/tools/extrude) | `E` | Turn one or more coplanar sketch faces into a solid body. |
+| [Chamfer](/docs/tools/chamfer) | `K` | Truncate a sketch corner with a straight cut. |
+| [Fillet](/docs/tools/fillet) | `F` | Round a sketch corner with a bezier-approximated arc. |
 
 Every shortcut above is the platform-independent single-letter binding shown on the toolbar
-buttons (all shortcuts are rebindable; see [Navigation](/tools/navigation) for the camera/mouse
+buttons (all shortcuts are rebindable; see [Navigation](/docs/tools/navigation) for the camera/mouse
 bindings, which are separate from the tool-select letters above).
 
 ## Common tool UX patterns
@@ -53,5 +53,5 @@ A few conventions apply across most of the drawing tools:
   drives the contents of the Context pane, which shows the union of editable properties for the
   current tool/selection.
 
-See [Navigation](/tools/navigation) for camera controls, the view-cube HUD, and sketch mode's
+See [Navigation](/docs/tools/navigation) for camera controls, the view-cube HUD, and sketch mode's
 viewport border.

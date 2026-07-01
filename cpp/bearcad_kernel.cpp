@@ -13,16 +13,27 @@
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Common.hxx>
+#include <BRepFilletAPI_MakeFillet.hxx>
+#include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <STEPControl_Writer.hxx>
+#include <STEPControl_Reader.hxx>
+#include <IFSelect_ReturnStatus.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
 #include <Poly_Triangulation.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Solid.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <TopLoc_Location.hxx>
 #include <TopAbs_Orientation.hxx>
 #include <gp_Pnt.hxx>
@@ -30,6 +41,8 @@
 #include <Standard_Failure.hxx>
 #include <Standard_Version.hxx>
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 // Opaque owned BREP shape handle exposed across the C ABI.
@@ -139,6 +152,112 @@ extern "C" BearcadShape* bearcad_shape_boolean(const BearcadShape* a, const Bear
     }
 }
 
+namespace {
+
+// Match each requested edge (endpoint pair) to one of the shape's OCCT edges by
+// world-space endpoints, add it to `maker` with its per-edge amount, then build.
+// Returns the resulting shape, or an empty/null shape (via IsNull) on any failure.
+// `Maker` is BRepFilletAPI_MakeFillet or BRepFilletAPI_MakeChamfer — both expose
+// Add(Standard_Real, const TopoDS_Edge&), Build(), IsDone(), Shape().
+template <typename Maker>
+TopoDS_Shape apply_edge_treatment(const TopoDS_Shape& shape, const double* edges,
+                                  const double* amounts, unsigned long n) {
+    // Tolerance scaled to the shape's bounding box (min 1e-6) so endpoint matching
+    // is robust across model sizes without matching unrelated nearby vertices.
+    double tol = 1e-6;
+    {
+        Bnd_Box bb;
+        BRepBndLib::Add(shape, bb);
+        if (!bb.IsVoid()) {
+            double xmin, ymin, zmin, xmax, ymax, zmax;
+            bb.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+            double dx = xmax - xmin, dy = ymax - ymin, dz = zmax - zmin;
+            double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+            tol = std::max(1e-4 * diag, 1e-6);
+        }
+    }
+
+    // Dedupe: TopExp::MapShapes visits each shared edge once.
+    TopTools_IndexedMapOfShape edgeMap;
+    TopExp::MapShapes(shape, TopAbs_EDGE, edgeMap);
+
+    Maker maker(shape);
+    auto near = [tol](const gp_Pnt& p, double x, double y, double z) {
+        return p.SquareDistance(gp_Pnt(x, y, z)) <= tol * tol;
+    };
+
+    for (unsigned long i = 0; i < n; ++i) {
+        const double* e = edges + 6 * i;
+        bool matched = false;
+        for (Standard_Integer k = 1; k <= edgeMap.Extent(); ++k) {
+            const TopoDS_Edge& edge = TopoDS::Edge(edgeMap(k));
+            TopoDS_Vertex v1, v2;
+            TopExp::Vertices(edge, v1, v2);
+            if (v1.IsNull() || v2.IsNull()) {
+                continue;
+            }
+            gp_Pnt p1 = BRep_Tool::Pnt(v1);
+            gp_Pnt p2 = BRep_Tool::Pnt(v2);
+            bool fwd = near(p1, e[0], e[1], e[2]) && near(p2, e[3], e[4], e[5]);
+            bool rev = near(p1, e[3], e[4], e[5]) && near(p2, e[0], e[1], e[2]);
+            if (fwd || rev) {
+                maker.Add(amounts[i], edge);
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            return TopoDS_Shape();  // requested edge not found -> caller falls back
+        }
+    }
+
+    maker.Build();
+    if (!maker.IsDone()) {
+        return TopoDS_Shape();
+    }
+    return maker.Shape();
+}
+
+}  // namespace
+
+extern "C" BearcadShape* bearcad_shape_fillet(const BearcadShape* s, const double* edges,
+                                              const double* radii, unsigned long n) {
+    if (s == nullptr || edges == nullptr || radii == nullptr || n == 0) {
+        return nullptr;
+    }
+    try {
+        TopoDS_Shape result =
+            apply_edge_treatment<BRepFilletAPI_MakeFillet>(s->shape, edges, radii, n);
+        if (result.IsNull()) {
+            return nullptr;
+        }
+        return new BearcadShape{result};
+    } catch (const Standard_Failure&) {
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" BearcadShape* bearcad_shape_chamfer(const BearcadShape* s, const double* edges,
+                                               const double* dists, unsigned long n) {
+    if (s == nullptr || edges == nullptr || dists == nullptr || n == 0) {
+        return nullptr;
+    }
+    try {
+        TopoDS_Shape result =
+            apply_edge_treatment<BRepFilletAPI_MakeChamfer>(s->shape, edges, dists, n);
+        if (result.IsNull()) {
+            return nullptr;
+        }
+        return new BearcadShape{result};
+    } catch (const Standard_Failure&) {
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 extern "C" double bearcad_shape_volume(const BearcadShape* shape) {
     if (shape == nullptr) {
         return -1.0;
@@ -215,4 +334,44 @@ extern "C" void bearcad_tri_free(double* tris) {
 
 extern "C" void bearcad_shape_free(BearcadShape* shape) {
     delete shape;
+}
+
+extern "C" int bearcad_shape_write_step(const BearcadShape* s, const char* path) {
+    if (s == nullptr || path == nullptr) {
+        return 1;
+    }
+    try {
+        STEPControl_Writer writer;
+        if (writer.Transfer(s->shape, STEPControl_AsIs) != IFSelect_RetDone) {
+            return 1;
+        }
+        IFSelect_ReturnStatus status = writer.Write(path);
+        return status == IFSelect_RetDone ? 0 : 1;
+    } catch (const Standard_Failure&) {
+        return 1;
+    } catch (...) {
+        return 1;
+    }
+}
+
+extern "C" BearcadShape* bearcad_read_step(const char* path) {
+    if (path == nullptr) {
+        return nullptr;
+    }
+    try {
+        STEPControl_Reader reader;
+        if (reader.ReadFile(path) != IFSelect_RetDone) {
+            return nullptr;
+        }
+        reader.TransferRoots();
+        TopoDS_Shape shape = reader.OneShape();
+        if (shape.IsNull()) {
+            return nullptr;
+        }
+        return new BearcadShape{shape};
+    } catch (const Standard_Failure&) {
+        return nullptr;
+    } catch (...) {
+        return nullptr;
+    }
 }

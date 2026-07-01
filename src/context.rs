@@ -407,6 +407,22 @@ pub fn toggle_construction_for_targets(
     Ok(updated)
 }
 
+/// One row of the extrude "into" picker (#32/#35): the mode's icon followed by a radio button.
+/// Selecting the radio mutates `current`, which the caller diffs to fire the change callback.
+fn extrude_body_mode_row(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    current: &mut ExtrudeBodyMode,
+    value: ExtrudeBodyMode,
+    icon: crate::icons::IconId,
+    label: String,
+) {
+    ui.horizontal(|ui| {
+        ui.image(crate::icons::sized_texture(ctx, icon));
+        ui.radio_value(current, value, label);
+    });
+}
+
 pub fn show_pane(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -608,12 +624,34 @@ pub fn show_pane(
         ui.label("Extrude into");
         let mut mode = control.mode;
         ui.add_enabled_ui(controls_enabled, |ui| {
-            ui.radio_value(
+            extrude_body_mode_row(
+                ui,
+                ctx,
                 &mut mode,
                 ExtrudeBodyMode::MergeInto(control.merge_body),
+                crate::icons::IconId::AddToBody,
                 format!("Add to {}", control.merge_body_label),
             );
-            ui.radio_value(&mut mode, ExtrudeBodyMode::NewBody, "New body");
+            extrude_body_mode_row(
+                ui,
+                ctx,
+                &mut mode,
+                ExtrudeBodyMode::NewBody,
+                crate::icons::IconId::NewBody,
+                "New body".to_string(),
+            );
+            // A cut needs the kernel to subtract solids; a non-`occt` build can't perform it,
+            // so it isn't offered (avoids a dead control). See `body_solid_mesh` (#35).
+            if cfg!(feature = "occt") {
+                extrude_body_mode_row(
+                    ui,
+                    ctx,
+                    &mut mode,
+                    ExtrudeBodyMode::Cut(control.merge_body),
+                    crate::icons::IconId::CutBody,
+                    format!("Cut {}", control.merge_body_label),
+                );
+            }
         });
         if mode != control.mode {
             on_extrude_body_mode_changed(mode);
